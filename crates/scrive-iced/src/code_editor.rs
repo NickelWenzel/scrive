@@ -29,12 +29,12 @@
 //! intel round-trip land on top in later milestones.
 
 use std::ops::Range;
-use std::time::Instant;
 
 use iced::advanced::widget;
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::operation::{focus, focus_next, focus_previous, is_focused};
 use iced::widget::{button, column, container, row, stack, text, text_input};
+use iced::time::Instant;
 use iced::{Alignment, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, Vector};
 
 use scrive_core::{
@@ -61,7 +61,7 @@ const REPLACE_INPUT: &str = "scrive-replace-input";
 
 /// The opaque message a [`CodeEditor`] emits and consumes. The host never
 /// matches on it — it only maps it through the three wires
-/// (`self.editor.update(e).map(Message::Editor)` and the same for `view` /
+/// (`self.editor.update(e, now).map(Message::Editor)` and the same for `view` /
 /// `subscription`). It is deliberately opaque: the internal set churns with
 /// every refactor, so host-relevant signals come through the curated read
 /// accessors and builder callbacks instead. A host that genuinely needs the raw
@@ -152,8 +152,13 @@ pub struct CodeEditor {
     /// Rendering policy.
     font: Font,
     text_size: f32,
-    /// Monotonic clock start — the injected `now_ms` for find's debounce.
-    start: Instant,
+    /// The first instant `update` was handed; find's debounce clock counts
+    /// milliseconds from it.
+    epoch: Option<Instant>,
+    /// Milliseconds from `epoch` to the latest instant `update` was handed (0
+    /// before the first). Paths outside `update`, like [`edit`](Self::edit),
+    /// reuse it.
+    now_ms: u64,
     /// Set by every committed edit; a host reads it for a dirty indicator via
     /// [`is_dirty`](CodeEditor::is_dirty) / [`take_dirty`](CodeEditor::take_dirty).
     dirty: bool,
@@ -283,7 +288,8 @@ impl CodeEditor {
             id: widget::Id::new(DEFAULT_ID),
             font: Font::MONOSPACE,
             text_size: 14.0,
-            start: Instant::now(),
+            epoch: None,
+            now_ms: 0,
             dirty: false,
             find_enabled: true,
             find_open: false,
@@ -590,9 +596,13 @@ impl CodeEditor {
 
     // ── the three wires ─────────────────────────────────────────────────────
 
-    /// Fold one [`Event`] into the editor. Map it back to your message type:
-    /// `Message::Editor(e) => self.editor.update(e).map(Message::Editor)`.
-    pub fn update(&mut self, event: Event) -> Task<Event> {
+    /// Fold one [`Event`] into the editor. `now` is when the event happened;
+    /// pass the instant [`iced::application::timed()`] gives your `update`. Map
+    /// the result back to your message type:
+    /// `Message::Editor(e) => self.editor.update(e, now).map(Message::Editor)`.
+    pub fn update(&mut self, event: Event, now: Instant) -> Task<Event> {
+        let epoch = *self.epoch.get_or_insert(now);
+        self.now_ms = now.saturating_duration_since(epoch).as_millis() as u64;
         match event {
             // The widget reported a new visible range (scroll / resize /
             // autoscroll). Aim the retention window there and tokenize down to
@@ -780,7 +790,7 @@ impl CodeEditor {
             Event::OpenReplace if self.find_enabled => {
                 // Ctrl+H is Ctrl+F with the replace row already out.
                 self.replace_open = true;
-                self.update(Event::OpenFind)
+                self.update(Event::OpenFind, now)
             }
             Event::CycleFocus { back } => {
                 let moved = if back { focus_previous() } else { focus_next() };
@@ -830,17 +840,17 @@ impl CodeEditor {
                     let sel = self.doc.selections().newest();
                     (!sel.is_empty()).then(|| sel.start()..sel.end())
                 };
-                let now = self.now_ms();
+                let now = self.now_ms;
                 self.doc.set_find_scope(scope, now);
                 Task::none()
             }
             Event::FindNext if self.find_open => {
-                let now = self.now_ms();
+                let now = self.now_ms;
                 self.doc.find_next(now);
                 Task::none()
             }
             Event::FindPrev if self.find_open => {
-                let now = self.now_ms();
+                let now = self.now_ms;
                 self.doc.find_prev(now);
                 Task::none()
             }
@@ -862,7 +872,7 @@ impl CodeEditor {
                 Task::none()
             }
             Event::ReplaceOne if self.find_open => {
-                let now = self.now_ms();
+                let now = self.now_ms;
                 let before = self.doc.revision();
                 self.doc.replace_next(&self.replace_text, self.replace_preserve_case, now);
                 // The first press only NAVIGATES (shows the match before
@@ -1146,11 +1156,6 @@ impl CodeEditor {
 
     // ── internals ───────────────────────────────────────────────────────────
 
-    /// Milliseconds since construction — the injected clock for find's debounce.
-    fn now_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
-    }
-
     /// Colour the document at load (or after a grammar swap / buffer load): the
     /// large-document parallel sweep for a big buffer, else a synchronous seed of
     /// the whole (small) buffer. The cold-load fix — the first paint is coloured
@@ -1182,7 +1187,7 @@ impl CodeEditor {
             q.regex = self.find_regex;
             q
         });
-        let now = self.now_ms();
+        let now = self.now_ms;
         self.doc.set_find_query(query, now);
     }
 
@@ -1194,7 +1199,7 @@ impl CodeEditor {
         self.find_focused = false;
         self.replace_focused = false;
         self.find_query.clear();
-        let now = self.now_ms();
+        let now = self.now_ms;
         self.doc.set_find_query(None, now);
     }
 
@@ -1322,7 +1327,7 @@ impl CodeEditor {
         self.doc.tokenize_highlight(self.viewport.end);
         // Keep find fresh while editing: matches ride the edit via the decoration
         // mover; a debounced re-scan picks up appearing/disappearing matches.
-        let now = self.now_ms();
+        let now = self.now_ms;
         self.doc.maybe_rescan_find(now);
         // Drive completion (typing opens/filters, deleting refilters, else close),
         // signature help, and reconcile the snippet session; any edit closes hover.
@@ -1460,7 +1465,7 @@ impl CodeEditor {
             }
         }
         self.doc.tokenize_highlight(self.viewport.end);
-        let now = self.now_ms();
+        let now = self.now_ms;
         self.doc.maybe_rescan_find(now);
         self.dirty = true;
 
@@ -1727,12 +1732,12 @@ mod tests {
     #[test]
     fn replace_all_through_events_is_one_undo_step() {
         let mut ed = CodeEditor::new("foo foo foo\n");
-        let _ = ed.update(Event::OpenFind);
-        let _ = ed.update(Event::FindQuery("foo".into()));
-        let _ = ed.update(Event::ReplaceText("bar".into()));
-        let _ = ed.update(Event::ReplaceAll);
+        let _ = ed.update(Event::OpenFind, Instant::now());
+        let _ = ed.update(Event::FindQuery("foo".into()), Instant::now());
+        let _ = ed.update(Event::ReplaceText("bar".into()), Instant::now());
+        let _ = ed.update(Event::ReplaceAll, Instant::now());
         assert_eq!(ed.document().text().into_owned(), "bar bar bar\n");
-        let _ = ed.update(Event::Editor(Action::Undo));
+        let _ = ed.update(Event::Editor(Action::Undo), Instant::now());
         assert_eq!(ed.document().text().into_owned(), "foo foo foo\n");
     }
 
@@ -1740,7 +1745,7 @@ mod tests {
     #[test]
     fn find_disabled_ignores_open() {
         let mut ed = CodeEditor::new("abc\n").find(false);
-        let _ = ed.update(Event::OpenFind);
+        let _ = ed.update(Event::OpenFind, Instant::now());
         assert!(!ed.find_open, "find(false) must not open the bar");
     }
 
@@ -1749,9 +1754,9 @@ mod tests {
     #[test]
     fn half_typed_regex_reports_invalid() {
         let mut ed = CodeEditor::new("abc\n");
-        let _ = ed.update(Event::OpenFind);
-        let _ = ed.update(Event::ToggleRegex);
-        let _ = ed.update(Event::FindQuery("(".into())); // unbalanced while typing
+        let _ = ed.update(Event::OpenFind, Instant::now());
+        let _ = ed.update(Event::ToggleRegex, Instant::now());
+        let _ = ed.update(Event::FindQuery("(".into()), Instant::now()); // unbalanced while typing
         assert!(
             ed.document().find_pattern_error().is_some(),
             "a half-typed regex is a normal invalid state, surfaced as a pattern error",
@@ -1763,15 +1768,15 @@ mod tests {
     #[test]
     fn find_in_selection_scopes_the_matches() {
         let mut ed = CodeEditor::new("foo foo foo\n");
-        let _ = ed.update(Event::OpenFind);
+        let _ = ed.update(Event::OpenFind, Instant::now());
         let _ = ed.update(Event::Editor(Action::DragSelect {
             granularity: scrive_core::Granularity::Char,
             origin: 0,
             head: 7, // "foo foo"
-        }));
-        let _ = ed.update(Event::ToggleFindInSelection);
+        }), Instant::now());
+        let _ = ed.update(Event::ToggleFindInSelection, Instant::now());
         assert!(ed.document().find_scope().is_some(), "the toggle sets the document scope");
-        let _ = ed.update(Event::FindQuery("foo".into()));
+        let _ = ed.update(Event::FindQuery("foo".into()), Instant::now());
         assert_eq!(ed.document().find_match_count(), 2, "matches are scoped to the selection");
     }
 
@@ -1780,12 +1785,12 @@ mod tests {
     #[test]
     fn replace_navigates_before_it_overwrites() {
         let mut ed = CodeEditor::new("foo foo\n");
-        let _ = ed.update(Event::OpenFind);
-        let _ = ed.update(Event::FindQuery("foo".into()));
-        let _ = ed.update(Event::ReplaceText("bar".into()));
-        let _ = ed.update(Event::ReplaceOne);
+        let _ = ed.update(Event::OpenFind, Instant::now());
+        let _ = ed.update(Event::FindQuery("foo".into()), Instant::now());
+        let _ = ed.update(Event::ReplaceText("bar".into()), Instant::now());
+        let _ = ed.update(Event::ReplaceOne, Instant::now());
         assert_eq!(ed.document().text().into_owned(), "foo foo\n", "first press only navigates");
-        let _ = ed.update(Event::ReplaceOne);
+        let _ = ed.update(Event::ReplaceOne, Instant::now());
         assert_eq!(ed.document().text().into_owned(), "bar foo\n", "second press overwrites the match");
     }
 
@@ -1822,12 +1827,12 @@ mod tests {
     #[test]
     fn typing_opens_and_accepting_inserts_a_completion() {
         let mut ed = CodeEditor::new("").completions(OneCompletion);
-        let _ = ed.update(Event::Editor(Action::Type('h')));
+        let _ = ed.update(Event::Editor(Action::Type('h')), Instant::now());
         assert!(
             matches!(ed.completion.state(), CompletionState::Open(_)),
             "typing a word char with a provider opens the popup",
         );
-        let _ = ed.update(Event::Editor(Action::PopupAccept));
+        let _ = ed.update(Event::Editor(Action::PopupAccept), Instant::now());
         assert_eq!(ed.document().text().into_owned(), "hello");
     }
 
@@ -1835,7 +1840,7 @@ mod tests {
     #[test]
     fn no_provider_never_opens_a_popup() {
         let mut ed = CodeEditor::new("");
-        let _ = ed.update(Event::Editor(Action::Type('h')));
+        let _ = ed.update(Event::Editor(Action::Type('h')), Instant::now());
         assert!(matches!(ed.completion.state(), CompletionState::Closed));
     }
 
@@ -1884,7 +1889,7 @@ mod tests {
     #[test]
     fn async_completion_request_and_ingest_round_trip() {
         let mut ed = CodeEditor::new("");
-        let _ = ed.update(Event::Editor(Action::Type('h')));
+        let _ = ed.update(Event::Editor(Action::Type('h')), Instant::now());
         let req = ed.take_completion_request().expect("a word char records an async request");
         ed.set_completions(
             req.revision,
@@ -1894,7 +1899,7 @@ mod tests {
             matches!(ed.completion.state(), CompletionState::Open(_)),
             "ingesting items at the current revision opens the popup",
         );
-        let _ = ed.update(Event::Editor(Action::PopupAccept));
+        let _ = ed.update(Event::Editor(Action::PopupAccept), Instant::now());
         assert_eq!(ed.document().text().into_owned(), "hello");
     }
 
@@ -1903,10 +1908,10 @@ mod tests {
     #[test]
     fn stale_set_completions_is_dropped() {
         let mut ed = CodeEditor::new("");
-        let _ = ed.update(Event::Editor(Action::Type('h')));
+        let _ = ed.update(Event::Editor(Action::Type('h')), Instant::now());
         let req = ed.take_completion_request().unwrap();
         // The buffer moves on before the async result arrives.
-        let _ = ed.update(Event::Editor(Action::Type('i')));
+        let _ = ed.update(Event::Editor(Action::Type('i')), Instant::now());
         ed.set_completions(
             req.revision,
             vec![CompletionItem::plain("hello", scrive_core::CompletionKind::Keyword)],
@@ -1922,7 +1927,7 @@ mod tests {
     #[test]
     fn async_snippet_item_starts_a_session_on_accept() {
         let mut ed = CodeEditor::new("");
-        let _ = ed.update(Event::Editor(Action::Type('i')));
+        let _ = ed.update(Event::Editor(Action::Type('i')), Instant::now());
         let req = ed.take_completion_request().unwrap();
         let snippet = CompletionItem::new(
             "iflet",
@@ -1931,7 +1936,7 @@ mod tests {
         );
         ed.set_completions(req.revision, vec![snippet]);
         assert!(matches!(ed.completion.state(), CompletionState::Open(_)));
-        let _ = ed.update(Event::Editor(Action::PopupAccept));
+        let _ = ed.update(Event::Editor(Action::PopupAccept), Instant::now());
         assert!(
             ed.snippet.is_some(),
             "accepting an async-ingested snippet item starts a tab-stop session",
@@ -1943,7 +1948,7 @@ mod tests {
     #[test]
     fn typing_open_paren_records_async_signature_request() {
         let mut ed = CodeEditor::new("");
-        let _ = ed.update(Event::Editor(Action::Type('(')));
+        let _ = ed.update(Event::Editor(Action::Type('(')), Instant::now());
         assert!(
             ed.take_signature_request().is_some(),
             "'(' with no provider records an async signature request",
@@ -1955,7 +1960,7 @@ mod tests {
     #[test]
     fn hover_over_a_word_records_async_request() {
         let mut ed = CodeEditor::new("hello world\n");
-        let _ = ed.update(Event::Editor(Action::HoverQuery(2))); // inside "hello"
+        let _ = ed.update(Event::Editor(Action::HoverQuery(2)), Instant::now()); // inside "hello"
         assert!(
             ed.take_hover_request().is_some(),
             "hovering a word with no provider records an async hover request",
@@ -1983,9 +1988,9 @@ mod tests {
     #[test]
     fn caret_move_does_not_dirty_but_typing_does() {
         let mut ed = CodeEditor::new("abc\n");
-        let _ = ed.update(Event::Editor(Action::PlaceCaret(1)));
+        let _ = ed.update(Event::Editor(Action::PlaceCaret(1)), Instant::now());
         assert!(!ed.is_dirty(), "a caret move must not dirty the document");
-        let _ = ed.update(Event::Editor(Action::Type('x')));
+        let _ = ed.update(Event::Editor(Action::Type('x')), Instant::now());
         assert!(ed.is_dirty(), "typing dirties the document");
     }
 
@@ -1996,7 +2001,7 @@ mod tests {
         let mut ed = CodeEditor::new("hello\n");
         assert!(ed.drain_changes().is_empty(), "the change log is off by default");
         ed.observe_changes(true);
-        let _ = ed.update(Event::Editor(Action::Type('X'))); // insert 'X' at the caret (offset 0)
+        let _ = ed.update(Event::Editor(Action::Type('X')), Instant::now()); // insert 'X' at the caret (offset 0)
         let changes = ed.drain_changes();
         assert_eq!(changes.len(), 1, "one keystroke logs one change");
         assert_eq!(changes[0].text, "X");

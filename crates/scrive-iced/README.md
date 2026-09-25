@@ -75,6 +75,7 @@ intelligence internally — integrating is three wires plus registering the
 bundled font:
 
 ```rust
+use iced::time::Instant;
 use iced::{Element, Subscription, Task};
 use scrive_iced::{CodeEditor, Event};
 
@@ -85,8 +86,9 @@ enum Message { Editor(Event) }
 
 impl App {
     fn new() -> Self { Self { editor: CodeEditor::new("fn main() {}\n") } }
-    fn update(&mut self, m: Message) -> Task<Message> {
-        match m { Message::Editor(e) => self.editor.update(e).map(Message::Editor) }
+    // `now` comes from iced: run the app with `iced::application::timed`.
+    fn update(&mut self, m: Message, now: Instant) -> Task<Message> {
+        match m { Message::Editor(e) => self.editor.update(e, now).map(Message::Editor) }
     }
     fn view(&self) -> Element<'_, Message> { self.editor.view().map(Message::Editor) }
     fn subscription(&self) -> Subscription<Message> {

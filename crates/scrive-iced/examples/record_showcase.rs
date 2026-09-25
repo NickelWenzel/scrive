@@ -25,6 +25,7 @@ use iced::advanced::widget::Operation;
 use iced::advanced::{mouse, renderer, shell};
 use iced::keyboard::key::{Key, Named, NativeCode, Physical};
 use iced::keyboard::{Event as KeyboardEvent, Location, Modifiers};
+use iced::time::Instant;
 use iced::{Event, Font, Pixels, Point, Size, Theme};
 use iced_runtime::user_interface::{Cache, UserInterface};
 use iced_runtime::{task, Action};
@@ -203,6 +204,10 @@ fn main() {
     let theme: Theme = scrive_dark();
 
     let mut app = App::default();
+    // One fixed instant stamps every message and frame: no runtime drives this
+    // loop, and a frozen clock keeps time-based state (caret blink) identical on
+    // every run.
+    let now = Instant::now();
     let mut cache = Cache::new();
     let mut inbox: Vec<Message> = Vec::new();
     let mut ops: Vec<Box<dyn Operation>> = Vec::new();
@@ -223,9 +228,7 @@ fn main() {
     // discarding the draw, so the doc's highlight cache is warm when frame 1 is
     // drawn.
     {
-        let events = [Event::Window(iced::window::Event::RedrawRequested(
-            std::time::Instant::now(),
-        ))];
+        let events = [Event::Window(iced::window::Event::RedrawRequested(now))];
         let mut ui: UserInterface<'_, Message, Theme, iced::Renderer> =
             UserInterface::build(app.view(), logical, cache, &mut renderer);
         let mut published = shell::Bus::new();
@@ -241,15 +244,13 @@ fn main() {
         inbox.extend(published);
         while !inbox.is_empty() {
             for m in std::mem::take(&mut inbox) {
-                drain(app.update(m), &mut inbox, &mut ops);
+                drain(app.update(m, now), &mut inbox, &mut ops);
             }
         }
     }
 
     for (steps, hold) in script() {
-        let mut events: Vec<Event> = vec![Event::Window(iced::window::Event::RedrawRequested(
-            std::time::Instant::now(),
-        ))];
+        let mut events: Vec<Event> = vec![Event::Window(iced::window::Event::RedrawRequested(now))];
         for step in steps {
             match step {
                 Step::Ev(e) => events.push(e),
@@ -260,7 +261,7 @@ fn main() {
         // Settle any queued messages first (find open focuses via a Task, etc.).
         while !inbox.is_empty() {
             for m in std::mem::take(&mut inbox) {
-                drain(app.update(m), &mut inbox, &mut ops);
+                drain(app.update(m, now), &mut inbox, &mut ops);
             }
         }
 
@@ -286,7 +287,7 @@ fn main() {
         inbox.extend(published);
         while !inbox.is_empty() {
             for m in std::mem::take(&mut inbox) {
-                drain(app.update(m), &mut inbox, &mut ops);
+                drain(app.update(m, now), &mut inbox, &mut ops);
             }
         }
 

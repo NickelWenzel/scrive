@@ -26,8 +26,8 @@
 mod capture;
 
 use std::ops::Range;
-use std::time::Instant;
 
+use iced::time::{Duration, Instant};
 use iced::{Element, Subscription, Task, Theme};
 
 use scrive_core::{
@@ -45,10 +45,10 @@ static LARGE_DOC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// document on the UI thread per keystroke is not what it demonstrates.
 const RELINT_MAX_BYTES: u32 = 2 * 1_048_576;
 
-/// Debounce window (ms) for the demo re-lint — a burst of keystrokes coalesces
+/// Debounce window for the demo re-lint — a burst of keystrokes coalesces
 /// into at most one whole-document scan per window, mirroring how a real
 /// off-thread compiler would be debounced.
-const RELINT_DEBOUNCE_MS: u64 = 250;
+const RELINT_DEBOUNCE: Duration = Duration::from_millis(250);
 
 // Test-only tally of `App::relint` scan-body executions — the debounce tests
 // read it to prove the whole-document scan runs once per window, not per key.
@@ -146,11 +146,11 @@ fn main() {
 /// recompile-on-edit pattern a real host would use for a language server.
 pub struct App {
     editor: CodeEditor,
-    /// Monotonic clock start — the injected `now_ms` for the re-lint debounce.
-    start: Instant,
-    /// An edit armed the debounced re-lint; a `now_ms`-gated tick runs the scan.
+    /// An edit armed the debounced re-lint; a clock-gated tick runs the scan.
     relint_dirty: bool,
-    last_relint_ms: u64,
+    /// When the last debounced scan ran (`None` before the first), on the clock
+    /// iced stamps on each message.
+    last_relint: Option<Instant>,
 }
 
 /// The app message: it only ever *maps* the editor's opaque [`Event`] (never
@@ -194,15 +194,17 @@ impl App {
             .completions(StubCompletions::new())
             .hover(StubHover)
             .signature(StubSignatures);
-        let mut app = Self { editor, start: Instant::now(), relint_dirty: false, last_relint_ms: 0 };
+        let mut app = Self { editor, relint_dirty: false, last_relint: None };
         app.relint(); // seed the stub diagnostics (the sample carries a TODO)
         app
     }
 
-    pub fn update(&mut self, message: Message) -> Task<Message> {
+    /// `now` is the instant iced stamps on the message (the app runs through
+    /// `iced::application::timed`), so the app never reads the clock itself.
+    pub fn update(&mut self, message: Message, now: Instant) -> Task<Message> {
         match message {
             Message::Editor(event) => {
-                let task = self.editor.update(event).map(Message::Editor);
+                let task = self.editor.update(event, now).map(Message::Editor);
                 // An edit arms the debounced re-lint (this app's stand-in for an
                 // off-thread compile), read off the editor's dirty signal.
                 if self.editor.take_dirty() {
@@ -211,7 +213,7 @@ impl App {
                 task
             }
             Message::Relint => {
-                self.maybe_relint(self.now_ms());
+                self.maybe_relint(now);
                 Task::none()
             }
         }
@@ -234,22 +236,18 @@ impl App {
         Subscription::batch([editor, relint])
     }
 
-    /// Milliseconds since app start — the injected clock for the re-lint debounce.
-    fn now_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
-    }
-
     /// The debounced trailing edge of the demo re-lint: if an edit armed a re-lint
-    /// and the window elapsed on the injected clock, run the whole-document stub
+    /// and the window elapsed since the last scan at `now`, run the whole-document stub
     /// scan once and re-arm. Returns whether it scanned (the debounce tests observe
     /// this; the app ignores it).
-    fn maybe_relint(&mut self, now: u64) -> bool {
-        if !self.relint_dirty || now.saturating_sub(self.last_relint_ms) < RELINT_DEBOUNCE_MS {
+    fn maybe_relint(&mut self, now: Instant) -> bool {
+        let in_window = self.last_relint.is_some_and(|last| now.saturating_duration_since(last) < RELINT_DEBOUNCE);
+        if !self.relint_dirty || in_window {
             return false;
         }
         self.relint();
         self.relint_dirty = false;
-        self.last_relint_ms = now;
+        self.last_relint = Some(now);
         true
     }
 
@@ -523,33 +521,35 @@ fn main() -> iced::Result {
     if let Some(i) = args.iter().position(|a| a == "--capture-find") {
         let path = args.get(i + 1).map_or("scratch-find.png", String::as_str);
         let mut app = App::new();
+        // Headless: no iced runtime stamps the messages, so one fixed instant
+        // stands in for all of them.
+        let now = Instant::now();
         let ev = |e| Message::Editor(e);
-        let _ = app.update(ev(Event::OpenReplace)); // find + the replace row out
-        let _ = app.update(ev(Event::FindQuery("self".into())));
-        let _ = app.update(ev(Event::ReplaceText("this".into())));
+        let _ = app.update(ev(Event::OpenReplace), now); // find + the replace row out
+        let _ = app.update(ev(Event::FindQuery("self".into())), now);
+        let _ = app.update(ev(Event::ReplaceText("this".into())), now);
         // Latch two of the three options, so both the engaged and the resting
         // toggle style are on screen to compare.
-        let _ = app.update(ev(Event::ToggleCase));
-        let _ = app.update(ev(Event::ToggleWholeWord));
-        let _ = app.update(ev(Event::TogglePreserveCase)); // latch the replace box's AB
+        let _ = app.update(ev(Event::ToggleCase), now);
+        let _ = app.update(ev(Event::ToggleWholeWord), now);
+        let _ = app.update(ev(Event::TogglePreserveCase), now); // latch the replace box's AB
         // Scope find to a block of the sample, so the scope wash + its latched
         // toggle are on screen too.
         let _ = app.update(ev(Event::Editor(Action::DragSelect {
             granularity: Granularity::Char,
             origin: 0,
             head: 600,
-        })));
-        let _ = app.update(ev(Event::ToggleFindInSelection));
-        let _ = app.update(ev(Event::FindNext)); // activate a match ⇒ a real "N of M"
+        })), now);
+        let _ = app.update(ev(Event::ToggleFindInSelection), now);
+        let _ = app.update(ev(Event::FindNext), now); // activate a match ⇒ a real "N of M"
         let (w, h) = capture::render_to_png(app.view(), 900, 560, &scrive_dark(), &[], path);
         eprintln!("captured {w}x{h} -> {path}");
         return Ok(());
     }
 
-    let app = iced::application(App::new, App::update, App::view)
+    let app = iced::application::timed(App::new, App::update, App::subscription, App::view)
         .title("scrive — scratch")
-        .theme(theme)
-        .subscription(App::subscription);
+        .theme(theme);
     // Register every font the widget requires (fold chevrons + find-bar icons)
     // through the one owner, so the set can't be loaded piecemeal and leave tofu.
     app.fonts(scrive_iced::required_fonts().iter().copied()).run()
@@ -571,8 +571,8 @@ mod tests {
 
         // Anchor the debounce window at a fixed fake "now"; start clean so only the
         // edits below can arm a re-lint.
-        let t0 = 100_000u64;
-        app.last_relint_ms = t0;
+        let t0 = Instant::now();
+        app.last_relint = Some(t0);
         app.relint_dirty = false;
 
         // A burst of keystrokes, all inside one debounce window. Each edit only
@@ -580,19 +580,19 @@ mod tests {
         // are gated → no scan runs.
         const N: usize = 25;
         for _ in 0..N {
-            let _ = app.update(Message::Editor(Event::Editor(Action::Type('x'))));
-            assert!(!app.maybe_relint(t0 + 10), "a tick inside the window must not scan");
+            let _ = app.update(Message::Editor(Event::Editor(Action::Type('x'))), t0);
+            assert!(!app.maybe_relint(t0 + Duration::from_millis(10)), "a tick inside the window must not scan");
         }
         assert_eq!(RELINT_RUNS.with(std::cell::Cell::get) - base, 0, "the burst ran ZERO whole-doc scans");
         assert!(app.relint_dirty, "a trailing scan is still pending");
 
         // The trailing-edge tick after the window elapses runs exactly one scan.
-        assert!(app.maybe_relint(t0 + RELINT_DEBOUNCE_MS + 1), "the trailing tick scans");
+        assert!(app.maybe_relint(t0 + RELINT_DEBOUNCE + Duration::from_millis(1)), "the trailing tick scans");
         assert_eq!(RELINT_RUNS.with(std::cell::Cell::get) - base, 1, "exactly one scan for the whole burst");
         assert!(!app.relint_dirty, "flag cleared after the scan");
 
         // Further idle ticks are no-ops (no re-scan while clean).
-        assert!(!app.maybe_relint(t0 + 10 * RELINT_DEBOUNCE_MS), "idle: no re-scan");
+        assert!(!app.maybe_relint(t0 + 10 * RELINT_DEBOUNCE), "idle: no re-scan");
         assert_eq!(RELINT_RUNS.with(std::cell::Cell::get) - base, 1, "still one");
     }
 
@@ -602,22 +602,22 @@ mod tests {
     #[test]
     fn relint_trailing_scan_makes_diagnostics_current() {
         let mut app = App::new();
-        let t0 = 100_000u64;
-        app.last_relint_ms = t0;
+        let t0 = Instant::now();
+        app.last_relint = Some(t0);
         app.relint_dirty = false;
 
         // Type a fresh `FIXME` at the end of the buffer (no existing diagnostic
         // there, so the check is independent of the sample's contents).
         let start = app.editor.document().buffer().len();
-        let _ = app.update(Message::Editor(Event::Editor(Action::PlaceCaret(start))));
+        let _ = app.update(Message::Editor(Event::Editor(Action::PlaceCaret(start))), t0);
         for ch in "FIXME".chars() {
-            let _ = app.update(Message::Editor(Event::Editor(Action::Type(ch))));
+            let _ = app.update(Message::Editor(Event::Editor(Action::Type(ch))), t0);
         }
         let typed = start..start + 5;
 
         // Inside the window: no scan yet, so the new marker is NOT flagged
         // (diagnostics only ride existing positions via stickiness).
-        assert!(!app.maybe_relint(t0 + 10), "still inside the debounce window");
+        assert!(!app.maybe_relint(t0 + Duration::from_millis(10)), "still inside the debounce window");
         let flagged_before = app
             .editor
             .document()
@@ -626,7 +626,7 @@ mod tests {
         assert!(!flagged_before, "the freshly-typed FIXME is not flagged mid-burst");
 
         // The trailing scan brings diagnostics current.
-        assert!(app.maybe_relint(t0 + RELINT_DEBOUNCE_MS + 1), "the trailing tick scans");
+        assert!(app.maybe_relint(t0 + RELINT_DEBOUNCE + Duration::from_millis(1)), "the trailing tick scans");
         let flagged_after = app
             .editor
             .document()

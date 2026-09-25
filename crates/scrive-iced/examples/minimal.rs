@@ -10,6 +10,7 @@
 //! Compare with `scratch.rs`, which drives the low-level [`scrive_iced::Editor`]
 //! widget by hand for full control.
 
+use iced::time::Instant;
 use iced::{Element, Subscription, Task};
 
 use scrive_core::SyntaxDef;
@@ -37,9 +38,10 @@ impl App {
         Self { editor: CodeEditor::new(source).language(grammar) }
     }
 
-    fn update(&mut self, message: Message) -> Task<Message> {
+    /// `now` is the instant iced stamps on the message (see `main`).
+    fn update(&mut self, message: Message, now: Instant) -> Task<Message> {
         match message {
-            Message::Editor(event) => self.editor.update(event).map(Message::Editor),
+            Message::Editor(event) => self.editor.update(event, now).map(Message::Editor),
         }
     }
 
@@ -53,9 +55,10 @@ impl App {
 }
 
 fn main() -> iced::Result {
-    let app = iced::application(App::new, App::update, App::view)
-        .title("scrive — minimal")
-        .subscription(App::subscription);
+    // `timed` hands `update` each message's instant, which the editor's find
+    // debounce runs on.
+    let app = iced::application::timed(App::new, App::update, App::subscription, App::view)
+        .title("scrive — minimal");
     // Register the fonts the widget needs (fold chevrons + find-bar icons).
     app.fonts(scrive_iced::required_fonts().iter().copied()).run()
 }

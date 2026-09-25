@@ -59,7 +59,7 @@ pub fn render_to_png<Message>(
     let mut ui: UserInterface<'_, Message, Theme, iced::Renderer> =
         UserInterface::build(view, logical, Cache::new(), &mut renderer);
     let mut all = vec![iced::Event::Window(iced::window::Event::RedrawRequested(
-        std::time::Instant::now(),
+        iced::time::Instant::now(),
     ))];
     all.extend_from_slice(events);
     let mut published = shell::Bus::new();

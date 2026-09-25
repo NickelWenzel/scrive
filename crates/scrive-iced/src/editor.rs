@@ -27,11 +27,11 @@ use iced::advanced::{layout, mouse, renderer, Layout, Shell};
 use iced::alignment::Vertical;
 use iced::keyboard::key::Named;
 use iced::keyboard::{Event as Keyboard, Key, Modifiers};
+use iced::time::{Duration, Instant};
 use iced::{border, window, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Shadow, Size, Vector};
 
 use std::cell::Ref;
 use std::ops::Range;
-use std::time::{Duration, Instant};
 
 use scrive_core::{
     display_map, BufferRow, ColumnDir, CompletionKind, Document, FoldMap, Granularity,
@@ -4392,7 +4392,7 @@ mod tests {
         ui.update(
             &iced::window::Headless,
             &shell::Waker::noop(),
-            &[iced::Event::Window(iced::window::Event::RedrawRequested(std::time::Instant::now()))],
+            &[iced::Event::Window(iced::window::Event::RedrawRequested(Instant::now()))],
             cursor,
             &mut r,
             &mut msgs,
