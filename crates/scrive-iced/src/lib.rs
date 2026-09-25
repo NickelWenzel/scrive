@@ -71,14 +71,29 @@ pub const CODICON_FONT: &[u8] = include_bytes!("../assets/codicon.ttf");
 /// The [`iced::Font`] handle for the bundled [`CODICON_FONT`] (family `"codicon"`).
 pub const CODICON: iced::Font = iced::Font::new("codicon");
 
+/// Fira Code, the editor's text font on wasm32: a browser gives iced no system
+/// fonts, so [`Font::MONOSPACE`](iced::Font::MONOSPACE) would resolve to
+/// nothing there. Its programming ligatures (`->`, `=>`, `!=`, …) render within
+/// a highlight token. [`required_fonts`] includes it on wasm32 only. SIL Open
+/// Font License 1.1 (see `assets/FIRA-CODE-LICENSE.md`).
+pub const FIRA_CODE_FONT: &[u8] = include_bytes!("../assets/fira-code.ttf");
+
+/// The editor's default text font: [`iced::Font::MONOSPACE`] natively, the
+/// bundled [`FIRA_CODE_FONT`] on wasm32.
+pub const DEFAULT_FONT: iced::Font =
+    if cfg!(target_arch = "wasm32") { iced::Font::new("Fira Code") } else { iced::Font::MONOSPACE };
+
 /// Every font the widget needs registered in iced's font system at startup —
 /// register them all and the fold-gutter chevrons and find-bar icons render;
 /// omit one and its glyphs fall back to per-machine tofu. One owner so an
-/// integrator can load the whole set instead of enumerating it by hand (today
-/// just [`CODICON_FONT`]):
+/// integrator can load the whole set instead of enumerating it by hand
+/// ([`CODICON_FONT`], plus the [`FIRA_CODE_FONT`] text font on wasm32):
 /// `app.fonts(scrive_iced::required_fonts().iter().copied())`.
 #[must_use]
 pub fn required_fonts() -> &'static [&'static [u8]] {
+    #[cfg(target_arch = "wasm32")]
+    return &[CODICON_FONT, FIRA_CODE_FONT];
+    #[cfg(not(target_arch = "wasm32"))]
     &[CODICON_FONT]
 }
 

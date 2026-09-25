@@ -513,6 +513,8 @@ mod tests {
             check_load_len(u32::MAX as usize),
             Err(LoadError::TooLarge { len }) if len == u32::MAX as usize
         ));
+        // Past u32::MAX is only representable where usize is wider (not wasm32).
+        #[cfg(target_pointer_width = "64")]
         assert!(check_load_len(u32::MAX as usize + 1).is_err());
     }
 

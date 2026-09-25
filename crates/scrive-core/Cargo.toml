@@ -44,13 +44,19 @@ regex = "1"       # find's whole-word + regex modes (wrapped; never public)
 arrayvec = "0.7"  # the rope chunk's inline storage (wrapped; never public)
 
 [dev-dependencies]
-# criterion: the wall-clock bench harness (op-count canaries live in unit tests;
-# wall-clock lives here). Dev-only — never enters the lib graph, so the
-# cargo-tree GUI gate is unaffected.
-criterion = "0.5"
 # ropey: kept ONLY as the byte-for-byte oracle for our own rope. Dev-only — the
 # production build does not depend on it.
 ropey = { version = "1.6", default-features = false, features = ["simd"] }
+
+# criterion: the wall-clock bench harness (op-count canaries live in unit tests;
+# wall-clock lives here). Dev-only — never enters the lib graph, so the
+# cargo-tree GUI gate is unaffected. Its default features pull in rayon, which
+# does not build for wasm32, so wasm gets it without them.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = "0.5"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+criterion = { version = "0.5", default-features = false }
 
 [[bench]]
 name = "perf"

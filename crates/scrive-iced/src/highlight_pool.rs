@@ -22,7 +22,10 @@ use scrive_core::{
 
 /// Documents at least this many bytes use the parallel sweep; smaller ones keep
 /// the synchronous path (so the sync path and its captures stay unchanged).
-pub(crate) const PARALLEL_MIN_BYTES: u32 = 2 * 1_048_576;
+/// `None` on wasm32, which has no threads to spawn: every document takes the
+/// synchronous path there.
+pub(crate) const PARALLEL_MIN_BYTES: Option<u32> =
+    if cfg!(target_arch = "wasm32") { None } else { Some(2 * 1_048_576) };
 
 /// Max rows per sweep segment. Small enough that workers turn over quickly and
 /// the document splits into many more segments than workers, for load balancing

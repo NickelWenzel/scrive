@@ -26,6 +26,29 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+  wasm:
+    name: Wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasmtime
+
+      # The browser target: the library, its tests, and the examples must build.
+      - name: Build for wasm32-unknown-unknown
+        run: cargo build --workspace --all-targets --target wasm32-unknown-unknown
+
+      # The GUI-free core runs its unit tests as wasm (32-bit usize, no threads).
+      - name: Test scrive-core on wasm32-wasip1
+        run: cargo test -p scrive-core --lib --target wasm32-wasip1
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
+
   lints:
     name: Lints & docs
     runs-on: ubuntu-latest

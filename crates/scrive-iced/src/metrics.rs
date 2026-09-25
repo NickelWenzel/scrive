@@ -48,7 +48,7 @@ impl Metrics {
             font,
             align_x: Alignment::Left,
             align_y: Vertical::Top,
-            shaping: Shaping::Basic,
+            shaping: Shaping::Advanced, // as `Editor` draws code text
             wrapping: Wrapping::None,
             ellipsis: Ellipsis::None,
             hint_factor: None,

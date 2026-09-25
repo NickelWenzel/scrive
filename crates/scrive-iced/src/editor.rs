@@ -642,7 +642,7 @@ pub struct Editor<'a, Message> {
 
 impl<'a, Message> Editor<'a, Message> {
     /// An editor rendering `doc`; `on_action(action)` is published for each
-    /// input the widget interprets. Defaults to [`Font::MONOSPACE`] at 14 px.
+    /// input the widget interprets. Defaults to [`DEFAULT_FONT`](crate::DEFAULT_FONT) at 14 px.
     pub fn new(doc: &'a Document, on_action: impl Fn(Action) -> Message + 'a) -> Self {
         Self {
             id: None,
@@ -652,7 +652,7 @@ impl<'a, Message> Editor<'a, Message> {
             snippet_active: false,
             signature: None,
             hover: None,
-            font: Font::MONOSPACE,
+            font: crate::DEFAULT_FONT,
             size: DEFAULT_SIZE,
             line_height: default_line_height(DEFAULT_SIZE),
         }
@@ -3279,6 +3279,9 @@ impl<Message> Editor<'_, Message> {
     }
 
     /// Draw one line of text at `position` using the configured font/size.
+    /// Advanced shaping, so a font's ligatures (Fira Code's `->`, `!=`, …) form
+    /// within the run; a monospace font's ligatures keep every cell's width, so
+    /// the grid is unaffected.
     fn draw_line(
         &self,
         renderer: &mut iced::Renderer,
@@ -3297,7 +3300,7 @@ impl<Message> Editor<'_, Message> {
                 font: self.font,
                 align_x: align,
                 align_y: Vertical::Top,
-                shaping: Shaping::Basic,
+                shaping: Shaping::Advanced,
                 wrapping: Wrapping::None,
                 ellipsis: Ellipsis::None,
                 hint_factor: None,

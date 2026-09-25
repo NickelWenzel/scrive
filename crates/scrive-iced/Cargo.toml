@@ -26,6 +26,11 @@ png = "0.17"
 # Pure-Rust GIF encoder for the headless showcase recorder (record_showcase).
 gif = "0.13"
 
+# In the browser the examples need WebGL (for browsers without WebGPU) and an
+# embedded UI font, since the web offers no system fonts.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+iced = { version = "0.15.0-dev", features = ["webgl", "fira-sans"] }
+
 [[example]]
 name = "scratch"
 test = true

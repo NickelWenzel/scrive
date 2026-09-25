@@ -114,6 +114,24 @@ cargo run -p scrive-iced --example scratch   # the low-level Editor widget, full
 `scratch` opens a real editor over a sample Rust document — type, select, find
 (Ctrl+F), fold, and undo/redo.
 
+## Web (wasm32)
+
+Both crates build for `wasm32-unknown-unknown`, and the examples run in the
+browser. The web has no system fonts, so on wasm32 the editor's default font is
+the bundled Fira Code ([`FIRA_CODE_FONT`](https://docs.rs/scrive-iced/latest/scrive_iced/constant.FIRA_CODE_FONT.html)), with its ligatures,
+which `required_fonts()` includes there. Enable iced's `fira-sans` feature for
+UI text such as the find bar, and `webgl` for browsers without WebGPU. There
+are no threads, so a large document is highlighted on the UI thread instead of
+the background pool.
+
+Serve an example as a web app with [Trunk](https://trunkrs.dev) (it fetches
+the matching `wasm-bindgen` itself):
+
+```bash
+cd crates/scrive-iced
+trunk serve --release --example minimal   # or: --example scratch
+```
+
 ## License
 
 MIT.

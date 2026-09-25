@@ -207,7 +207,7 @@ pub struct CodeEditor {
     /// rested over a word and no synchronous hover provider is set.
     pending_hover_request: Option<HoverRequest>,
     /// The off-thread parallel highlight sweep — `Some` for a large document
-    /// (`PARALLEL_MIN_BYTES`), `None` for small ones (the synchronous path). Owned
+    /// (see [`uses_pool`](Self::uses_pool)), `None` otherwise (the synchronous path). Owned
     /// here so a batteries-included host gets large-document highlighting for free.
     hl_pool: Option<HighlightPool>,
 }
@@ -286,7 +286,7 @@ impl CodeEditor {
             theme: crate::scrive_dark_theme(),
             has_syntax: false,
             id: widget::Id::new(DEFAULT_ID),
-            font: Font::MONOSPACE,
+            font: crate::DEFAULT_FONT,
             text_size: 14.0,
             epoch: None,
             now_ms: 0,
@@ -344,7 +344,7 @@ impl CodeEditor {
         self
     }
 
-    /// Set the (monospace) font. Default [`Font::MONOSPACE`].
+    /// Set the (monospace) font. Default [`DEFAULT_FONT`](crate::DEFAULT_FONT).
     #[must_use]
     pub fn font(mut self, font: Font) -> Self {
         self.font = font;
@@ -611,7 +611,7 @@ impl CodeEditor {
             Event::Editor(Action::ViewportChanged(rows)) => {
                 self.viewport = rows.clone();
                 self.doc.set_highlight_window(rows.clone());
-                if self.doc.buffer().len() >= PARALLEL_MIN_BYTES {
+                if self.uses_pool() {
                     // Large document: the off-thread sweep owns dirt-clearing; the
                     // viewport is painted synchronously now and verified in place.
                     // Do NOT run the whole-doc synchronous walk (it would race the
@@ -732,7 +732,7 @@ impl CodeEditor {
             // The subscription drops itself once the frontier is clean, so this
             // stops firing on an idle document.
             Event::HighlightSweep => {
-                if self.doc.buffer().len() >= PARALLEL_MIN_BYTES {
+                if self.uses_pool() {
                     if let Some(mut pool) = self.hl_pool.take() {
                         if pool.rev != self.doc.revision() {
                             // An edit landed: re-sweep from a fresh snapshot AND
@@ -1156,6 +1156,12 @@ impl CodeEditor {
 
     // ── internals ───────────────────────────────────────────────────────────
 
+    /// Whether the document is large enough for the off-thread highlight pool
+    /// (never on wasm32, which has no threads).
+    fn uses_pool(&self) -> bool {
+        PARALLEL_MIN_BYTES.is_some_and(|min| self.doc.buffer().len() >= min)
+    }
+
     /// Colour the document at load (or after a grammar swap / buffer load): the
     /// large-document parallel sweep for a big buffer, else a synchronous seed of
     /// the whole (small) buffer. The cold-load fix — the first paint is coloured
@@ -1164,7 +1170,7 @@ impl CodeEditor {
     /// which the first `ViewportChanged` reaims). Recreating the pool here also
     /// picks up a new grammar's engine after a `load` language swap.
     fn seed_highlight(&mut self) {
-        if self.doc.buffer().len() >= PARALLEL_MIN_BYTES {
+        if self.uses_pool() {
             self.hl_pool = HighlightPool::new(&self.doc, self.viewport.clone());
         } else {
             self.hl_pool = None;
@@ -1971,6 +1977,7 @@ mod tests {
     /// at load; a small one keeps the synchronous path. This is what stops a huge
     /// buffer from blocking the UI thread tokenizing synchronously.
     #[test]
+    #[cfg(not(target_arch = "wasm32"))] // no pool without threads
     fn large_document_uses_the_parallel_pool() {
         let grammar = SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
         let big = "fn f() {}\n".repeat(230_000); // ~2.3 MB, over PARALLEL_MIN_BYTES
