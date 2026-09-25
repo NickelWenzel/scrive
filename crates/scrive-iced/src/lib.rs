@@ -61,20 +61,20 @@ pub use metrics::Metrics;
 /// The bundled [Codicon](https://github.com/microsoft/vscode-codicons) icon font
 /// (v0.0.45) — VS Code's own UI glyph set. The host application **must** load
 /// these bytes into iced's font system at startup (e.g.
-/// `iced::application(..).font(scrive_iced::CODICON_FONT)`); after that the
+/// `iced::application(..).fonts([scrive_iced::CODICON_FONT])`); after that the
 /// widget's fold-gutter chevrons and any app chrome can draw glyphs in the
 /// [`CODICON`] font. Icons © Microsoft, CC BY 4.0 (see `assets/CODICON-LICENSE.md`).
 pub const CODICON_FONT: &[u8] = include_bytes!("../assets/codicon.ttf");
 
 /// The [`iced::Font`] handle for the bundled [`CODICON_FONT`] (family `"codicon"`).
-pub const CODICON: iced::Font = iced::Font::with_name("codicon");
+pub const CODICON: iced::Font = iced::Font::new("codicon");
 
 /// Every font the widget needs registered in iced's font system at startup —
 /// register them all and the fold-gutter chevrons and find-bar icons render;
 /// omit one and its glyphs fall back to per-machine tofu. One owner so an
 /// integrator can load the whole set instead of enumerating it by hand (today
 /// just [`CODICON_FONT`]):
-/// `scrive_iced::required_fonts().iter().fold(app, |app, f| app.font(*f))`.
+/// `app.fonts(scrive_iced::required_fonts().iter().copied())`.
 #[must_use]
 pub fn required_fonts() -> &'static [&'static [u8]] {
     &[CODICON_FONT]

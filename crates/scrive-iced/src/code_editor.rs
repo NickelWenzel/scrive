@@ -968,7 +968,6 @@ impl CodeEditor {
         let input_style = |_theme: &Theme, _status: text_input::Status| text_input::Style {
             background: Color::TRANSPARENT.into(),
             border: iced::border::rounded(0.0),
-            icon: Color::from_rgb8(0xCC, 0xCC, 0xCC),
             placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
             value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
             selection: Color::from_rgb8(0x26, 0x4F, 0x78),

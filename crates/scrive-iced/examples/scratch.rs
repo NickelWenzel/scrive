@@ -469,11 +469,11 @@ impl Completions for StubCompletions {
 /// An original dark theme for the demo's iced chrome (find bar, popups,
 /// scrollbar), matching the `Scrive Dark` syntax theme.
 pub fn scrive_dark() -> Theme {
-    use iced::theme::Palette;
+    use iced::theme::palette::Seed;
     use iced::Color;
     Theme::custom(
         "Scrive Dark".to_string(),
-        Palette {
+        Seed {
             background: Color::from_rgb8(0x1c, 0x1e, 0x24), // #1C1E24
             text: Color::from_rgb8(0xdf, 0xe1, 0xe6),       // #DFE1E6
             primary: Color::from_rgb8(0xec, 0x6a, 0x88),    // rose accent (caret/selection)
@@ -552,10 +552,7 @@ fn main() -> iced::Result {
         .subscription(App::subscription);
     // Register every font the widget requires (fold chevrons + find-bar icons)
     // through the one owner, so the set can't be loaded piecemeal and leave tofu.
-    scrive_iced::required_fonts()
-        .iter()
-        .fold(app, |app, font| app.font(*font))
-        .run()
+    app.fonts(scrive_iced::required_fonts().iter().copied()).run()
 }
 
 #[cfg(test)]

@@ -57,8 +57,5 @@ fn main() -> iced::Result {
         .title("scrive — minimal")
         .subscription(App::subscription);
     // Register the fonts the widget needs (fold chevrons + find-bar icons).
-    scrive_iced::required_fonts()
-        .iter()
-        .fold(app, |app, font| app.font(*font))
-        .run()
+    app.fonts(scrive_iced::required_fonts().iter().copied()).run()
 }

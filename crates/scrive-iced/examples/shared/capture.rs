@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use iced::advanced::{clipboard, mouse, renderer};
+use iced::advanced::{mouse, renderer, shell};
 use iced::{Element, Font, Pixels, Point, Size, Theme};
 use iced_runtime::user_interface::{Cache, UserInterface};
 use iced_tiny_skia::graphics::Viewport;
@@ -42,9 +42,16 @@ pub fn render_to_png<Message>(
         .expect("font system lock")
         .load_font(std::borrow::Cow::Borrowed(scrive_iced::CODICON_FONT));
     let mut renderer = iced_renderer::fallback::Renderer::Secondary(
-        iced_tiny_skia::Renderer::new(Font::default(), Pixels(14.0)),
+        iced_tiny_skia::Renderer::new(renderer::Settings {
+            font: Font::default(),
+            text_size: Pixels(14.0),
+            ..renderer::Settings::default()
+        }),
     );
-    let viewport = Viewport::with_physical_size(Size::new(width, height), 1.0);
+    let viewport = Viewport::with_physical_size(
+        Size::new(width, height),
+        renderer::Scale { window: 1.0, application: 1.0 },
+    );
     let logical = Size::new(width as f32, height as f32);
     let cursor = mouse::Cursor::Available(Point::new(width as f32 / 2.0, height as f32 / 2.0));
 
@@ -55,8 +62,15 @@ pub fn render_to_png<Message>(
         std::time::Instant::now(),
     ))];
     all.extend_from_slice(events);
-    let mut published: Vec<Message> = Vec::new();
-    ui.update(&all, cursor, &mut renderer, &mut clipboard::Null, &mut published);
+    let mut published = shell::Bus::new();
+    ui.update(
+        &iced::window::Headless,
+        &shell::Waker::noop(),
+        &all,
+        cursor,
+        &mut renderer,
+        &mut published,
+    );
     ui.draw(&mut renderer, theme, &renderer::Style::default(), cursor);
 
     // Rasterize the tiny-skia variant to raw RGBA.
@@ -64,7 +78,7 @@ pub fn render_to_png<Message>(
         unreachable!("constructed the tiny-skia variant above");
     };
     let rgba =
-        iced_tiny_skia::window::compositor::screenshot(ts, &viewport, theme.palette().background);
+        iced_tiny_skia::window::compositor::screenshot(ts, &viewport, theme.palette().background.base.color);
 
     encode_png(&rgba, width, height, path);
     (width, height)
@@ -109,9 +123,16 @@ pub fn render_interactive_to_png<State, Msg>(
         .expect("font system lock")
         .load_font(std::borrow::Cow::Borrowed(scrive_iced::CODICON_FONT));
     let mut renderer = iced_renderer::fallback::Renderer::Secondary(
-        iced_tiny_skia::Renderer::new(Font::default(), Pixels(14.0)),
+        iced_tiny_skia::Renderer::new(renderer::Settings {
+            font: Font::default(),
+            text_size: Pixels(14.0),
+            ..renderer::Settings::default()
+        }),
     );
-    let viewport = Viewport::with_physical_size(Size::new(width, height), 1.0);
+    let viewport = Viewport::with_physical_size(
+        Size::new(width, height),
+        renderer::Scale { window: 1.0, application: 1.0 },
+    );
     let logical = Size::new(width as f32, height as f32);
     let mut cache = Cache::new();
     let mut cursor_pos = Point::new(width as f32 / 2.0, height as f32 / 2.0);
@@ -122,12 +143,13 @@ pub fn render_interactive_to_png<State, Msg>(
         }
         let cursor = mouse::Cursor::Available(cursor_pos);
         let mut ui = UserInterface::build(view(&state), logical, cache, &mut renderer);
-        let mut messages: Vec<Msg> = Vec::new();
+        let mut messages = shell::Bus::new();
         ui.update(
+            &iced::window::Headless,
+            &shell::Waker::noop(),
             std::slice::from_ref(event),
             cursor,
             &mut renderer,
-            &mut clipboard::Null,
             &mut messages,
         );
         cache = ui.into_cache();
@@ -144,7 +166,7 @@ pub fn render_interactive_to_png<State, Msg>(
         unreachable!("constructed the tiny-skia variant above");
     };
     let rgba =
-        iced_tiny_skia::window::compositor::screenshot(ts, &viewport, theme.palette().background);
+        iced_tiny_skia::window::compositor::screenshot(ts, &viewport, theme.palette().background.base.color);
     encode_png(&rgba, width, height, path);
     (width, height)
 }

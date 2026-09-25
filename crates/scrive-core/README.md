@@ -99,7 +99,7 @@ Attach a grammar with `.language(grammar)` (highlighting is coloured at load, no
 scroll needed) and override defaults with `.theme(..)`, `.find(..)`,
 `.completions(..)`, `.hover(..)`, and `.signature(..)`. For full control, drop to
 the low-level `Editor` widget. The host **must** register the bundled font —
-`iced::application(..).font(scrive_iced::CODICON_FONT)` — so the fold chevrons
+`iced::application(..).fonts([scrive_iced::CODICON_FONT])` — so the fold chevrons
 and find-bar icons render.
 
 ## Examples

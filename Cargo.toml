@@ -9,3 +9,12 @@ edition = "2021"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/robbym/scrive"
+
+# Track iced's git master. The requirements in scrive-iced are `0.15.0-dev`
+# to match it; the dev-dep sub-crates are patched to the same source so their
+# types unify with the ones `iced` re-exports.
+[patch.crates-io]
+iced = { git = "https://github.com/iced-rs/iced", rev = "10e9b995eb5af74dbac08ed62b01971fe7e495b2" }
+iced_renderer = { git = "https://github.com/iced-rs/iced", rev = "10e9b995eb5af74dbac08ed62b01971fe7e495b2" }
+iced_tiny_skia = { git = "https://github.com/iced-rs/iced", rev = "10e9b995eb5af74dbac08ed62b01971fe7e495b2" }
+iced_runtime = { git = "https://github.com/iced-rs/iced", rev = "10e9b995eb5af74dbac08ed62b01971fe7e495b2" }

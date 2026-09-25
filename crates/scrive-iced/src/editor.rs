@@ -19,11 +19,11 @@
 //! caret-moving action and resolved at layout — so the view never chases the
 //! caret while the user is scrolling by hand.
 
-use iced::advanced::clipboard::Kind as ClipboardKind;
-use iced::advanced::text::{Alignment, LineHeight, Renderer as _, Shaping, Text, Wrapping};
+use iced::advanced::clipboard::{self, Kind as ClipboardKind};
+use iced::advanced::text::{Alignment, Ellipsis, LineHeight, Renderer as _, Shaping, Text, Wrapping};
 use iced::advanced::widget::operation::Focusable;
 use iced::advanced::widget::{self, Operation, Widget};
-use iced::advanced::{layout, mouse, renderer, Clipboard, Layout, Shell};
+use iced::advanced::{layout, mouse, renderer, Layout, Shell};
 use iced::alignment::Vertical;
 use iced::keyboard::key::Named;
 use iced::keyboard::{Event as Keyboard, Key, Modifiers};
@@ -518,6 +518,10 @@ struct State {
     /// on hover — as mainstream editors do. Tracked so a move on/off the gutter
     /// triggers exactly one redraw.
     gutter_hover: bool,
+    /// A Ctrl+V clipboard read is in flight. Reads are asynchronous and their
+    /// result is broadcast to every widget, so only the editor that asked
+    /// consumes the next `clipboard::Event::Read`.
+    paste_pending: bool,
     /// The buffer row under the pointer while it is over the gutter — drives
     /// the hovered fold chevron's brightening (disambiguating adjacent
     /// chevrons). Tracked so a row-to-row move inside the gutter repaints
@@ -556,6 +560,7 @@ impl Default for State {
             hover_at: None,
             hover_scroll: 0.0,
             gutter_hover: false,
+            paste_pending: false,
             gutter_hover_row: None,
             fold_preview: None,
             hover_chip: None,
@@ -1177,7 +1182,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
     fn operate(
         &mut self,
         tree: &mut widget::Tree,
-        layout: Layout<'_>,
+        layout: Layout,
+        _viewport: &Rectangle,
         _renderer: &iced::Renderer,
         operation: &mut dyn Operation,
     ) {
@@ -1194,8 +1200,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         tree: &mut widget::Tree,
         _renderer: &iced::Renderer,
         limits: &layout::Limits,
-    ) -> layout::Node {
-        let size = limits.max();
+    ) {
+        let size = limits.bounds();
         let state = tree.state.downcast_mut::<State>();
         self.ensure_metrics(state);
         let (advance, line_h) = (state.metrics.advance, state.metrics.line_height);
@@ -1279,7 +1285,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         );
         state.scroll_x =
             state.scroll_x.clamp(0.0, self.max_scroll_x(vp, advance, line_h, state.scroll.rows(line_h)));
-        layout::Node::new(size)
+        tree.size = size;
     }
 
     fn draw(
@@ -1288,7 +1294,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         renderer: &mut iced::Renderer,
         theme: &iced::Theme,
         _style: &renderer::Style,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
     ) {
@@ -1300,7 +1306,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         let state = tree.state.downcast_ref::<State>();
         let (advance, line_h) = (state.metrics.advance, state.metrics.line_height);
         let bounds = layout.bounds();
-        let palette = theme.extended_palette();
+        let palette = theme.palette();
         let geo = self.geo(state, bounds);
         let buffer = self.doc.buffer();
         // Whether the pointer is over the gutter — the expanded (chevron-down)
@@ -1929,10 +1935,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         &mut self,
         tree: &mut widget::Tree,
         event: &Event,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
@@ -2373,12 +2378,12 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     if let Key::Character(c) = key {
                         match c.as_str() {
                             "c" => {
-                                self.write_clipboard(clipboard);
+                                self.write_clipboard(shell);
                                 shell.capture_event();
                                 return;
                             }
                             "x" => {
-                                self.write_clipboard(clipboard);
+                                self.write_clipboard(shell);
                                 state.autoscroll = true;
                                 state.ping();
                                 shell.publish((self.on_action)(Action::Cut));
@@ -2386,17 +2391,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                                 return;
                             }
                             "v" => {
-                                if let Some(pasted) = clipboard.read(ClipboardKind::Standard) {
-                                    state.autoscroll = true;
-                                    state.ping();
-                                    // Whole-line copies paste above the caret's
-                                    // line — a side table remembers ours.
-                                    let entire_line = crate::clipboard::is_entire_line(&pasted);
-                                    shell.publish((self.on_action)(Action::Paste {
-                                        text: pasted,
-                                        entire_line,
-                                    }));
-                                }
+                                state.paste_pending = true;
+                                shell.read_clipboard(ClipboardKind::Text);
                                 shell.capture_event();
                                 return;
                             }
@@ -2462,6 +2458,22 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             // would drive scroll/selection from a button-less cursor on the
             // next move. (CursorLeft is deliberately NOT a trigger: a drag past
             // the viewport edge must keep selecting.)
+            Event::Clipboard(clipboard::Event::Read(result)) if state.paste_pending => {
+                state.paste_pending = false;
+                if let Ok(content) = result {
+                    if let clipboard::Content::Text(pasted) = content.as_ref() {
+                        state.autoscroll = true;
+                        state.ping();
+                        // Whole-line copies paste above the caret's line — a
+                        // side table remembers ours.
+                        let entire_line = crate::clipboard::is_entire_line(pasted);
+                        shell.publish((self.on_action)(Action::Paste {
+                            text: pasted.clone(),
+                            entire_line,
+                        }));
+                    }
+                }
+            }
             Event::Window(window::Event::Unfocused) => {
                 state.drag = None;
                 state.column_drag_anchor = None;
@@ -2521,7 +2533,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
     fn mouse_interaction(
         &self,
         tree: &widget::Tree,
-        layout: Layout<'_>,
+        layout: Layout,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &iced::Renderer,
@@ -2824,6 +2836,8 @@ impl<Message> Editor<'_, Message> {
                         align_y: Vertical::Top,
                         shaping: Shaping::Basic,
                         wrapping: Wrapping::Word,
+                        ellipsis: Ellipsis::None,
+                        hint_factor: None,
                     },
                     Point::new(row_x, y + 1.0),
                     dim,
@@ -2947,12 +2961,12 @@ impl<Message> Editor<'_, Message> {
     /// rule ([`Document::clipboard_payload`] — non-empty selections joined, or
     /// whole lines for empty carets), re-expanded to the OS EOL flavor and
     /// recorded in a side table so paste can recognize a whole-line copy.
-    fn write_clipboard(&self, clipboard: &mut dyn Clipboard) {
+    fn write_clipboard(&self, shell: &mut Shell<'_, Message>) {
         let (text, entire_line) = self.doc.clipboard_payload();
         if !text.is_empty() {
             let exported = crate::clipboard::export_eol(&text);
             crate::clipboard::record(&exported, entire_line);
-            clipboard.write(ClipboardKind::Standard, exported);
+            shell.write_clipboard(exported);
         }
     }
 
@@ -3285,6 +3299,8 @@ impl<Message> Editor<'_, Message> {
                 align_y: Vertical::Top,
                 shaping: Shaping::Basic,
                 wrapping: Wrapping::None,
+                ellipsis: Ellipsis::None,
+                hint_factor: None,
             },
             position,
             color,
@@ -3318,6 +3334,8 @@ impl<Message> Editor<'_, Message> {
                 align_y: Vertical::Top,
                 shaping: Shaping::Basic,
                 wrapping: Wrapping::None,
+                ellipsis: Ellipsis::None,
+                hint_factor: None,
             },
             Point::new(origin.x + width / 2.0, origin.y),
             color,
@@ -3347,6 +3365,8 @@ impl<Message> Editor<'_, Message> {
                 align_y: Vertical::Top,
                 shaping: Shaping::Basic,
                 wrapping: Wrapping::None,
+                ellipsis: Ellipsis::None,
+                hint_factor: None,
             },
             position,
             color,
@@ -4331,7 +4351,7 @@ mod tests {
         // rows (thousands here) and freeze; the display-window walk visits a few
         // dozen. A change that washes buffer rows through `draw_wash_row` trips
         // this and the in-`draw` debug assert.
-        use iced::advanced::{clipboard, mouse, renderer};
+        use iced::advanced::{mouse, renderer, shell};
         use iced::{Font, Pixels, Point as IPoint, Size};
         use iced_runtime::user_interface::{Cache, UserInterface};
 
@@ -4357,19 +4377,24 @@ mod tests {
             .expect("font system lock")
             .load_font(std::borrow::Cow::Borrowed(crate::CODICON_FONT));
         let mut r = iced_renderer::fallback::Renderer::Secondary(
-            iced_tiny_skia::Renderer::new(Font::default(), Pixels(14.0)),
+            iced_tiny_skia::Renderer::new(renderer::Settings {
+                font: Font::default(),
+                text_size: Pixels(14.0),
+                ..renderer::Settings::default()
+            }),
         );
         let (w, h) = (500.0_f32, 320.0_f32);
         let cursor = mouse::Cursor::Available(IPoint::new(w / 2.0, h / 2.0));
         let element: iced::Element<'_, (), iced::Theme, iced::Renderer> =
             Editor::new(&doc, |_: Action| ()).into();
         let mut ui = UserInterface::build(element, Size::new(w, h), Cache::new(), &mut r);
-        let mut msgs: Vec<()> = Vec::new();
+        let mut msgs = shell::Bus::new();
         ui.update(
+            &iced::window::Headless,
+            &shell::Waker::noop(),
             &[iced::Event::Window(iced::window::Event::RedrawRequested(std::time::Instant::now()))],
             cursor,
             &mut r,
-            &mut clipboard::Null,
             &mut msgs,
         );
         ui.draw(&mut r, &iced::Theme::Dark, &renderer::Style::default(), cursor);

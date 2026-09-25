@@ -22,7 +22,7 @@ use std::fs::File;
 use std::task::{Context, Poll, Waker};
 
 use iced::advanced::widget::Operation;
-use iced::advanced::{clipboard, mouse, renderer};
+use iced::advanced::{mouse, renderer, shell};
 use iced::keyboard::key::{Key, Named, NativeCode, Physical};
 use iced::keyboard::{Event as KeyboardEvent, Location, Modifiers};
 use iced::{Event, Font, Pixels, Point, Size, Theme};
@@ -191,9 +191,13 @@ fn main() {
     drop(fs);
 
     let mut renderer = iced_renderer::fallback::Renderer::Secondary(
-        iced_tiny_skia::Renderer::new(Font::default(), Pixels(14.0)),
+        iced_tiny_skia::Renderer::new(renderer::Settings {
+            font: Font::default(),
+            text_size: Pixels(14.0),
+            ..renderer::Settings::default()
+        }),
     );
-    let viewport = Viewport::with_physical_size(Size::new(W, H), 1.0);
+    let viewport = Viewport::with_physical_size(Size::new(W, H), renderer::Scale { window: 1.0, application: 1.0 });
     let logical = Size::new(W as f32, H as f32);
     let cursor = mouse::Cursor::Available(Point::new(W as f32 / 2.0, H as f32 / 2.0));
     let theme: Theme = scrive_dark();
@@ -224,8 +228,15 @@ fn main() {
         ))];
         let mut ui: UserInterface<'_, Message, Theme, iced::Renderer> =
             UserInterface::build(app.view(), logical, cache, &mut renderer);
-        let mut published: Vec<Message> = Vec::new();
-        let _ = ui.update(&events, cursor, &mut renderer, &mut clipboard::Null, &mut published);
+        let mut published = shell::Bus::new();
+        let _ = ui.update(
+            &iced::window::Headless,
+            &shell::Waker::noop(),
+            &events,
+            cursor,
+            &mut renderer,
+            &mut published,
+        );
         cache = ui.into_cache();
         inbox.extend(published);
         while !inbox.is_empty() {
@@ -259,8 +270,15 @@ fn main() {
         for mut op in ops.drain(..) {
             ui.operate(&renderer, op.as_mut());
         }
-        let mut published: Vec<Message> = Vec::new();
-        let _ = ui.update(&events, cursor, &mut renderer, &mut clipboard::Null, &mut published);
+        let mut published = shell::Bus::new();
+        let _ = ui.update(
+            &iced::window::Headless,
+            &shell::Waker::noop(),
+            &events,
+            cursor,
+            &mut renderer,
+            &mut published,
+        );
         ui.draw(&mut renderer, &theme, &renderer::Style::default(), cursor);
         cache = ui.into_cache();
 
@@ -276,7 +294,7 @@ fn main() {
         let iced_renderer::fallback::Renderer::Secondary(ts) = &mut renderer else {
             unreachable!("constructed the tiny-skia variant above");
         };
-        let rgba = iced_tiny_skia::window::compositor::screenshot(ts, &viewport, theme.palette().background);
+        let rgba = iced_tiny_skia::window::compositor::screenshot(ts, &viewport, theme.palette().background.base.color);
 
         // Coalesce a frame identical to the previous one into extra delay.
         match &mut pending {

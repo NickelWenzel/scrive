@@ -10,7 +10,7 @@
 //! capture, for whatever monospace font the app configures.
 
 use iced::advanced::text::{
-    Alignment, LineHeight, Paragraph as _, Shaping, Text, Wrapping,
+    Alignment, Ellipsis, LineHeight, Paragraph as _, Shaping, Text, Wrapping,
 };
 use iced::alignment::Vertical;
 use iced::{Font, Pixels, Size};
@@ -50,6 +50,8 @@ impl Metrics {
             align_y: Vertical::Top,
             shaping: Shaping::Basic,
             wrapping: Wrapping::None,
+            ellipsis: Ellipsis::None,
+            hint_factor: None,
         };
         let width = Paragraph::with_text(text).min_width();
         let advance = width / SAMPLE.chars().count() as f32;
