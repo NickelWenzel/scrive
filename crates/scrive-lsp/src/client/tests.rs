@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use scrive_core::Document;
+use scrive_core::{Document, EditOp, GroupingHint, OpClass};
 use serde_json::{json, Value};
 
 use super::*;
@@ -66,6 +66,24 @@ fn did_open(uri: &str, version: i32, text: &str) -> Value {
     }}})
 }
 
+fn did_change(uri: &str, version: i32, changes: Vec<Value>) -> Value {
+    json!({"jsonrpc": "2.0", "method": "textDocument/didChange", "params": {
+        "textDocument": {"uri": uri, "version": version},
+        "contentChanges": changes,
+    }})
+}
+
+fn ranged(start: (u32, u32), end: (u32, u32), text: &str) -> Value {
+    json!({"range": {
+        "start": {"line": start.0, "character": start.1},
+        "end": {"line": end.0, "character": end.1},
+    }, "text": text})
+}
+
+fn whole(text: &str) -> Value {
+    json!({"text": text})
+}
+
 /// The `initialize` request advertises what the client handles, and carries the builder's
 /// inputs.
 #[test]
@@ -115,7 +133,7 @@ fn initialize_advertises_encodings_versions_and_workspace_capabilities() {
 /// `initialized` and the configuration push.
 #[test]
 fn handshake_sends_initialized_configuration_and_deferred_did_open_with_latest_text() {
-    let doc = document("fn main() {}");
+    let mut doc = document("fn main() {}");
     let (mut client, _) = Client::builder().configuration(json!({"x": 1})).build();
     let opened = client
         .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
@@ -123,6 +141,12 @@ fn handshake_sends_initialized_configuration_and_deferred_did_open_with_latest_t
     assert!(
         opened.messages.is_empty(),
         "nothing goes out before initialize is answered"
+    );
+    doc.edit(vec![EditOp::insert(0, "pub ")]).expect("edits");
+    let synced = client.sync(&doc.snapshot(), doc.drain_changes());
+    assert!(
+        synced.messages.is_empty(),
+        "sync before initialize sends nothing"
     );
     let output = client
         .receive(from_server(
@@ -135,9 +159,221 @@ fn handshake_sends_initialized_configuration_and_deferred_did_open_with_latest_t
             json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
             json!({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
                 "params": {"settings": {"x": 1}}}),
-            did_open("file:///a.rs", 1, "fn main() {}"),
+            did_open("file:///a.rs", 1, "pub fn main() {}"),
         ],
-        "the handshake finishes, then the deferred document opens",
+        "the handshake finishes, then the deferred document opens with its edited text",
+    );
+}
+
+/// Before `initialize` is answered, registering and syncing only store the snapshot.
+#[test]
+fn sync_before_initialize_sends_nothing() {
+    let mut doc = document("a");
+    let (mut client, _) = Client::builder().build();
+    let opened = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    assert!(
+        opened.messages.is_empty() && opened.updates.is_empty(),
+        "open before initialize sends nothing",
+    );
+    doc.edit(vec![EditOp::insert(1, "b")]).expect("edits");
+    let synced = client.sync(&doc.snapshot(), doc.drain_changes());
+    assert!(
+        synced.messages.is_empty() && synced.updates.is_empty(),
+        "sync before initialize sends nothing",
+    );
+}
+
+/// Ranges go out in the negotiated unit: after an astral character, utf-16 counts two units.
+#[test]
+fn utf16_server_receives_incremental_ranges_in_utf16() {
+    let mut doc = document("😀a");
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    doc.edit(vec![EditOp::insert(5, "b")]).expect("edits");
+    assert_eq!(
+        wire(&client.sync(&doc.snapshot(), doc.drain_changes()).messages),
+        vec![did_change(
+            "file:///a.rs",
+            2,
+            vec![ranged((0, 3), (0, 3), "b")]
+        )],
+        "the insert after `😀a` is at utf-16 column 3",
+    );
+}
+
+/// Undoing a typing run replays several steps. Each step's log entry converts against its own
+/// `before`, so the server receives exact incremental deletes instead of the whole text.
+#[test]
+fn undo_of_a_typing_run_syncs_incrementally_in_one_did_change() {
+    let mut doc = document("ab");
+    let (mut client, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    for (at, c) in [(2, "c"), (3, "d")] {
+        doc.edit_grouped(
+            vec![EditOp::insert(at, c)],
+            GroupingHint::mergeable(OpClass::Type),
+        )
+        .expect("types");
+    }
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+    assert!(doc.undo(), "the typing run undoes");
+    assert_eq!(
+        doc.snapshot().text(),
+        "ab",
+        "the whole run is one undo step"
+    );
+    assert_eq!(
+        wire(&client.sync(&doc.snapshot(), doc.drain_changes()).messages),
+        vec![did_change(
+            "file:///a.rs",
+            3,
+            vec![ranged((0, 3), (0, 4), ""), ranged((0, 2), (0, 3), "")],
+        )],
+        "undo of a two-step typing run is one didChange with two ranged deletes, newest first",
+    );
+}
+
+/// Several commits drained at once go out as one `didChange`, in commit order.
+#[test]
+fn multi_commit_drain_is_sent_as_one_did_change() {
+    let mut doc = document("abc");
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    doc.edit(vec![EditOp::insert(0, "x")]).expect("edits");
+    doc.edit(vec![EditOp::insert(4, "y")]).expect("edits");
+    assert_eq!(
+        wire(&client.sync(&doc.snapshot(), doc.drain_changes()).messages),
+        vec![did_change(
+            "file:///a.rs",
+            2,
+            vec![ranged((0, 0), (0, 0), "x"), ranged((0, 4), (0, 4), "y")],
+        )],
+        "both commits go out in one didChange, oldest first",
+    );
+}
+
+/// A log that starts past what the server has leaves a gap, so the whole text goes out.
+#[test]
+fn broken_chain_falls_back_to_full_text() {
+    let mut doc = document("abc");
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    doc.edit(vec![EditOp::insert(0, "x")]).expect("edits");
+    let _lost = doc.drain_changes();
+    doc.edit(vec![EditOp::insert(0, "y")]).expect("edits");
+    assert_eq!(
+        wire(&client.sync(&doc.snapshot(), doc.drain_changes()).messages),
+        vec![did_change("file:///a.rs", 2, vec![whole("yxabc")])],
+        "a gap in the chain sends the whole text",
+    );
+}
+
+/// Another document's log never describes this document's edits.
+#[test]
+fn foreign_doc_id_changes_fall_back_to_full_text() {
+    let (mut a, mut b) = (document("abc"), document("def"));
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&a.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens a");
+    let _ = client
+        .open(&b.snapshot(), &uri("file:///b.rs"), "rust")
+        .expect("opens b");
+    a.edit(vec![EditOp::insert(0, "x")]).expect("edits a");
+    b.edit(vec![EditOp::insert(0, "y")]).expect("edits b");
+    let _ = a.drain_changes();
+    assert_eq!(
+        wire(&client.sync(&a.snapshot(), b.drain_changes()).messages),
+        vec![did_change("file:///a.rs", 2, vec![whole("xabc")])],
+        "a's snapshot with b's log sends a's whole text",
+    );
+}
+
+/// A log that overflowed its cap has no chain, so the whole text goes out.
+#[test]
+fn capped_log_falls_back_to_full_text() {
+    let mut doc = document("");
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    for at in 0..1025 {
+        doc.edit(vec![EditOp::insert(at, "a")]).expect("edits");
+    }
+    let changes = doc.drain_changes();
+    assert_eq!(changes.from(), None, "the log broke at its cap");
+    assert_eq!(
+        wire(&client.sync(&doc.snapshot(), changes).messages),
+        vec![did_change(
+            "file:///a.rs",
+            2,
+            vec![whole(&"a".repeat(1025))]
+        )],
+        "a broken log sends the whole text",
+    );
+}
+
+/// A server that only takes full syncs gets the whole text even when the chain would pass.
+#[test]
+fn full_sync_server_receives_whole_text() {
+    let mut doc = document("abc");
+    let (mut client, _) = running(Client::builder(), json!({"textDocumentSync": 1}));
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    doc.edit(vec![EditOp::insert(3, "d")]).expect("edits");
+    assert_eq!(
+        wire(&client.sync(&doc.snapshot(), doc.drain_changes()).messages),
+        vec![did_change("file:///a.rs", 2, vec![whole("abcd")])],
+        "a FULL server gets the whole text",
+    );
+}
+
+/// Syncing a snapshot the server already has sends nothing.
+#[test]
+fn unchanged_revision_sends_nothing() {
+    let mut doc = document("abc");
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    doc.edit(vec![EditOp::insert(3, "d")]).expect("edits");
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+    let again = client.sync(&doc.snapshot(), doc.drain_changes());
+    assert!(
+        again.messages.is_empty() && again.updates.is_empty(),
+        "a second sync at the same revision sends nothing",
+    );
+}
+
+/// A reopened URI continues its version count, so versions never repeat for one URI.
+#[test]
+fn version_high_water_mark_survives_reopen() {
+    let (mut first, second) = (document("a"), document("b"));
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&first.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    first.edit(vec![EditOp::insert(1, "x")]).expect("edits");
+    let _ = client.sync(&first.snapshot(), first.drain_changes());
+    let _ = client.close(first.doc_id());
+    let reopened = client
+        .open(&second.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("reopens");
+    assert_eq!(
+        wire(&reopened.messages),
+        vec![did_open("file:///a.rs", 3, "b")],
+        "the reopen takes version 3, after didOpen 1 and didChange 2",
     );
 }
 
@@ -216,10 +452,10 @@ fn shutdown_error_response_still_sends_exit() {
 }
 
 /// Before `initialize` is answered there is nothing to shut down: nothing goes out, and the
-/// late answer is ignored.
+/// late answer is ignored, and so is every later sync.
 #[test]
 fn shutdown_before_initialize_exits_silently() {
-    let doc = document("a");
+    let mut doc = document("a");
     let (mut client, _) = Client::builder().build();
     let _ = client
         .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
@@ -227,6 +463,14 @@ fn shutdown_before_initialize_exits_silently() {
     assert!(
         client.shutdown().messages.is_empty(),
         "shutdown sends nothing"
+    );
+    doc.edit(vec![EditOp::insert(1, "b")]).expect("edits");
+    assert!(
+        client
+            .sync(&doc.snapshot(), doc.drain_changes())
+            .messages
+            .is_empty(),
+        "sync declines after shutdown",
     );
     let late = client
         .receive(from_server(
@@ -260,10 +504,10 @@ fn server_requests_after_shutdown_get_null() {
     );
 }
 
-/// After `shutdown()`, registering and closing documents send nothing.
+/// After `shutdown()`, registering, syncing and closing documents send nothing.
 #[test]
 fn client_calls_decline_after_shutdown() {
-    let (a, b) = (document("a"), document("b"));
+    let (mut a, b) = (document("a"), document("b"));
     let (mut client, _) = running(Client::builder(), incremental());
     let _ = client
         .open(&a.snapshot(), &uri("file:///a.rs"), "rust")
@@ -273,6 +517,14 @@ fn client_calls_decline_after_shutdown() {
         .open(&b.snapshot(), &uri("file:///b.rs"), "rust")
         .expect("open declines without an error");
     assert!(opened.messages.is_empty(), "open declines after shutdown");
+    a.edit(vec![EditOp::insert(1, "b")]).expect("edits");
+    assert!(
+        client
+            .sync(&a.snapshot(), a.drain_changes())
+            .messages
+            .is_empty(),
+        "sync declines after shutdown",
+    );
     assert!(
         client.close(a.doc_id()).messages.is_empty(),
         "close declines after shutdown"
@@ -283,7 +535,7 @@ fn client_calls_decline_after_shutdown() {
 /// waiting for their `didOpen` are dropped.
 #[test]
 fn failed_initialize_is_a_server_error_and_drops_deferred_opens() {
-    let doc = document("a");
+    let mut doc = document("a");
     let (mut client, _) = Client::builder().build();
     let _ = client
         .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
@@ -294,6 +546,14 @@ fn failed_initialize_is_a_server_error_and_drops_deferred_opens() {
     assert!(
         matches!(&failed, Err(Error::Server { doc_id: None, method, .. }) if method == "initialize"),
         "a failed initialize is a server error, got {failed:?}",
+    );
+    doc.edit(vec![EditOp::insert(1, "b")]).expect("edits");
+    assert!(
+        client
+            .sync(&doc.snapshot(), doc.drain_changes())
+            .messages
+            .is_empty(),
+        "nothing syncs after a failed initialize",
     );
     assert!(
         client.close(doc.doc_id()).messages.is_empty(),

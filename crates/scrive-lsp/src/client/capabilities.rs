@@ -3,7 +3,7 @@
 use lsp_types::{
     ClientCapabilities, GeneralClientCapabilities, PublishDiagnosticsClientCapabilities,
     ServerCapabilities, TextDocumentClientCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncClientCapabilities, WorkspaceClientCapabilities,
+    TextDocumentSyncClientCapabilities, TextDocumentSyncKind, WorkspaceClientCapabilities,
 };
 
 use crate::Encoding;
@@ -13,20 +13,25 @@ use crate::Encoding;
 pub(crate) struct Server {
     /// Whether the server wants `didOpen` and `didClose`.
     pub(crate) open_close: bool,
+    /// How `didChange` is sent; anything but FULL or INCREMENTAL means not at all.
+    pub(crate) change: TextDocumentSyncKind,
 }
 
 impl Server {
+    /// An absent `textDocumentSync`, and an options object without `openClose` or `change`,
+    /// mean the spec's defaults: no open/close notifications and no changes.
     pub(crate) fn new(capabilities: &ServerCapabilities) -> Self {
-        let open_close = match &capabilities.text_document_sync {
+        let (open_close, change) = match &capabilities.text_document_sync {
             // LSP §textDocument_synchronization: a bare kind is the shorthand for
             // `{ openClose: true, change: kind }`.
-            Some(TextDocumentSyncCapability::Kind(_)) => true,
-            Some(TextDocumentSyncCapability::Options(options)) => {
-                options.open_close.unwrap_or(false)
-            }
-            None => false,
+            Some(TextDocumentSyncCapability::Kind(kind)) => (true, *kind),
+            Some(TextDocumentSyncCapability::Options(options)) => (
+                options.open_close.unwrap_or(false),
+                options.change.unwrap_or(TextDocumentSyncKind::NONE),
+            ),
+            None => (false, TextDocumentSyncKind::NONE),
         };
-        Self { open_close }
+        Self { open_close, change }
     }
 }
 

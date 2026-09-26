@@ -10,10 +10,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use lsp_types::{
     ApplyWorkspaceEditResponse, ClientInfo, ConfigurationParams, DidChangeConfigurationParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, InitializeParams, InitializeResult,
-    InitializedParams, TextDocumentIdentifier, TextDocumentItem, Uri, WorkspaceFolder,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    InitializeParams, InitializeResult, InitializedParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind, Uri,
+    VersionedTextDocumentIdentifier, WorkspaceFolder,
 };
-use scrive_core::{DocId, Snapshot};
+use scrive_core::{document, DocId, Revision, Snapshot};
 use serde_json::Value;
 
 use crate::message::{self, Message};
@@ -30,8 +32,9 @@ static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 /// One connection to one language server.
 ///
 /// The host builds it with [`Client::builder`], sends the `initialize` request that
-/// [`Builder::build`] returns, then passes every server message to [`receive`](Self::receive)
-/// and registers documents with [`open`](Self::open). Every entry point returns what to send
+/// [`Builder::build`] returns, then passes every server message to [`receive`](Self::receive).
+/// Documents are registered with [`open`](Self::open) and kept current with
+/// [`sync`](Self::sync) after every round of edits. Every entry point returns what to send
 /// and what to apply; the client itself never does I/O.
 #[derive(Debug)]
 pub struct Client {
@@ -205,6 +208,70 @@ impl Client {
                 )));
         }
         output
+    }
+
+    /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
+    /// it leads exactly from what the server has to `snapshot`, and the server syncs
+    /// incrementally, the edits go out as ranges; otherwise the whole text goes out. Servers that
+    /// take no changes are sent nothing. Either way the snapshot becomes the one server
+    /// positions are converted against.
+    ///
+    /// A snapshot no newer than the synced one, a document that is not registered, and any call
+    /// after [`shutdown`](Self::shutdown) send nothing.
+    pub fn sync(&mut self, snapshot: &Snapshot, changes: document::Changes) -> Output {
+        let Self {
+            state,
+            encoding,
+            tracked,
+            versions,
+            ..
+        } = self;
+        let Some(tracked) = tracked.iter_mut().find(|t| t.doc_id == snapshot.doc_id()) else {
+            return Output::default();
+        };
+        if snapshot.revision() <= tracked.synced.revision() {
+            return Output::default();
+        }
+        let server = match state {
+            State::Running(server) => server,
+            State::Initializing { .. } => {
+                tracked.synced = snapshot.clone();
+                return Output::default();
+            }
+            State::ShuttingDown { .. } | State::Exited => return Output::default(),
+        };
+        let content_changes = if !server.open_close || tracked.version.is_none() {
+            None
+        } else if server.change == TextDocumentSyncKind::INCREMENTAL {
+            Some(
+                incremental(*encoding, &tracked.synced, snapshot, &changes)
+                    .unwrap_or_else(|| full(snapshot)),
+            )
+        } else if server.change == TextDocumentSyncKind::FULL {
+            Some(full(snapshot))
+        } else {
+            None
+        };
+        tracked.synced = snapshot.clone();
+        let Some(content_changes) = content_changes else {
+            return Output::default();
+        };
+        let version = next_version(versions, &tracked.key);
+        tracked.version = Some(version);
+        Output {
+            messages: vec![Message::Notification(message::Notification::new::<
+                lsp_types::notification::DidChangeTextDocument,
+            >(
+                DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: tracked.key.uri().clone(),
+                        version,
+                    },
+                    content_changes,
+                },
+            ))],
+            updates: Vec::new(),
+        }
     }
 
     /// Starts an orderly shutdown: sends `shutdown`, and `exit` once its response arrives. Before
@@ -510,6 +577,52 @@ fn next_version(versions: &mut HashMap<uri::Key, i32>, key: &uri::Key) -> i32 {
     let version = versions.entry(key.clone()).or_insert(0);
     *version += 1;
     *version
+}
+
+/// The whole document as one content change.
+fn full(snapshot: &Snapshot) -> Vec<TextDocumentContentChangeEvent> {
+    vec![TextDocumentContentChangeEvent {
+        range: None,
+        range_length: None,
+        text: snapshot.text().into_owned(),
+    }]
+}
+
+/// The logged edits as ranged content changes, or `None` when `changes` does not lead exactly
+/// from `synced` to `snapshot`: another document's log, a broken log, a gap, or an end short of
+/// `snapshot`.
+fn incremental(
+    encoding: Encoding,
+    synced: &Snapshot,
+    snapshot: &Snapshot,
+    changes: &document::Changes,
+) -> Option<Vec<TextDocumentContentChangeEvent>> {
+    if changes.doc_id() != snapshot.doc_id() || changes.from() != Some(synced.revision()) {
+        return None;
+    }
+    let mut cursor = synced.revision();
+    let mut events = Vec::new();
+    for change in changes.iter() {
+        let before = change.before();
+        if before.revision() != cursor {
+            return None;
+        }
+        // The server applies content changes in order (LSP §textDocument_didChange). A
+        // commit's ops are descending, so every op lies before the ones already applied and
+        // its range is the same in `before` as in the text the server holds by then.
+        events.extend(
+            change
+                .ops()
+                .iter()
+                .map(|op| TextDocumentContentChangeEvent {
+                    range: Some(encoding.range(before, op.range.clone())),
+                    range_length: None,
+                    text: op.text.clone(),
+                }),
+        );
+        cursor = Revision(cursor.0 + 1);
+    }
+    (cursor == snapshot.revision()).then_some(events)
 }
 
 /// The workspace folder for `root`, named after its last path segment.
