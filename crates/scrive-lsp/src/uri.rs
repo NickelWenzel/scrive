@@ -25,6 +25,29 @@ impl Key {
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
+
+    /// The decoded file-system path of a `file:` key, `None` for other schemes. A drive letter
+    /// loses its leading slash (`c:/x`), and a host other than `localhost` keeps its UNC form
+    /// (`//host/share`).
+    pub(crate) fn file_path(&self) -> Option<String> {
+        let rest = without_query(self.as_str().strip_prefix("file:")?);
+        let path = rest
+            .strip_prefix("//")
+            .filter(|path| path.starts_with('/'))
+            .unwrap_or(rest);
+        let path = decode(path);
+        let bytes = path.as_bytes();
+        let drive = matches!(bytes, [b'/', letter, b':', ..] if letter.is_ascii_alphabetic());
+        Some(if drive { path[1..].to_owned() } else { path })
+    }
+
+    /// The decoded last non-empty path segment, or the whole URI text when there is none.
+    pub(crate) fn name(&self) -> String {
+        without_query(self.as_str())
+            .rsplit('/')
+            .find(|segment| !segment.is_empty())
+            .map_or_else(|| self.as_str().to_owned(), decode)
+    }
 }
 
 impl fmt::Display for Key {
@@ -51,7 +74,8 @@ pub fn normalize(uri: &Uri) -> Key {
     if !scheme.eq_ignore_ascii_case("file") {
         return Key(uri.clone());
     }
-    let (hier, tail) = rest.split_at(rest.find(['?', '#']).unwrap_or(rest.len()));
+    let hier = without_query(rest);
+    let tail = &rest[hier.len()..];
     let mut out = String::from("file:");
     let path = match hier.strip_prefix("//") {
         Some(after) => {
@@ -69,6 +93,31 @@ pub fn normalize(uri: &Uri) -> Key {
     // The output holds only characters fluent-uri accepts in a path, so the fallback never runs;
     // it keeps the function total without a panic.
     Uri::from_str(&out).map_or_else(|_| Key(uri.clone()), Key)
+}
+
+/// `text` up to its query or fragment.
+fn without_query(text: &str) -> &str {
+    &text[..text.find(['?', '#']).unwrap_or(text.len())]
+}
+
+/// Percent-decodes `text`. Decoded bytes that are not UTF-8 become U+FFFD.
+fn decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match hex_pair(bytes.get(i + 1..i + 3)).filter(|_| bytes[i] == b'%') {
+            Some(byte) => {
+                out.push(byte);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Decodes and re-encodes one path, then lowers a leading drive letter. `raw` is ASCII, since it
@@ -221,6 +270,33 @@ mod tests {
     #[test]
     fn non_file_uris_pass_through() {
         assert_normalizes(&FIXTURES[8..]);
+    }
+
+    /// `rootPath` is the decoded local path; a Windows drive path has no leading slash.
+    #[test]
+    fn file_path_and_name_are_decoded() {
+        let unix = key("file:///work/my%20proj/");
+        assert_eq!(
+            unix.file_path().as_deref(),
+            Some("/work/my proj/"),
+            "a unix path decodes"
+        );
+        assert_eq!(
+            unix.name(),
+            "my proj",
+            "the name is the last non-empty segment"
+        );
+        let windows = key("file:///C%3A/work");
+        assert_eq!(
+            windows.file_path().as_deref(),
+            Some("c:/work"),
+            "a drive path loses its slash"
+        );
+        assert_eq!(
+            key("untitled:x").file_path(),
+            None,
+            "only file URIs have a path"
+        );
     }
 
     /// Everything `normalize` emits parses as a `Uri`, and normalizing it again changes nothing.

@@ -4,6 +4,8 @@
 //! sends whatever the client returns; nothing here reads a socket, a clock or a thread. That keeps
 //! the crate a pure state machine that tests as data in, data out, and builds for wasm32.
 //!
+//! - the client state machine → [`Client`] ([`client`])
+//! - what the client hands back → [`Update`] ([`update`])
 //! - the JSON-RPC envelope → [`message`]
 //! - LSP positions ↔ scrive byte offsets → [`encoding`]
 //! - URI identity → [`uri`]
@@ -13,10 +15,14 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod encoding;
 pub mod message;
+pub mod update;
 pub mod uri;
 
+pub use client::{Client, Error, Output};
 pub use encoding::Encoding;
 pub use lsp_types;
 pub use message::Message;
+pub use update::Update;
