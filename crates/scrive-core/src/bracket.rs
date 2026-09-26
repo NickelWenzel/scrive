@@ -291,6 +291,17 @@ impl Brackets {
             .map(|(o, _)| o)
     }
 
+    /// The offset of the innermost opener `ch` (e.g. `b'('`) still open at
+    /// `offset`, looking strictly before it. Unlike [`Self::enclosing_pair`], an
+    /// unmatched opener counts, so the call being typed (`foo(a, b` with no `)`
+    /// yet) is found. Brackets inside strings and comments are skipped exactly
+    /// as matching skips them: line-locally, per the document's
+    /// [`BracketConfig`]. O(log + depth).
+    #[must_use]
+    pub fn innermost_open(&self, offset: u32, ch: u8) -> Option<u32> {
+        bracket_tree::innermost_open(&self.tree, offset, ch)
+    }
+
     /// The innermost matched pair whose CONTENTS contain the whole range —
     /// `open + 1 <= start && end <= close` — as `(open, close)`. The
     /// expand-selection ladder's next rung. `None` outside every pair.
@@ -905,5 +916,46 @@ mod tests {
         edit(&mut b, &mut buf, vec![EditOp::insert(p1, "("), EditOp::insert(p2, ")")]);
         assert_oracle(&b, &buf, "scattered two-insert transaction");
         assert_eq!(bat(&b, 1).partner, Some(18)); // "a(aa\n…\ne)ee"
+    }
+
+    /// The innermost `(` still open before the offset is found whether or not
+    /// it is closed later, and closed or foreign brackets never count.
+    #[test]
+    fn innermost_open_finds_the_unclosed_call() {
+        for (text, at, want) in [
+            ("foo(a, b", 8, Some(3)),
+            ("f(g(x), y", 9, Some(1)),
+            ("f(g(x", 5, Some(3)),
+            ("f(x)", 4, None),
+            ("f(x)", 2, Some(1)),
+            ("(", 0, None),
+            ("x = [1, 2", 9, None),
+            ("a[f(b]", 6, Some(3)),
+        ] {
+            let b = Brackets::match_text(text);
+            assert_eq!(b.innermost_open(at, b'('), want, "{text:?} at {at}");
+        }
+    }
+
+    /// A `(` inside a string or a line comment is not the call under a lexing
+    /// config, and is under the structural match.
+    #[test]
+    fn innermost_open_skips_a_paren_inside_a_string() {
+        let text = "f(\"(\", x";
+        assert_eq!(
+            Brackets::match_text_with(text, &cfg()).innermost_open(8, b'('),
+            Some(1),
+            "the string's paren is skipped"
+        );
+        assert_eq!(
+            Brackets::match_text(text).innermost_open(8, b'('),
+            Some(3),
+            "without lexing the string's paren counts"
+        );
+        assert_eq!(
+            Brackets::match_text_with("f( // (\n", &cfg()).innermost_open(7, b'('),
+            Some(1),
+            "the comment's paren is skipped"
+        );
     }
 }

@@ -66,14 +66,15 @@ impl SignatureInfo {
 pub struct SignatureRequest {
     ticket: Ticket,
     position: Point,
+    call: Option<u32>,
 }
 
 impl SignatureRequest {
-    /// A request for signature help at `position` (the caret), made under
-    /// `ticket`.
+    /// A request for signature help at `position` (the caret), inside the call
+    /// whose `(` sits at byte offset `call`, made under `ticket`.
     #[must_use]
-    pub fn new(ticket: Ticket, position: Point) -> Self {
-        Self { ticket, position }
+    pub fn new(ticket: Ticket, position: Point, call: Option<u32>) -> Self {
+        Self { ticket, position, call }
     }
 
     /// The ticket the reply must carry.
@@ -86,5 +87,15 @@ impl SignatureRequest {
     #[must_use]
     pub fn position(&self) -> Point {
         self.position
+    }
+
+    /// The byte offset of the innermost `(` still open at the caret, if any:
+    /// the call's identity. Two requests with the same `call` are about the
+    /// same call, so a client can keep one in flight while the user types its
+    /// arguments. It skips strings and comments only line-locally, as bracket
+    /// colouring does.
+    #[must_use]
+    pub fn call(&self) -> Option<u32> {
+        self.call
     }
 }

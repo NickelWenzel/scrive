@@ -1510,9 +1510,10 @@ impl CodeEditor {
             // No synchronous provider: record an async request for the host.
             let head = self.doc.selections().newest().head();
             let ticket = self.tickets.issue(self.doc.revision());
+            let call = self.doc.brackets().innermost_open(head, b'(');
             self.awaiting.signature = Some(ticket);
             self.pending_signature_request =
-                Some(SignatureRequest::new(ticket, self.doc.buffer().offset_to_point(head)));
+                Some(SignatureRequest::new(ticket, self.doc.buffer().offset_to_point(head), call));
         }
     }
 
@@ -2428,5 +2429,35 @@ mod tests {
         assert!(shown(&ed).is_empty(), "the superseded reply is dropped");
         ed.set_completions(second.ticket(), vec![item("fresh")]);
         assert_eq!(shown(&ed), ["fresh"], "the newest reply lands");
+    }
+
+    /// A signature request names the innermost `(` still open at the caret,
+    /// not a call that has closed before it.
+    #[test]
+    fn signature_request_names_the_innermost_open_paren() {
+        let mut ed = CodeEditor::new("");
+        for c in ['f', '(', 'g', '(', 'x', ')', ','] {
+            act(&mut ed, Action::Type(c));
+        }
+        let text = ed.document().text().into_owned();
+        let outer = text.find('(').expect("the outer call") as u32;
+        let req = ed.take_signature_request().expect("typing in a call re-queries while awaited");
+        assert_eq!(req.call(), Some(outer), "the closed inner call does not count: {text:?}");
+    }
+
+    /// With string lexing on, a `(` inside a string literal on the caret's
+    /// line is not the call.
+    #[test]
+    fn a_paren_inside_a_string_is_not_the_call() {
+        let mut ed = CodeEditor::new("g\nf(\"(\", \n").bracket_lexing(vec![b'"'], None);
+        act(&mut ed, Action::PlaceCaret(1));
+        act(&mut ed, Action::Type('('));
+        let _ = ed.take_signature_request();
+        let text = ed.document().text().into_owned();
+        let call = text.find("f(").expect("the call") as u32 + 1;
+        let end = text[call as usize..].find('\n').expect("the call's line ends") as u32 + call;
+        act(&mut ed, Action::PlaceCaret(end));
+        let req = ed.take_signature_request().expect("a move re-queries while awaited");
+        assert_eq!(req.call(), Some(call), "the paren inside the string is skipped");
     }
 }

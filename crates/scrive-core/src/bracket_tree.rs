@@ -152,6 +152,12 @@ fn enclosing_openers(tree: &SumTree<BracketItem>, offset: u32) -> Vec<Entry> {
     tree.summary_before(&ByteDim(offset)).stack
 }
 
+/// The offset of the innermost opener `ch` on the enclosing stack at `offset`,
+/// matched or not. O(log + depth).
+pub(crate) fn innermost_open(tree: &SumTree<BracketItem>, offset: u32, ch: u8) -> Option<u32> {
+    enclosing_openers(tree, offset).iter().rev().find(|e| e.ch == ch).map(|e| e.off)
+}
+
 /// The matched partner of the bracket `ch` at byte `offset`, or `None` if it is
 /// unmatched. Dispatches on the char — a closer looks left, an opener looks right.
 fn partner(tree: &SumTree<BracketItem>, offset: u32, ch: u8) -> Option<u32> {
