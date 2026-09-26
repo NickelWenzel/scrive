@@ -12,7 +12,7 @@ editing engine plus an `iced::advanced::Widget` that renders it.
 <sub>Recorded deterministically, headless — the demo renders itself, no external tools:
 `cargo run -p scrive-iced --example record_showcase --release -- docs/showcase.gif`</sub>
 
-Two crates, with the dependency pointing one way:
+Three crates, with every dependency pointing one way:
 
 - **`scrive-core`** — the headless engine: a rope-backed buffer, atomic
   multi-range transactions with mechanically-derived undo/redo, selections and
@@ -24,6 +24,10 @@ Two crates, with the dependency pointing one way:
   matching, indent guides, diagnostic squiggles, code folding, and the
   completion / hover / signature-help popups. Depends on `scrive-core`; the
   dependency never points back.
+- **`scrive-lsp`** — a Language Server Protocol bridge with no I/O: a state
+  machine that turns editor snapshots and change logs into JSON-RPC messages,
+  and server messages into per-document updates. Depends on `scrive-core`
+  only; `scrive-iced` pulls it in behind its `lsp` feature.
 
 ## Features
 
@@ -47,6 +51,10 @@ Two crates, with the dependency pointing one way:
   edit, so results never go stale.
 - **Language intelligence** — completion, snippets, signature help, and hover,
   exposed as trait seams the integrating application implements.
+- **Language servers** (the `lsp` feature) — one client per server, many
+  documents per client: incremental sync (including undo), diagnostics,
+  completion, signature help, hover, goto definition, rename across files, and
+  formatting. Late replies are dropped, never applied to text that moved.
 - **Diagnostics** — squiggles, a diagnostic hover, and scrollbar overview marks.
 
 Every derived position — a caret, a find match, a diagnostic, a snippet stop — is
@@ -104,19 +112,54 @@ the low-level `Editor` widget. The host **must** register the bundled font —
 `iced::application(..).fonts([scrive_iced::CODICON_FONT])` — so the fold chevrons
 and find-bar icons render.
 
+## Language servers
+
+Enable the `lsp` feature and `scrive_iced::lsp` re-exports the bridge. The app
+owns the transport (a child process, a socket, a web worker) and carries
+`lsp::Message`s both ways; the bridge owns everything between them:
+
+```rust
+// Boot: one client per server, one open_lsp per editor.
+let (mut client, initialize) = lsp::Client::builder().root(root).build();
+let mut outgoing = vec![initialize];
+outgoing.extend(editor.open_lsp(&mut client, &file, "rust")?);
+
+// After every editor update: sync, and send what it returns.
+let task = editor.update(event, now).map(Message::Editor);
+let outgoing = editor.sync_lsp(&mut client);
+
+// For every message from the server.
+let output = client.receive(message)?;
+let mut outgoing = output.messages;
+for update in output.updates {
+    if let lsp::Update::Document(document) = update {
+        // Route to the editor whose document().doc_id() == document.doc_id().
+        let applied = editor.apply_lsp(&mut client, document);
+        outgoing.extend(applied.messages);
+        // applied.jump: a definition in another tab — call that editor's jump().
+    }
+}
+```
+
+`scrive-lsp` does no I/O and builds for wasm32. `examples/lsp` runs two tabs
+against a scripted in-process server and shows the traffic.
+
 ## Examples
 
 ```bash
 cargo run -p scrive-iced --example minimal   # the CodeEditor quick start above
 cargo run -p scrive-iced --example scratch   # the low-level Editor widget, full control
+cargo run -p scrive-iced --features lsp --example lsp   # two tabs on a scripted language server
 ```
 
 `scratch` opens a real editor over a sample Rust document — type, select, find
-(Ctrl+F), fold, and undo/redo.
+(Ctrl+F), fold, and undo/redo. `lsp` shows the traffic panel next to the
+editor. Press F12 on `greet`, F2 to rename it across both files, or Shift+Alt+F
+to format.
 
 ## Web (wasm32)
 
-Both crates build for `wasm32-unknown-unknown`, and the examples run in the
+All three crates build for `wasm32-unknown-unknown`, and the examples run in the
 browser. The web has no system fonts, so on wasm32 the editor's default font is
 the bundled Fira Code ([`FIRA_CODE_FONT`](https://docs.rs/scrive-iced/latest/scrive_iced/constant.FIRA_CODE_FONT.html)), with its ligatures,
 which `required_fonts()` includes there. Enable iced's `fira-sans` feature for
@@ -130,6 +173,7 @@ the matching `wasm-bindgen` itself):
 ```bash
 cd crates/scrive-iced
 trunk serve --release --example minimal   # or: --example scratch
+trunk serve --release --example lsp --features lsp
 ```
 
 ## License
