@@ -2,7 +2,7 @@
 
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-    GeneralClientCapabilities, HoverClientCapabilities, HoverProviderCapability, MarkupKind,
+    DocumentFormattingClientCapabilities, GeneralClientCapabilities, HoverClientCapabilities, HoverProviderCapability, MarkupKind, OneOf,
     ParameterInformationSettings, PublishDiagnosticsClientCapabilities, ServerCapabilities,
     SignatureHelpClientCapabilities, SignatureInformationSettings, TextDocumentClientCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
@@ -24,6 +24,8 @@ pub(crate) struct Server {
     pub(crate) signature: bool,
     /// Whether the server answers `textDocument/hover`.
     pub(crate) hover: bool,
+    /// Whether the server answers `textDocument/formatting`.
+    pub(crate) formatting: bool,
 }
 
 impl Server {
@@ -52,6 +54,10 @@ impl Server {
             hover: matches!(
                 capabilities.hover_provider,
                 Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+            ),
+            formatting: matches!(
+                capabilities.document_formatting_provider,
+                Some(OneOf::Left(true) | OneOf::Right(_))
             ),
         }
     }
@@ -97,6 +103,7 @@ pub(crate) fn client() -> ClientCapabilities {
                 content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                 ..HoverClientCapabilities::default()
             }),
+            formatting: Some(DocumentFormattingClientCapabilities::default()),
             ..TextDocumentClientCapabilities::default()
         }),
         general: Some(GeneralClientCapabilities {

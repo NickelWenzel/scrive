@@ -3,8 +3,8 @@ use std::str::FromStr;
 use scrive_core::intel::completion::Start;
 use scrive_core::intel::ticket::Counter;
 use scrive_core::{
-    CompletionItem, Document, EditOp, GroupingHint, HoverInfo, HoverRequest, OpClass, Point,
-    SignatureInfo,
+    CompletionItem, Document, EditOp, FormatRequest, GroupingHint, HoverInfo, HoverRequest,
+    OpClass, Point, SignatureInfo,
 };
 use serde_json::{json, Value};
 
@@ -89,8 +89,8 @@ fn whole(text: &str) -> Value {
     json!({"text": text})
 }
 
-/// With [`completions`], [`signature`] and [`hover`], the only place tests read a `Change`, so a
-/// new variant changes only these helpers.
+/// With the other per-variant helpers ([`completions`], [`signature`], [`hover`], [`edits`]),
+/// the only place tests read a `Change`, so a new variant changes only these helpers.
 fn diagnostics(update: &Update) -> (DocId, update::Stamp, Vec<scrive_core::Diagnostic>) {
     let Update::Document(document) = update else {
         panic!("expected a document update, got {update:?}")
@@ -131,6 +131,17 @@ fn hover(update: &Update) -> (update::Stamp, Option<HoverInfo>) {
     match document.change() {
         update::Change::Hover(info) => (document.stamp(), info.clone()),
         other => panic!("expected a hover, got {other:?}"),
+    }
+}
+
+/// The stamp and ops of an edits update.
+fn edits(update: &Update) -> (update::Stamp, Vec<EditOp>) {
+    let Update::Document(document) = update else {
+        panic!("expected a document update, got {update:?}")
+    };
+    match document.change() {
+        update::Change::Edits(ops) => (document.stamp(), ops.clone()),
+        other => panic!("expected edits, got {other:?}"),
     }
 }
 
@@ -2316,5 +2327,172 @@ fn failed_hover_request_answers_none() {
             "stamped with the request's ticket"
         );
         assert!(info.is_none(), "the failure has no docs");
+    }
+}
+
+/// Server capabilities with incremental sync, utf-8 positions (fixture columns are bytes) and
+/// formatting.
+fn command_capabilities() -> Value {
+    json!({
+        "positionEncoding": "utf-8",
+        "textDocumentSync": 2,
+        "documentFormattingProvider": true,
+    })
+}
+
+/// A running client with `text` open as `file:///a.rs`, whose server offers the commands.
+fn commanding(text: &str) -> (Client, Document) {
+    let doc = document(text);
+    let (mut client, _) = running(Client::builder(), command_capabilities());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    (client, doc)
+}
+
+/// The success reply to request `id`.
+fn reply(id: i64, result: Value) -> Message {
+    from_server(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+/// A `TextEdit` over `start..end` (line, character).
+fn text_edit(start: (u32, u32), end: (u32, u32), text: &str) -> Value {
+    json!({"range": {
+        "start": {"line": start.0, "character": start.1},
+        "end": {"line": end.0, "character": end.1},
+    }, "newText": text})
+}
+
+/// `initialize` advertises formatting.
+#[test]
+fn initialize_advertises_formatting() {
+    let (_, initialize) = Client::builder().build();
+    let initialize = serde_json::to_value(&initialize).expect("serializes");
+    assert_eq!(
+        initialize.pointer("/params/capabilities/textDocument/formatting"),
+        Some(&json!({})),
+        "formatting is advertised",
+    );
+}
+
+/// A format request asks for the whole document, indented with spaces at the request's width.
+#[test]
+fn format_request_asks_for_spaces_at_the_tab_size() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding("fn a() {}  \n");
+    let request = FormatRequest::new(tickets.issue(doc.revision()), 4);
+    assert_eq!(
+        wire(&client.format(&doc.snapshot(), &request).messages),
+        vec![json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/formatting", "params": {
+            "textDocument": {"uri": "file:///a.rs"},
+            "options": {"tabSize": 4, "insertSpaces": true},
+        }})],
+        "the request goes out with spaces",
+    );
+}
+
+/// The formatted edits answer the request's ticket, trimmed and in LF.
+#[test]
+fn format_reply_is_stamped_with_the_request_ticket() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding("fn a() {}  \n");
+    let request = FormatRequest::new(tickets.issue(doc.revision()), 4);
+    let _ = client.format(&doc.snapshot(), &request);
+    let output = client
+        .receive(reply(2, json!([text_edit((0, 9), (0, 11), "")])))
+        .expect("the reply is accepted");
+    assert!(output.messages.is_empty(), "the answer sends nothing");
+    let [update] = output.updates.as_slice() else {
+        panic!("expected one update, got {:?}", output.updates)
+    };
+    let (stamp, ops) = edits(update);
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(request.ticket),
+        "stamped with the request's ticket"
+    );
+    assert_eq!(
+        ops,
+        vec![EditOp::delete(9..11)],
+        "the trailing blanks go"
+    );
+}
+
+/// A reply to a format asked before the latest edit would rewrite text that has moved.
+#[test]
+fn format_reply_after_an_edit_is_dropped() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = commanding("fn a() {}  \n");
+    let request = FormatRequest::new(tickets.issue(doc.revision()), 4);
+    let _ = client.format(&doc.snapshot(), &request);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(0, "x")]);
+    assert_silent(
+        &client
+            .receive(reply(2, json!([text_edit((0, 9), (0, 11), "")])))
+            .expect("a stale reply is not an error"),
+        "a stale format reply is dropped",
+    );
+}
+
+/// A result with nothing to change answers nothing: formatting has no slot to settle.
+#[test]
+fn format_reply_without_changes_answers_nothing() {
+    for result in [json!(null), json!([]), json!([text_edit((0, 0), (0, 2), "fn")])] {
+        let mut tickets = Counter::new();
+        let (mut client, doc) = commanding("fn a() {}\n");
+        let _ = client.format(
+            &doc.snapshot(),
+            &FormatRequest::new(tickets.issue(doc.revision()), 4),
+        );
+        assert_silent(
+            &client.receive(reply(2, result)).expect("the reply is accepted"),
+            "nothing to change",
+        );
+    }
+}
+
+/// A user asked for the format, so a failed or undecodable reply is reported, not swallowed.
+#[test]
+fn format_failures_are_errors() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding("fn a() {}\n");
+    let request = FormatRequest::new(tickets.issue(doc.revision()), 4);
+    let _ = client.format(&doc.snapshot(), &request);
+    let error = client
+        .receive(failure(2, -32603))
+        .expect_err("a server error is reported");
+    assert!(
+        matches!(&error, Error::Server { doc_id: Some(id), method, .. }
+            if *id == doc.doc_id() && method == "textDocument/formatting"),
+        "the error names the document and the method: {error:?}",
+    );
+    let _ = client.format(&doc.snapshot(), &request);
+    let error = client
+        .receive(reply(3, json!("x")))
+        .expect_err("an undecodable result is reported");
+    assert!(
+        matches!(&error, Error::Decode { method, .. } if method == "textDocument/formatting"),
+        "the error names the method: {error:?}",
+    );
+}
+
+/// With no server to ask, or one without a provider, a format sends nothing and answers nothing.
+#[test]
+fn format_declines_before_initialize_and_without_a_provider() {
+    let doc = document("fn a() {}\n");
+    let (initializing, _) = Client::builder().build();
+    let (without, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
+    for mut client in [initializing, without] {
+        let mut tickets = Counter::new();
+        let _ = client
+            .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+            .expect("opens");
+        assert_silent(
+            &client.format(
+                &doc.snapshot(),
+                &FormatRequest::new(tickets.issue(doc.revision()), 4),
+            ),
+            "a declined format sends nothing",
+        );
     }
 }

@@ -1,6 +1,8 @@
 //! What the client hands back: document-bound changes, and notifications it passes through.
 
-use scrive_core::{CompletionItem, Diagnostic, DocId, HoverInfo, Revision, SignatureInfo, Ticket};
+use scrive_core::{
+    CompletionItem, Diagnostic, DocId, EditOp, HoverInfo, Revision, SignatureInfo, Ticket,
+};
 
 use crate::message;
 
@@ -41,6 +43,9 @@ pub enum Change {
     Signature(Option<SignatureInfo>),
     /// The hover card answering the ticket's request; `None` means no docs.
     Hover(Option<HoverInfo>),
+    /// A batch of edits for one `edit_grouped` transaction: LF text, each op trimmed to what
+    /// changes, sorted by `(start, end)` with tied inserts in the server's order.
+    Edits(Vec<EditOp>),
 }
 
 impl Document {

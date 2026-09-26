@@ -14,20 +14,20 @@ use lsp_types::{
     ApplyWorkspaceEditResponse, ClientInfo, CompletionContext, CompletionParams,
     CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    HoverParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
+    DocumentFormattingParams, FormattingOptions, HoverParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
     SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
     WorkspaceFolder,
 };
 use scrive_core::{
-    document, Bias, CompletionRequest, CompletionTrigger, DocId, HoverRequest, Revision,
-    SignatureRequest, Snapshot, Ticket,
+    document, Bias, CompletionRequest, CompletionTrigger, DocId, FormatRequest, HoverRequest,
+    Revision, SignatureRequest, Snapshot, Ticket,
 };
 use serde_json::Value;
 
 use crate::message::{self, Message};
 use crate::update::{self, Update};
-use crate::{completion, diagnostics, hover, signature, uri, Encoding};
+use crate::{completion, diagnostics, edits, hover, signature, uri, Encoding};
 
 /// JSON-RPC's "method not found": a server request this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -166,6 +166,7 @@ enum Kind {
     Completion,
     Signature,
     Hover,
+    Format,
 }
 
 /// What a pending request asked, with what its reply needs.
@@ -174,6 +175,8 @@ enum Query {
     Completion(completion::Query),
     Signature(signature::Query),
     Hover(hover::Query),
+    /// Formatting of the whole document at this indent width.
+    Format { tab_size: u32 },
 }
 
 impl Client {
@@ -427,6 +430,33 @@ impl Client {
         self.send(doc_id, ticket, Query::Hover(query), None)
     }
 
+    /// Asks the server to format the whole document, indenting with spaces. The answer is a
+    /// [`update::Change::Edits`] under the request's ticket; a result that changes nothing
+    /// answers nothing.
+    ///
+    /// When the server is not running or has no formatting provider, nothing is sent. A request
+    /// from a revision other than `snapshot`'s or the last synced one, or for a document that is
+    /// not registered, gets nothing either.
+    pub fn format(&mut self, snapshot: &Snapshot, request: &FormatRequest) -> Output {
+        let doc_id = snapshot.doc_id();
+        let ticket = request.ticket;
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
+            return Output::default();
+        };
+        if ticket.revision() != snapshot.revision()
+            || snapshot.revision() != tracked.synced.revision()
+        {
+            return Output::default();
+        }
+        if !matches!(&self.state, State::Running(server) if server.formatting) {
+            return Output::default();
+        }
+        let query = Query::Format {
+            tab_size: request.tab_size,
+        };
+        self.send(doc_id, ticket, query, None)
+    }
+
     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
     /// it leads exactly from what the server has to `snapshot`, and the server syncs
     /// incrementally, the edits go out as ranges; otherwise the whole text goes out. Servers that
@@ -590,17 +620,22 @@ impl Client {
             State::Initializing { .. }
             | State::Running(_)
             | State::ShuttingDown { .. }
-            | State::Exited => Ok(self.settled(&id, response.result)),
+            | State::Exited => self.settled(&id, response.result),
         }
     }
 
     /// Routes the reply to a pending request. Replies to requests the client no longer waits
-    /// for, and cancellations, are silent. A failed or undecodable reply settles the editor's
-    /// slot with the request's empty answer. A request the server dropped as content-modified is
-    /// sent again, at most once per ticket.
-    fn settled(&mut self, id: &message::Id, result: Result<Value, message::Error>) -> Output {
+    /// for, and cancellations, are silent. A failed or undecodable reply to an intel request
+    /// settles the editor's slot with the request's empty answer; one to a command is an error,
+    /// since a user asked for it. A request the server dropped as content-modified is sent
+    /// again, at most once per ticket.
+    fn settled(
+        &mut self,
+        id: &message::Id,
+        result: Result<Value, message::Error>,
+    ) -> Result<Output, Error> {
         let Some(index) = self.pending.iter().position(|p| p.id == *id) else {
-            return Output::default();
+            return Ok(Output::default());
         };
         let entry = self.pending.swap_remove(index);
         let synced = self
@@ -612,16 +647,21 @@ impl Client {
         // over, so a continuing request moves `latest_ticket` forward only after the sync. Only
         // when the reply arrives is it certain that no newer request adopted this entry.
         if synced != Some(entry.latest_ticket.revision()) {
-            return Output::default();
+            return Ok(Output::default());
         }
         match result {
             Err(error) if error.code == REQUEST_CANCELLED || error.code == SERVER_CANCELLED => {
-                Output::default()
+                Ok(Output::default())
             }
             // The drop above guarantees the ticket is still current, so the server's text has
             // caught up with the editor's and asking again can succeed.
-            Err(error) if error.code == CONTENT_MODIFIED => self.reissue(entry),
-            Err(_) => entry.failed(),
+            Err(error) if error.code == CONTENT_MODIFIED => Ok(self.reissue(entry)),
+            Err(error) if entry.query.kind().is_command() => Err(Error::Server {
+                doc_id: Some(entry.doc_id),
+                method: entry.query.method().to_owned(),
+                error,
+            }),
+            Err(_) => Ok(entry.failed()),
             Ok(value) => self.resolved(&entry, value),
         }
     }
@@ -648,20 +688,21 @@ impl Client {
                 }),
                 Some(entry.latest_ticket),
             ),
-            Query::Hover(query) => self.send(
+            query @ (Query::Hover(_) | Query::Format { .. }) => self.send(
                 entry.doc_id,
                 entry.latest_ticket,
-                Query::Hover(query),
+                query,
                 Some(entry.latest_ticket),
             ),
         }
     }
 
-    fn resolved(&mut self, entry: &Pending, value: Value) -> Output {
+    fn resolved(&mut self, entry: &Pending, value: Value) -> Result<Output, Error> {
         match &entry.query {
-            Query::Completion(query) => self.completed(entry, query, value),
-            Query::Signature(query) => self.signed(entry, query, value),
-            Query::Hover(query) => self.hovered(entry, query, value),
+            Query::Completion(query) => Ok(self.completed(entry, query, value)),
+            Query::Signature(query) => Ok(self.signed(entry, query, value)),
+            Query::Hover(query) => Ok(self.hovered(entry, query, value)),
+            Query::Format { .. } => self.formatted(entry, value),
         }
     }
 
@@ -879,6 +920,29 @@ impl Client {
         Output::answer(entry.doc_id, entry.latest_ticket, update::Change::Hover(card))
     }
 
+    /// Answers the ticket with the reply's edits, converted against the request's text, which
+    /// is still the synced text once `settled` let the reply through.
+    ///
+    /// # Errors
+    /// [`Error::Decode`] when the result is not a `TextEdit[]` or `null`.
+    fn formatted(&self, entry: &Pending, value: Value) -> Result<Output, Error> {
+        let text_edits: Option<Vec<lsp_types::TextEdit>> =
+            decode(entry.query.method(), Some(value))?;
+        let ops = edits::hygiene(
+            &entry.request_snapshot,
+            self.encoding,
+            &text_edits.unwrap_or_default(),
+        );
+        if ops.is_empty() {
+            return Ok(Output::default());
+        }
+        Ok(Output::answer(
+            entry.doc_id,
+            entry.latest_ticket,
+            update::Change::Edits(ops),
+        ))
+    }
+
     fn answer(&self, request: message::Request) -> Output {
         let response = match self.state {
             // After `shutdown()` the client promises nothing; `null` keeps the server unblocked.
@@ -1073,6 +1137,18 @@ impl Pending {
             Query::Hover(_) => {
                 Output::answer(self.doc_id, self.latest_ticket, update::Change::Hover(None))
             }
+            // Commands have no slot to settle: `settled` reports their failures as errors.
+            Query::Format { .. } => Output::default(),
+        }
+    }
+}
+
+impl Kind {
+    /// Whether the user asked for this request, so its failure is reported rather than settled.
+    fn is_command(self) -> bool {
+        match self {
+            Kind::Completion | Kind::Signature | Kind::Hover => false,
+            Kind::Format => true,
         }
     }
 }
@@ -1083,6 +1159,18 @@ impl Query {
             Query::Completion(_) => Kind::Completion,
             Query::Signature(_) => Kind::Signature,
             Query::Hover(_) => Kind::Hover,
+            Query::Format { .. } => Kind::Format,
+        }
+    }
+
+    /// The request's LSP method.
+    fn method(&self) -> &'static str {
+        use lsp_types::request::Request;
+        match self {
+            Query::Completion(_) => lsp_types::request::Completion::METHOD,
+            Query::Signature(_) => lsp_types::request::SignatureHelpRequest::METHOD,
+            Query::Hover(_) => lsp_types::request::HoverRequest::METHOD,
+            Query::Format { .. } => lsp_types::request::Formatting::METHOD,
         }
     }
 
@@ -1092,6 +1180,8 @@ impl Query {
             Query::Completion(query) => query.word.end,
             Query::Signature(query) => query.caret,
             Query::Hover(query) => query.offset,
+            // Formatting covers the whole document and asks at no caret.
+            Query::Format { .. } => 0,
         }
     }
 
@@ -1135,6 +1225,19 @@ impl Query {
                     text_document_position_params: TextDocumentPositionParams {
                         text_document: TextDocumentIdentifier { uri: uri.clone() },
                         position: encoding.position(snapshot, query.offset),
+                    },
+                    work_done_progress_params: Default::default(),
+                },
+            ),
+            Query::Format { tab_size } => message::Request::new::<lsp_types::request::Formatting>(
+                id,
+                DocumentFormattingParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    // scrive indents with spaces, so the formatter must too.
+                    options: FormattingOptions {
+                        tab_size: *tab_size,
+                        insert_spaces: true,
+                        ..FormattingOptions::default()
                     },
                     work_done_progress_params: Default::default(),
                 },

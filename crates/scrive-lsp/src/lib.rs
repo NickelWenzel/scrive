@@ -8,6 +8,7 @@
 //! - completion → [`Client::complete`]
 //! - signature help → [`Client::signature_help`]
 //! - hover → [`Client::hover`]
+//! - formatting → [`Client::format`]
 //! - what the client hands back → [`Update`] ([`update`])
 //! - the JSON-RPC envelope → [`message`]
 //! - LSP positions ↔ scrive byte offsets → [`encoding`]
@@ -21,6 +22,7 @@
 pub mod client;
 mod completion;
 mod diagnostics;
+mod edits;
 mod hover;
 pub mod encoding;
 mod markdown;
