@@ -49,6 +49,12 @@ jobs:
         env:
           CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
 
+      # The LSP client is headless too; its unit tests run as wasm the same way.
+      - name: Test scrive-lsp on wasm32-wasip1
+        run: cargo test -p scrive-lsp --lib --target wasm32-wasip1
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: wasmtime
+
   lints:
     name: Lints & docs
     runs-on: ubuntu-latest
@@ -68,3 +74,16 @@ jobs:
         run: cargo doc --no-deps --workspace
         env:
           RUSTDOCFLAGS: -D warnings
+
+      # The headless crates must never pull a GUI crate into their normal
+      # dependency graph. `cargo tree` failing is itself a failure.
+      - name: Headless crates depend on no GUI crate
+        shell: bash
+        run: |
+          for c in scrive-core scrive-lsp; do
+            out=$(cargo tree -p "$c" -e normal --prefix none) || exit 1
+            if grep -qE '^(iced|winit|wgpu)' <<<"$out"; then
+              echo "$c depends on a GUI crate"
+              exit 1
+            fi
+          done
