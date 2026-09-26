@@ -1,7 +1,8 @@
 //! What the client advertises, and the subset of the server's capabilities it acts on.
 
 use lsp_types::{
-    ClientCapabilities, GeneralClientCapabilities, PublishDiagnosticsClientCapabilities,
+    ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
+    GeneralClientCapabilities, MarkupKind, PublishDiagnosticsClientCapabilities,
     ServerCapabilities, TextDocumentClientCapabilities, TextDocumentSyncCapability,
     TextDocumentSyncClientCapabilities, TextDocumentSyncKind, WorkspaceClientCapabilities,
 };
@@ -15,6 +16,8 @@ pub(crate) struct Server {
     pub(crate) open_close: bool,
     /// How `didChange` is sent; anything but FULL or INCREMENTAL means not at all.
     pub(crate) change: TextDocumentSyncKind,
+    /// The completion trigger strings; `None` when the server has no completion provider.
+    pub(crate) completion: Option<Vec<String>>,
 }
 
 impl Server {
@@ -31,7 +34,15 @@ impl Server {
             ),
             None => (false, TextDocumentSyncKind::NONE),
         };
-        Self { open_close, change }
+        let completion = capabilities
+            .completion_provider
+            .as_ref()
+            .map(|options| options.trigger_characters.clone().unwrap_or_default());
+        Self {
+            open_close,
+            change,
+            completion,
+        }
     }
 }
 
@@ -48,6 +59,17 @@ pub(crate) fn client() -> ClientCapabilities {
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                 version_support: Some(true),
                 ..PublishDiagnosticsClientCapabilities::default()
+            }),
+            completion: Some(CompletionClientCapabilities {
+                completion_item: Some(CompletionItemCapability {
+                    snippet_support: Some(true),
+                    // The popup renders documentation as plain text; markdown from a server that
+                    // ignores this is lowered.
+                    documentation_format: Some(vec![MarkupKind::PlainText]),
+                    ..CompletionItemCapability::default()
+                }),
+                context_support: Some(true),
+                ..CompletionClientCapabilities::default()
             }),
             ..TextDocumentClientCapabilities::default()
         }),

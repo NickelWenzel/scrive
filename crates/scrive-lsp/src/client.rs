@@ -8,19 +8,24 @@ mod tests;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use lsp_types::error_codes::REQUEST_CANCELLED;
 use lsp_types::{
-    ApplyWorkspaceEditResponse, ClientInfo, ConfigurationParams, DidChangeConfigurationParams,
+    ApplyWorkspaceEditResponse, ClientInfo, CompletionContext, CompletionParams,
+    CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind,
-    Uri, VersionedTextDocumentIdentifier, WorkspaceFolder,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
+    WorkspaceFolder,
 };
-use scrive_core::{document, DocId, Revision, Snapshot};
+use scrive_core::{
+    document, Bias, CompletionRequest, CompletionTrigger, DocId, Revision, Snapshot, Ticket,
+};
 use serde_json::Value;
 
 use crate::message::{self, Message};
 use crate::update::{self, Update};
-use crate::{diagnostics, uri, Encoding};
+use crate::{completion, diagnostics, uri, Encoding};
 
 /// JSON-RPC's "method not found": a server request this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -50,6 +55,8 @@ pub struct Client {
     versions: HashMap<uri::Key, i32>,
     /// The latest unversioned diagnostics for URIs that are not open, applied at `open`.
     cached: HashMap<uri::Key, Vec<lsp_types::Diagnostic>>,
+    /// Requests in flight, at most one per document and [`Kind`].
+    pending: Vec<Pending>,
     next_request: i64,
 }
 
@@ -131,6 +138,28 @@ struct Tracked {
     version: Option<i32>,
 }
 
+/// One request in flight.
+#[derive(Debug)]
+struct Pending {
+    id: message::Id,
+    doc_id: DocId,
+    /// The editor ticket the reply answers.
+    ticket: Ticket,
+    query: Query,
+}
+
+/// The kind of a pending request; with the document, it keys the pending table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Completion,
+}
+
+/// What a pending request asked, with what its reply needs.
+#[derive(Debug)]
+enum Query {
+    Completion(completion::Query),
+}
+
 impl Client {
     /// A builder for a new client.
     pub fn builder() -> Builder {
@@ -198,14 +227,21 @@ impl Client {
         Ok(output)
     }
 
-    /// Forgets a document, and sends `didClose` if the server was told about it. Its version
-    /// high-water mark stays, so a reopen continues the count.
+    /// Forgets a document, cancelling its requests in flight, and sends `didClose` if the server
+    /// was told about it. Its version high-water mark stays, so a reopen continues the count.
     pub fn close(&mut self, doc_id: DocId) -> Output {
         let Some(index) = self.tracked.iter().position(|t| t.doc_id == doc_id) else {
             return Output::default();
         };
         let tracked = self.tracked.remove(index);
         let mut output = Output::default();
+        self.pending.retain(|pending| {
+            let keep = pending.doc_id != doc_id;
+            if !keep {
+                output.messages.push(cancel(pending.id.clone()));
+            }
+            keep
+        });
         if tracked.version.is_some() && self.opens_and_closes() {
             output
                 .messages
@@ -220,6 +256,55 @@ impl Client {
                 )));
         }
         output
+    }
+
+    /// Answers the editor's completion request with a `textDocument/completion` request, which
+    /// supersedes the document's previous one.
+    ///
+    /// When the server cannot be asked (it is not running, has no completion provider, or did not
+    /// register the trigger the text before the caret ends with) the request is declined with an
+    /// empty [`update::Change::Completions`] under its ticket, so the editor stops waiting. A
+    /// request from a revision other than `snapshot`'s or the last synced one, or for a document
+    /// that is not registered, gets nothing: the editor has moved on.
+    pub fn complete(&mut self, snapshot: &Snapshot, request: &CompletionRequest) -> Output {
+        let doc_id = snapshot.doc_id();
+        let ticket = request.ticket();
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
+            return Output::default();
+        };
+        if ticket.revision() != snapshot.revision()
+            || snapshot.revision() != tracked.synced.revision()
+        {
+            return Output::default();
+        }
+        let decline = || Output::answer(doc_id, ticket, update::Change::Completions(Vec::new()));
+        let State::Running(server) = &self.state else {
+            return decline();
+        };
+        let Some(triggers) = &server.completion else {
+            return decline();
+        };
+        let word = request.word();
+        let context = match request.trigger() {
+            CompletionTrigger::TriggerChar(_) => {
+                match matched_trigger(snapshot, word.end, triggers) {
+                    Some(trigger) => CompletionContext {
+                        trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                        trigger_character: Some(trigger),
+                    },
+                    None => return decline(),
+                }
+            }
+            CompletionTrigger::Typed(_) | CompletionTrigger::Manual => CompletionContext {
+                trigger_kind: CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+        };
+        self.send(
+            doc_id,
+            ticket,
+            Query::Completion(completion::Query { word, context }),
+        )
     }
 
     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
@@ -296,6 +381,8 @@ impl Client {
                 Output::default()
             }
             State::Running(_) => {
+                // Their replies could no longer be delivered, and `shutdown` goes out alone.
+                self.pending.clear();
                 let request = self.next_request();
                 self.state = State::ShuttingDown {
                     request: request.clone(),
@@ -383,7 +470,36 @@ impl Client {
             State::Initializing { .. }
             | State::Running(_)
             | State::ShuttingDown { .. }
-            | State::Exited => Ok(Output::default()),
+            | State::Exited => Ok(self.settled(&id, response.result)),
+        }
+    }
+
+    /// Routes the reply to a pending request. Replies to requests the client no longer waits
+    /// for, and cancellations, are silent. A failed or undecodable reply settles the editor's
+    /// slot with the request's empty answer.
+    fn settled(&mut self, id: &message::Id, result: Result<Value, message::Error>) -> Output {
+        let Some(index) = self.pending.iter().position(|p| p.id == *id) else {
+            return Output::default();
+        };
+        let entry = self.pending.swap_remove(index);
+        let synced = self
+            .tracked
+            .iter()
+            .find(|t| t.doc_id == entry.doc_id)
+            .map(|t| t.synced.revision());
+        if synced != Some(entry.ticket.revision()) {
+            return Output::default();
+        }
+        match result {
+            Err(error) if error.code == REQUEST_CANCELLED => Output::default(),
+            Err(_) => entry.failed(),
+            Ok(value) => self.resolved(&entry, value),
+        }
+    }
+
+    fn resolved(&mut self, entry: &Pending, value: Value) -> Output {
+        match &entry.query {
+            Query::Completion(query) => self.completed(entry, query, value),
         }
     }
 
@@ -461,6 +577,58 @@ impl Client {
         let id = self.next_request;
         self.next_request += 1;
         message::Id::Number(id)
+    }
+
+    /// Sends `query` for `doc_id` at its synced snapshot, cancelling the request of the same
+    /// kind it supersedes.
+    fn send(&mut self, doc_id: DocId, ticket: Ticket, query: Query) -> Output {
+        let mut output = Output::default();
+        if let Some(index) = self
+            .pending
+            .iter()
+            .position(|p| p.doc_id == doc_id && p.query.kind() == query.kind())
+        {
+            output
+                .messages
+                .push(cancel(self.pending.swap_remove(index).id));
+        }
+        let Some(index) = self.tracked.iter().position(|t| t.doc_id == doc_id) else {
+            return output;
+        };
+        let id = self.next_request();
+        let tracked = &self.tracked[index];
+        output.messages.push(Message::Request(query.request(
+            id.clone(),
+            tracked.key.uri(),
+            self.encoding,
+            &tracked.synced,
+        )));
+        self.pending.push(Pending {
+            id,
+            doc_id,
+            ticket,
+            query,
+        });
+        output
+    }
+
+    fn completed(&self, entry: &Pending, query: &completion::Query, value: Value) -> Output {
+        let Some(reply) = completion::Reply::decode(value) else {
+            return entry.failed();
+        };
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == entry.doc_id) else {
+            return Output::default();
+        };
+        // `settled` checked that the ticket's revision is the synced one, so the synced snapshot
+        // is the text the request was made against.
+        let candidates =
+            completion::convert(self.encoding, &tracked.synced, query.word.clone(), reply);
+        let word = tracked.synced.slice(query.word.clone());
+        Output::answer(
+            entry.doc_id,
+            entry.ticket,
+            update::Change::Completions(completion::answer(&candidates, &word)),
+        )
     }
 
     fn answer(&self, request: message::Request) -> Output {
@@ -594,6 +762,7 @@ impl Builder {
             tracked: Vec::new(),
             versions: HashMap::new(),
             cached: HashMap::new(),
+            pending: Vec::new(),
             next_request: 2,
         };
         (client, Message::Request(initialize))
@@ -617,6 +786,87 @@ impl Builder {
             ..InitializeParams::default()
         }
     }
+}
+
+impl Output {
+    /// A ticket-stamped change for one document, with nothing to send.
+    fn answer(doc_id: DocId, ticket: Ticket, change: update::Change) -> Self {
+        Self {
+            messages: Vec::new(),
+            updates: vec![Update::Document(update::Document::new(
+                doc_id,
+                update::Stamp::Ticket(ticket),
+                change,
+            ))],
+        }
+    }
+}
+
+impl Pending {
+    /// What settles the editor's slot after the server failed the request.
+    fn failed(&self) -> Output {
+        match self.query {
+            Query::Completion(_) => Output::answer(
+                self.doc_id,
+                self.ticket,
+                update::Change::Completions(Vec::new()),
+            ),
+        }
+    }
+}
+
+impl Query {
+    fn kind(&self) -> Kind {
+        match self {
+            Query::Completion(_) => Kind::Completion,
+        }
+    }
+
+    /// The request message for this query at `snapshot`.
+    fn request(
+        &self,
+        id: message::Id,
+        uri: &Uri,
+        encoding: Encoding,
+        snapshot: &Snapshot,
+    ) -> message::Request {
+        match self {
+            Query::Completion(query) => message::Request::new::<lsp_types::request::Completion>(
+                id,
+                CompletionParams {
+                    text_document_position: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: encoding.position(snapshot, query.word.end),
+                    },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                    context: Some(query.context.clone()),
+                },
+            ),
+        }
+    }
+}
+
+/// `$/cancelRequest` for `id`, built by hand because lsp-types' `CancelParams` holds an `i32` id,
+/// narrower than [`message::Id`].
+fn cancel(id: message::Id) -> Message {
+    Message::Notification(message::Notification {
+        method: "$/cancelRequest".to_owned(),
+        params: Some(serde_json::json!({ "id": id })),
+    })
+}
+
+/// The longest registered trigger that the text before `caret` ends with. Triggers may be
+/// longer than one character (`::`).
+fn matched_trigger(snapshot: &Snapshot, caret: u32, triggers: &[String]) -> Option<String> {
+    let reach = triggers.iter().map(|t| t.len() as u32).max()?;
+    let start = snapshot.clip_offset(caret.saturating_sub(reach), Bias::Left);
+    let before = snapshot.slice(start..caret);
+    triggers
+        .iter()
+        .filter(|t| !t.is_empty() && before.ends_with(t.as_str()))
+        .max_by_key(|t| t.len())
+        .cloned()
 }
 
 /// The next version for `key`, advancing its high-water mark.

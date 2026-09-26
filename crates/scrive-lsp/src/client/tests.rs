@@ -1,6 +1,8 @@
 use std::str::FromStr;
 
-use scrive_core::{Document, EditOp, GroupingHint, OpClass};
+use scrive_core::intel::completion::Start;
+use scrive_core::intel::ticket::Counter;
+use scrive_core::{CompletionItem, Document, EditOp, GroupingHint, OpClass};
 use serde_json::{json, Value};
 
 use super::*;
@@ -84,13 +86,26 @@ fn whole(text: &str) -> Value {
     json!({"text": text})
 }
 
-/// The one place tests read a `Change`, so a new variant changes only this helper.
+/// With [`completions`], the only place tests read a `Change`, so a new variant changes only
+/// these helpers.
 fn diagnostics(update: &Update) -> (DocId, update::Stamp, Vec<scrive_core::Diagnostic>) {
     let Update::Document(document) = update else {
         panic!("expected a document update, got {update:?}")
     };
     match document.change() {
         update::Change::Diagnostics(set) => (document.doc_id(), document.stamp(), set.clone()),
+        other => panic!("expected diagnostics, got {other:?}"),
+    }
+}
+
+/// The stamp and items of a completion update.
+fn completions(update: &Update) -> (update::Stamp, Vec<CompletionItem>) {
+    let Update::Document(document) = update else {
+        panic!("expected a document update, got {update:?}")
+    };
+    match document.change() {
+        update::Change::Completions(items) => (document.stamp(), items.clone()),
+        other => panic!("expected completions, got {other:?}"),
     }
 }
 
@@ -913,4 +928,490 @@ fn unknown_response_id_is_silent() {
         output.messages.is_empty() && output.updates.is_empty(),
         "an unknown id sends and updates nothing",
     );
+}
+
+/// Server capabilities with incremental sync and completion triggered by `.` and `::`.
+fn completion_capabilities() -> Value {
+    json!({"textDocumentSync": 2, "completionProvider": {"triggerCharacters": [".", "::"]}})
+}
+
+/// A completion request for `word` in `doc` at its current revision, under a fresh ticket from
+/// the test's `tickets`.
+fn request(
+    tickets: &mut Counter,
+    doc: &Document,
+    word: core::ops::Range<u32>,
+    trigger: CompletionTrigger,
+    start: Start,
+) -> CompletionRequest {
+    CompletionRequest::new(tickets.issue(doc.revision()), word, trigger, start)
+}
+
+/// A running client with `text` open as `file:///a.rs` (`didOpen` already sent).
+fn completing(text: &str) -> (Client, Document) {
+    let doc = document(text);
+    let (mut client, _) = running(Client::builder(), completion_capabilities());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    (client, doc)
+}
+
+/// Labels, for compact assertions.
+fn labels(items: &[CompletionItem]) -> Vec<&str> {
+    items.iter().map(|item| item.label.as_str()).collect()
+}
+
+/// The reply to request `id` for `let v = pr` with the caret at 10: `print` edits exactly the
+/// word, `println` is a snippet without an edit, `= prim` edits `6..10` and filters on `prim`,
+/// and `other` matches nothing.
+fn list(id: i64, incomplete: bool) -> Message {
+    from_server(
+        json!({"jsonrpc": "2.0", "id": id, "result": {"isIncomplete": incomplete, "items": [
+            {"label": "print", "textEdit": {"range": {"start": {"line": 0, "character": 8}, "end": {"line": 0, "character": 10}}, "newText": "print"}},
+            {"label": "println", "insertText": "println!($0)", "insertTextFormat": 2},
+            {"label": "= prim", "filterText": "prim", "textEdit": {"range": {"start": {"line": 0, "character": 6}, "end": {"line": 0, "character": 10}}, "newText": "= prim"}},
+            {"label": "other"},
+        ]}}),
+    )
+}
+
+/// An error reply to request `id`.
+fn failure(id: i64, code: i64) -> Message {
+    from_server(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": "no"}}))
+}
+
+fn completion_request(id: i64, position: (u32, u32), context: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/completion", "params": {
+        "textDocument": {"uri": "file:///a.rs"},
+        "position": {"line": position.0, "character": position.1},
+        "context": context,
+    }})
+}
+
+fn cancel_request(id: i64) -> Value {
+    json!({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": id}})
+}
+
+fn assert_silent(output: &Output, why: &str) {
+    assert!(
+        output.messages.is_empty() && output.updates.is_empty(),
+        "{why}: got {output:?}"
+    );
+}
+
+/// The one completion update in `output`, which sends nothing.
+fn answered(output: &Output) -> (update::Stamp, Vec<CompletionItem>) {
+    assert!(
+        output.messages.is_empty(),
+        "an answer sends nothing: {output:?}"
+    );
+    let [update] = output.updates.as_slice() else {
+        panic!("expected one update, got {:?}", output.updates)
+    };
+    completions(update)
+}
+
+/// A request goes out at the caret, with the context the trigger implies.
+#[test]
+fn completion_request_carries_position_and_context() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let output = client.complete(&doc.snapshot(), &first);
+    assert_eq!(
+        wire(&output.messages),
+        vec![completion_request(2, (0, 10), json!({"triggerKind": 1}))],
+        "a manual request is invoked at the caret",
+    );
+    assert!(output.updates.is_empty(), "nothing is answered yet");
+}
+
+/// `initialize` advertises the completion features the conversion handles, and none it does
+/// not.
+#[test]
+fn completion_advertises_snippets_plaintext_docs_and_context() {
+    let (_, initialize) = Client::builder().build();
+    let initialize = serde_json::to_value(&initialize).expect("serializes");
+    let completion = &initialize["params"]["capabilities"]["textDocument"]["completion"];
+    assert_eq!(
+        completion["completionItem"]["snippetSupport"],
+        json!(true),
+        "snippets are advertised"
+    );
+    assert_eq!(
+        completion["completionItem"]["documentationFormat"],
+        json!(["plaintext"]),
+        "documentation is plain text"
+    );
+    assert_eq!(
+        completion["contextSupport"],
+        json!(true),
+        "context is advertised"
+    );
+    for absent in [
+        "/completionItem/insertReplaceSupport",
+        "/completionItem/labelDetailsSupport",
+        "/completionList",
+    ] {
+        assert_eq!(
+            completion.pointer(absent),
+            None,
+            "{absent} is not advertised"
+        );
+    }
+}
+
+/// A new request for the same document cancels the one in flight.
+#[test]
+fn second_request_supersedes_the_first_with_a_cancel() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    assert_eq!(
+        wire(&client.complete(&doc.snapshot(), &second).messages),
+        vec![
+            cancel_request(2),
+            completion_request(3, (0, 10), json!({"triggerKind": 1}))
+        ],
+        "the first request is cancelled before the second goes out",
+    );
+}
+
+/// Once superseded, a request's reply answers nothing.
+#[test]
+fn reply_to_a_superseded_request_is_silent() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &second);
+    let output = client
+        .receive(list(2, false))
+        .expect("the reply is accepted");
+    assert_silent(&output, "a superseded reply is dropped");
+}
+
+/// A request the server confirms as cancelled was superseded; nothing waits for it.
+#[test]
+fn request_cancelled_reply_is_silent() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let output = client
+        .receive(failure(2, -32800))
+        .expect("a cancellation is not an error");
+    assert_silent(&output, "a cancelled request answers nothing");
+}
+
+/// A failed completion request still settles the editor's slot.
+#[test]
+fn other_server_errors_answer_an_empty_list() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let output = client
+        .receive(failure(2, -32603))
+        .expect("a completion failure is not an error");
+    let (stamp, items) = answered(&output);
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(first.ticket()),
+        "stamped with the request's ticket"
+    );
+    assert!(items.is_empty(), "the failure answers an empty list");
+}
+
+/// Before `initialize` is answered there is no server to ask; the editor stops waiting.
+#[test]
+fn completion_declines_before_initialize() {
+    let mut tickets = Counter::new();
+    let doc = document("let v = pr");
+    let (mut client, _) = Client::builder().build();
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let (stamp, items) = answered(&client.complete(&doc.snapshot(), &first));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(first.ticket()),
+        "the decline answers the ticket"
+    );
+    assert!(items.is_empty(), "the decline is an empty list");
+}
+
+/// A server without a completion provider is never asked.
+#[test]
+fn completion_declines_without_a_provider() {
+    let mut tickets = Counter::new();
+    let doc = document("let v = pr");
+    let (mut client, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let (stamp, items) = answered(&client.complete(&doc.snapshot(), &first));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(first.ticket()),
+        "the decline answers the ticket"
+    );
+    assert!(items.is_empty(), "the decline is an empty list");
+}
+
+/// The editor's trigger set is fixed; a trigger the server did not register asks nothing.
+#[test]
+fn unregistered_trigger_character_declines() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = ");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..8,
+        CompletionTrigger::TriggerChar(' '),
+        Start::Fresh,
+    );
+    let (stamp, items) = answered(&client.complete(&doc.snapshot(), &first));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(first.ticket()),
+        "the decline answers the ticket"
+    );
+    assert!(items.is_empty(), "the decline is an empty list");
+}
+
+/// A trigger longer than the typed character matches the text before the caret.
+#[test]
+fn multi_character_trigger_matches_by_suffix() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("std::");
+    let first = request(
+        &mut tickets,
+        &doc,
+        5..5,
+        CompletionTrigger::TriggerChar(':'),
+        Start::Fresh,
+    );
+    assert_eq!(
+        wire(&client.complete(&doc.snapshot(), &first).messages),
+        vec![completion_request(
+            2,
+            (0, 5),
+            json!({"triggerKind": 2, "triggerCharacter": "::"})
+        )],
+        "the registered `::` is the trigger character",
+    );
+}
+
+/// A request from an older revision is neither sent nor answered.
+#[test]
+fn stale_completion_request_is_ignored() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = completing("let v = pr");
+    doc.edit(vec![EditOp::insert(10, "i")]).expect("edits");
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+    let stale = CompletionRequest::new(
+        tickets.issue(Revision(0)),
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    assert_silent(
+        &client.complete(&doc.snapshot(), &stale),
+        "a stale request is ignored",
+    );
+}
+
+/// A reply answers the request's ticket with the items matching the word, as shown.
+#[test]
+fn reply_answers_the_ticket_with_the_matching_items() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Typed('r'),
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let output = client
+        .receive(list(2, false))
+        .expect("the reply is accepted");
+    let (stamp, items) = answered(&output);
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(first.ticket()),
+        "the reply answers the ticket"
+    );
+    assert_eq!(
+        labels(&items),
+        ["print", "println", "= prim"],
+        "`other` does not match `pr`"
+    );
+    let replaces: Vec<_> = items.iter().map(|item| item.replace.clone()).collect();
+    assert_eq!(
+        replaces,
+        [None, None, Some(6..10)],
+        "only a range other than the word is kept"
+    );
+}
+
+/// A result that is not a completion result settles the editor's slot like a server error.
+#[test]
+fn undecodable_completion_result_settles_with_an_empty_list() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let output = client
+        .receive(from_server(
+            json!({"jsonrpc": "2.0", "id": 2, "result": "x"}),
+        ))
+        .expect("an undecodable completion result is not an error");
+    let (stamp, items) = answered(&output);
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(first.ticket()),
+        "stamped with the request's ticket"
+    );
+    assert!(
+        items.is_empty(),
+        "the undecodable result answers an empty list"
+    );
+}
+
+/// A reply computed for a revision the document has left is dropped when it arrives.
+#[test]
+fn reply_behind_the_synced_revision_is_dropped_in_receive() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    doc.edit(vec![EditOp::insert(0, "x")]).expect("edits");
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+    let output = client
+        .receive(list(2, false))
+        .expect("the reply is accepted");
+    assert_silent(&output, "a reply behind the synced revision is dropped");
+}
+
+/// Closing a document cancels its requests before `didClose`.
+#[test]
+fn close_cancels_pending_requests() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    assert_eq!(
+        wire(&client.close(doc.doc_id()).messages),
+        vec![
+            cancel_request(2),
+            json!({"jsonrpc": "2.0", "method": "textDocument/didClose",
+                "params": {"textDocument": {"uri": "file:///a.rs"}}}),
+        ],
+        "the request is cancelled, then the document closed",
+    );
+}
+
+/// `shutdown` goes out alone, and the forgotten request's reply is silent.
+#[test]
+fn shutdown_forgets_pending_requests() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    assert_eq!(
+        wire(&client.shutdown().messages),
+        vec![json!({"jsonrpc": "2.0", "id": 3, "method": "shutdown"})],
+        "only shutdown goes out",
+    );
+    let output = client
+        .receive(list(2, false))
+        .expect("the reply is accepted");
+    assert_silent(&output, "a forgotten request's reply is dropped");
 }

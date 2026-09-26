@@ -5,6 +5,7 @@
 //! the crate a pure state machine that tests as data in, data out, and builds for wasm32.
 //!
 //! - the client state machine → [`Client`] ([`client`])
+//! - completion → [`Client::complete`]
 //! - what the client hands back → [`Update`] ([`update`])
 //! - the JSON-RPC envelope → [`message`]
 //! - LSP positions ↔ scrive byte offsets → [`encoding`]
@@ -16,9 +17,12 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+mod completion;
 mod diagnostics;
 pub mod encoding;
+mod markdown;
 pub mod message;
+mod snippet;
 pub mod update;
 pub mod uri;
 
