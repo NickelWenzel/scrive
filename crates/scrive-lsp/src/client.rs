@@ -5,6 +5,7 @@ mod capabilities;
 #[cfg(test)]
 mod tests;
 
+use core::ops::Range;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -136,6 +137,9 @@ struct Tracked {
     synced: Snapshot,
     /// The version last sent; `None` while the server has not been told about the document.
     version: Option<i32>,
+    /// The completion session of the document's latest completion request, which the pending
+    /// completion entry, if any, answers.
+    session: Option<completion::Session>,
 }
 
 /// One request in flight.
@@ -143,8 +147,12 @@ struct Tracked {
 struct Pending {
     id: message::Id,
     doc_id: DocId,
-    /// The editor ticket the reply answers.
-    ticket: Ticket,
+    /// What the request's positions were computed against; the reply converts against it.
+    request_snapshot: Snapshot,
+    /// The newest editor ticket the reply answers. A continuing request moves it forward.
+    latest_ticket: Ticket,
+    /// The caret that goes with `latest_ticket`.
+    latest_caret: u32,
     query: Query,
 }
 
@@ -219,6 +227,7 @@ impl Client {
             language: language.into(),
             synced: snapshot.clone(),
             version: None,
+            session: None,
         });
         if self.opens_and_closes() {
             let index = self.tracked.len() - 1;
@@ -258,8 +267,16 @@ impl Client {
         output
     }
 
-    /// Answers the editor's completion request with a `textDocument/completion` request, which
-    /// supersedes the document's previous one.
+    /// Answers the editor's completion request: locally from the list of the request it
+    /// continues, by adopting it into that request while it is in flight, or with a new
+    /// `textDocument/completion` that supersedes the document's previous one.
+    ///
+    /// A request continues the previous one only while the user types at its caret: a
+    /// [`Typed`](CompletionTrigger::Typed) request that is
+    /// [`Continuing`](scrive_core::intel::completion::Start::Continuing), at the same word
+    /// start, with the text before the old caret unchanged and every byte since typed at the
+    /// caret, at most 32 bytes past it, and only while the previous request is in flight or its
+    /// list has arrived. A list the server marked incomplete is asked for again.
     ///
     /// When the server cannot be asked (it is not running, has no completion provider, or did not
     /// register the trigger the text before the caret ends with) the request is declined with an
@@ -285,7 +302,7 @@ impl Client {
             return decline();
         };
         let word = request.word();
-        let context = match request.trigger() {
+        let mut context = match request.trigger() {
             CompletionTrigger::TriggerChar(_) => {
                 match matched_trigger(snapshot, word.end, triggers) {
                     Some(trigger) => CompletionContext {
@@ -300,11 +317,31 @@ impl Client {
                 trigger_character: None,
             },
         };
-        self.send(
-            doc_id,
-            ticket,
-            Query::Completion(completion::Query { word, context }),
-        )
+        if let Some(session) = tracked
+            .session
+            .as_ref()
+            .filter(|session| session.continues(snapshot, request))
+        {
+            if let Some(entry) = self
+                .pending
+                .iter_mut()
+                .find(|p| p.doc_id == doc_id && p.query.kind() == Kind::Completion)
+            {
+                entry.latest_ticket = ticket;
+                entry.latest_caret = word.end;
+                return Output::default();
+            }
+            // A session whose request was dropped before its list arrived has nothing to
+            // refine, so the request starts afresh with its own context.
+            if session.filled() {
+                if !session.incomplete() {
+                    let items = session.answer(snapshot, word.end);
+                    return Output::answer(doc_id, ticket, update::Change::Completions(items));
+                }
+                context = for_incomplete();
+            }
+        }
+        self.request_completion(doc_id, ticket, word, context)
     }
 
     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
@@ -487,7 +524,10 @@ impl Client {
             .iter()
             .find(|t| t.doc_id == entry.doc_id)
             .map(|t| t.synced.revision());
-        if synced != Some(entry.ticket.revision()) {
+        // Dropped here and never in `sync`: a host syncs before it hands the editor's requests
+        // over, so a continuing request moves `latest_ticket` forward only after the sync. Only
+        // when the reply arrives is it certain that no newer request adopted this entry.
+        if synced != Some(entry.latest_ticket.revision()) {
             return Output::default();
         }
         match result {
@@ -579,6 +619,26 @@ impl Client {
         message::Id::Number(id)
     }
 
+    /// Starts a new completion session at `word` and sends its request at the synced snapshot,
+    /// whose revision every caller has checked against the ticket's.
+    fn request_completion(
+        &mut self,
+        doc_id: DocId,
+        ticket: Ticket,
+        word: Range<u32>,
+        context: CompletionContext,
+    ) -> Output {
+        let Some(tracked) = self.tracked.iter_mut().find(|t| t.doc_id == doc_id) else {
+            return Output::default();
+        };
+        tracked.session = Some(completion::Session::new(&tracked.synced, word.clone()));
+        self.send(
+            doc_id,
+            ticket,
+            Query::Completion(completion::Query { word, context }),
+        )
+    }
+
     /// Sends `query` for `doc_id` at its synced snapshot, cancelling the request of the same
     /// kind it supersedes.
     fn send(&mut self, doc_id: DocId, ticket: Ticket, query: Query) -> Output {
@@ -606,29 +666,49 @@ impl Client {
         self.pending.push(Pending {
             id,
             doc_id,
-            ticket,
+            request_snapshot: tracked.synced.clone(),
+            latest_ticket: ticket,
+            latest_caret: query.caret(),
             query,
         });
         output
     }
 
-    fn completed(&self, entry: &Pending, query: &completion::Query, value: Value) -> Output {
+    /// Stores the reply in the session and answers the latest ticket from it. An incomplete
+    /// list whose caret has moved since the request is also asked for again at the new caret.
+    fn completed(&mut self, entry: &Pending, query: &completion::Query, value: Value) -> Output {
         let Some(reply) = completion::Reply::decode(value) else {
             return entry.failed();
         };
-        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == entry.doc_id) else {
+        let incomplete = reply.incomplete();
+        let candidates = completion::convert(
+            self.encoding,
+            &entry.request_snapshot,
+            query.word.clone(),
+            reply,
+        );
+        let Some(tracked) = self.tracked.iter_mut().find(|t| t.doc_id == entry.doc_id) else {
             return Output::default();
         };
-        // `settled` checked that the ticket's revision is the synced one, so the synced snapshot
-        // is the text the request was made against.
-        let candidates =
-            completion::convert(self.encoding, &tracked.synced, query.word.clone(), reply);
-        let word = tracked.synced.slice(query.word.clone());
-        Output::answer(
+        let Some(session) = tracked.session.as_mut() else {
+            return Output::default();
+        };
+        session.fill(candidates, incomplete);
+        let items = session.answer(&tracked.synced, entry.latest_caret);
+        let mut output = Output::answer(
             entry.doc_id,
-            entry.ticket,
-            update::Change::Completions(completion::answer(&candidates, &word)),
-        )
+            entry.latest_ticket,
+            update::Change::Completions(items),
+        );
+        if incomplete && entry.latest_caret != query.word.end {
+            output.append(self.request_completion(
+                entry.doc_id,
+                entry.latest_ticket,
+                query.word.start..entry.latest_caret,
+                for_incomplete(),
+            ));
+        }
+        output
     }
 
     fn answer(&self, request: message::Request) -> Output {
@@ -800,6 +880,12 @@ impl Output {
             ))],
         }
     }
+
+    /// Appends `other`'s messages and updates after this output's.
+    fn append(&mut self, other: Output) {
+        self.messages.extend(other.messages);
+        self.updates.extend(other.updates);
+    }
 }
 
 impl Pending {
@@ -808,7 +894,7 @@ impl Pending {
         match self.query {
             Query::Completion(_) => Output::answer(
                 self.doc_id,
-                self.ticket,
+                self.latest_ticket,
                 update::Change::Completions(Vec::new()),
             ),
         }
@@ -819,6 +905,13 @@ impl Query {
     fn kind(&self) -> Kind {
         match self {
             Query::Completion(_) => Kind::Completion,
+        }
+    }
+
+    /// The caret the query was made at.
+    fn caret(&self) -> u32 {
+        match self {
+            Query::Completion(query) => query.word.end,
         }
     }
 
@@ -844,6 +937,14 @@ impl Query {
                 },
             ),
         }
+    }
+}
+
+/// The context for asking again for a list the server marked incomplete.
+fn for_incomplete() -> CompletionContext {
+    CompletionContext {
+        trigger_kind: CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS,
+        trigger_character: None,
     }
 }
 

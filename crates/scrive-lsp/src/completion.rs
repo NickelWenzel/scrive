@@ -1,4 +1,5 @@
-//! Completion replies converted to scrive items.
+//! Completion replies converted to scrive items, and the session that lets one reply serve the
+//! keystrokes that follow it.
 
 use core::ops::Range;
 use std::borrow::Cow;
@@ -7,10 +8,19 @@ use std::collections::HashMap;
 use lsp_types::{
     CompletionContext, CompletionItemKind, CompletionTextEdit, Documentation, InsertTextFormat,
 };
-use scrive_core::{CompletionItem, CompletionKind, EditOp, InsertText, Snapshot};
+use scrive_core::intel::completion::Start;
+use scrive_core::{
+    Bias, CompletionItem, CompletionKind, CompletionRequest, CompletionTrigger, EditOp, InsertText,
+    Snapshot,
+};
 use serde_json::Value;
 
 use crate::{markdown, snippet, Encoding};
+
+/// How many bytes past a session's caret a request may still continue it. Beyond that it
+/// supersedes the session, so a list the server built for a much shorter word is not refiltered
+/// indefinitely.
+const CONTINUATION_REACH: u32 = 32;
 
 /// What a pending completion request asked.
 #[derive(Clone, Debug)]
@@ -20,8 +30,22 @@ pub(crate) struct Query {
     pub(crate) context: CompletionContext,
 }
 
-/// A converted item, before the work only a shown item needs: snippet lowering and
-/// documentation.
+/// One request's items, and what a later request must match to be answered from them. Offsets
+/// are in the coordinates of the request snapshot.
+#[derive(Debug)]
+pub(crate) struct Session {
+    word_start: u32,
+    caret: u32,
+    len: u32,
+    prefix: String,
+    /// The reply's items; `None` until it arrives.
+    items: Option<Vec<Candidate>>,
+    /// The server will refine the list as the word grows, so it cannot answer locally.
+    incomplete: bool,
+}
+
+/// A converted item, before the work only a shown item needs: snippet lowering, documentation
+/// and the range shift.
 #[derive(Debug)]
 pub(crate) struct Candidate {
     item: CompletionItem,
@@ -34,6 +58,7 @@ pub(crate) struct Candidate {
 #[derive(Debug)]
 pub(crate) struct Reply {
     items: Vec<Value>,
+    incomplete: bool,
 }
 
 /// One reply's conversion against the request snapshot. Item edit ranges almost always lie on
@@ -54,20 +79,97 @@ impl Reply {
     /// `Value`s, so an item that does not decode costs only itself.
     pub(crate) fn decode(value: Value) -> Option<Self> {
         match value {
-            Value::Null => Some(Self { items: Vec::new() }),
-            Value::Array(items) => Some(Self { items }),
-            Value::Object(mut list) => match list.remove("items") {
-                Some(Value::Array(items)) => Some(Self { items }),
-                _ => None,
-            },
+            Value::Null => Some(Self {
+                items: Vec::new(),
+                incomplete: false,
+            }),
+            Value::Array(items) => Some(Self {
+                items,
+                incomplete: false,
+            }),
+            Value::Object(mut list) => {
+                let incomplete = list
+                    .get("isIncomplete")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                match list.remove("items") {
+                    Some(Value::Array(items)) => Some(Self { items, incomplete }),
+                    _ => None,
+                }
+            }
             _ => None,
         }
+    }
+
+    /// Whether the server will refine the list as the word grows.
+    pub(crate) fn incomplete(&self) -> bool {
+        self.incomplete
+    }
+}
+
+impl Session {
+    /// A session for a request at `word` in `snapshot`, awaiting its reply.
+    pub(crate) fn new(snapshot: &Snapshot, word: Range<u32>) -> Self {
+        Self {
+            word_start: word.start,
+            caret: word.end,
+            len: snapshot.len(),
+            prefix: snapshot.slice(word).into_owned(),
+            items: None,
+            incomplete: false,
+        }
+    }
+
+    /// Stores the reply's items.
+    pub(crate) fn fill(&mut self, items: Vec<Candidate>, incomplete: bool) {
+        self.items = Some(items);
+        self.incomplete = incomplete;
+    }
+
+    /// Whether the reply's list has arrived.
+    pub(crate) fn filled(&self) -> bool {
+        self.items.is_some()
+    }
+
+    /// Whether the stored list must be asked for again rather than reused.
+    pub(crate) fn incomplete(&self) -> bool {
+        self.incomplete
+    }
+
+    /// Whether `request`, made at `snapshot`, only extends this session's word by typing at its
+    /// caret. The length check rules out forward deletes and edits at secondary carets, which
+    /// the other checks cannot see.
+    pub(crate) fn continues(&self, snapshot: &Snapshot, request: &CompletionRequest) -> bool {
+        let word = request.word();
+        let caret = word.end;
+        matches!(request.trigger(), CompletionTrigger::Typed(_))
+            && request.start() == Start::Continuing
+            && word.start == self.word_start
+            && caret >= self.caret
+            && caret - self.caret <= CONTINUATION_REACH
+            && i64::from(snapshot.len()) - i64::from(self.len) == i64::from(caret - self.caret)
+            && snapshot.clip_offset(self.caret, Bias::Left) == self.caret
+            && snapshot.slice(self.word_start..self.caret) == self.prefix
+    }
+
+    /// The items matching the word typed up to `caret` in `snapshot`, with their ranges moved
+    /// by the bytes typed since the request.
+    pub(crate) fn answer(&self, snapshot: &Snapshot, caret: u32) -> Vec<CompletionItem> {
+        let delta = caret - self.caret;
+        let word = snapshot.slice(self.word_start..caret);
+        self.items
+            .iter()
+            .flatten()
+            .filter(|candidate| candidate.item.matches(&word))
+            .map(|candidate| candidate.finish(self.caret, delta))
+            .collect()
     }
 }
 
 impl Candidate {
-    /// The item as shown: snippet lowered and documentation flattened to plain text.
-    fn finish(&self) -> CompletionItem {
+    /// The item as shown: snippet lowered, documentation flattened to plain text, and ranges
+    /// shifted by `delta` bytes typed at `caret`.
+    fn finish(&self, caret: u32, delta: u32) -> CompletionItem {
         let mut item = self.item.clone();
         if self.snippet {
             if let InsertText::Plain(body) = &self.item.insert {
@@ -76,6 +178,14 @@ impl Candidate {
         }
         if let Some(documentation) = &self.documentation {
             item = item.with_doc(markdown::documentation(documentation));
+        }
+        if delta > 0 {
+            if let Some(replace) = item.replace.clone() {
+                item = item.with_replace(shift(replace, caret, delta));
+            }
+            for op in &mut item.additional {
+                op.range = shift(op.range.clone(), caret, delta);
+            }
         }
         item
     }
@@ -179,13 +289,20 @@ pub(crate) fn convert(
         .collect()
 }
 
-/// The candidates that match `word`, as shown.
-pub(crate) fn answer(candidates: &[Candidate], word: &str) -> Vec<CompletionItem> {
-    candidates
-        .iter()
-        .filter(|candidate| candidate.item.matches(word))
-        .map(Candidate::finish)
-        .collect()
+/// `range` after `delta` bytes were typed at `caret`: an end at or past the caret moves, and a
+/// start only when strictly past it, so a range starting at the caret grows.
+fn shift(range: Range<u32>, caret: u32, delta: u32) -> Range<u32> {
+    let start = if range.start > caret {
+        range.start + delta
+    } else {
+        range.start
+    };
+    let end = if range.end >= caret {
+        range.end + delta
+    } else {
+        range.end
+    };
+    start..end
 }
 
 /// LSP's 25 kinds folded onto scrive's popup categories. scrive's `Param` has no LSP source.
@@ -240,7 +357,7 @@ mod tests {
         let [candidate] = candidates(text, word, json!([item]))
             .try_into()
             .expect("one candidate");
-        candidate.finish()
+        candidate.finish(0, 0)
     }
 
     /// clangd labels items with a bullet and filters on `filterText`; a text edit over exactly
@@ -444,16 +561,19 @@ mod tests {
     /// All three result shapes decode; anything else is an error.
     #[test]
     fn null_array_and_list_replies_decode() {
-        for (value, count) in [
-            (json!(null), 0),
-            (json!([{"label": "a"}]), 1),
+        for (value, count, incomplete) in [
+            (json!(null), 0, false),
+            (json!([{"label": "a"}]), 1, false),
             (
                 json!({"isIncomplete": true, "items": [{"label": "a"}, {"label": "b"}]}),
                 2,
+                true,
             ),
+            (json!({"items": []}), 0, false),
         ] {
             let reply = Reply::decode(value.clone()).expect("decodes");
             assert_eq!(reply.items.len(), count, "{value} has {count} items");
+            assert_eq!(reply.incomplete(), incomplete, "{value} completeness");
         }
         for value in [json!({"items": 3}), json!("x")] {
             assert!(Reply::decode(value.clone()).is_none(), "{value} is refused");
@@ -481,15 +601,81 @@ mod tests {
         );
     }
 
-    /// Only items matching the word are shown.
+    /// A session answered at `caret` in `now`, filled from `items` requested at `word` in
+    /// `then`.
+    fn answer(
+        then: &str,
+        word: Range<u32>,
+        items: Value,
+        now: &str,
+        caret: u32,
+    ) -> Vec<CompletionItem> {
+        let then = snapshot(then);
+        let reply = Reply::decode(items).expect("fixture decodes");
+        let mut session = Session::new(&then, word.clone());
+        session.fill(convert(Encoding::Utf16, &then, word, reply), false);
+        session.answer(&snapshot(now), caret)
+    }
+
+    /// Only items matching the word typed so far are shown.
     #[test]
     fn answer_keeps_only_matching_items() {
-        let items = candidates(
-            "",
-            0..0,
-            json!([{"label": "print"}, {"label": "other"}, {"label": "x", "filterText": "prx"}]),
+        let items = answer(
+            "pr",
+            0..2,
+            json!([{"label": "print"}, {"label": "prune"}, {"label": "x", "filterText": "prix"}]),
+            "pri",
+            3,
         );
-        let shown: Vec<_> = answer(&items, "pr").into_iter().map(|i| i.label).collect();
-        assert_eq!(shown, ["print", "x"], "label or filter text must match");
+        let shown: Vec<_> = items.into_iter().map(|i| i.label).collect();
+        assert_eq!(
+            shown,
+            ["print", "x"],
+            "label or filter text must match `pri`"
+        );
+    }
+
+    /// Bytes typed since the request move every range at or past the request caret; ranges
+    /// before it stay.
+    #[test]
+    fn answer_shifts_ranges_by_the_caret_delta() {
+        let [item] = answer(
+            "let v = pr\n;;",
+            8..10,
+            json!([{"label": "print", "textEdit": {"range": range((0, 6), (0, 10)), "newText": "print"},
+                "additionalTextEdits": [
+                    {"range": range((0, 0), (0, 0)), "newText": "use a;"},
+                    {"range": range((1, 1), (1, 1)), "newText": "b"},
+                ]}]),
+            "let v = pri\n;;",
+            11,
+        )
+        .try_into()
+        .expect("one item");
+        assert_eq!(
+            item.replace,
+            Some(6..11),
+            "the replace range grows by the typed byte"
+        );
+        let ranges: Vec<_> = item.additional.iter().map(|op| op.range.clone()).collect();
+        assert_eq!(
+            ranges,
+            [0..0, 13..13],
+            "an edit before the caret stays, one after it moves"
+        );
+    }
+
+    /// The shift table: ends at or past the caret move, starts only when strictly past it.
+    #[test]
+    fn shift_moves_ranges_at_or_past_the_caret() {
+        for (range, shifted) in [
+            (8..10, 8..13),
+            (10..10, 10..13),
+            (6..12, 6..15),
+            (0..0, 0..0),
+            (11..12, 14..15),
+        ] {
+            assert_eq!(shift(range.clone(), 10, 3), shifted, "{range:?}");
+        }
     }
 }

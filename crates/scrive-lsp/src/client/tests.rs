@@ -1415,3 +1415,358 @@ fn shutdown_forgets_pending_requests() {
         .expect("the reply is accepted");
     assert_silent(&output, "a forgotten request's reply is dropped");
 }
+
+/// Applies `ops` as one typing commit and syncs it.
+fn type_ops(client: &mut Client, doc: &mut Document, ops: Vec<EditOp>) {
+    doc.edit_grouped(ops, GroupingHint::mergeable(OpClass::Type))
+        .expect("types");
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+}
+
+/// A client whose first request, at `pr` in `let v = pr`, has been answered with [`list`].
+fn answered_session(tickets: &mut Counter, incomplete: bool) -> (Client, Document) {
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Typed('r'),
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let _ = client
+        .receive(list(2, incomplete))
+        .expect("the reply is accepted");
+    (client, doc)
+}
+
+/// Typing into a complete list answers locally, with ranges moved by the typed byte.
+#[test]
+fn complete_list_is_reused_with_shifted_ranges() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = answered_session(&mut tickets, false);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(10, "i")]);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..11,
+        CompletionTrigger::Typed('i'),
+        Start::Continuing,
+    );
+    let (stamp, items) = answered(&client.complete(&doc.snapshot(), &second));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(second.ticket()),
+        "the reuse answers the new ticket"
+    );
+    assert_eq!(
+        labels(&items),
+        ["print", "println", "= prim"],
+        "items are filtered by `pri`"
+    );
+    let print = items.iter().find(|i| i.label == "print").expect("kept");
+    assert_eq!(print.replace, None, "the word range stays live");
+    let prim = items.iter().find(|i| i.label == "= prim").expect("kept");
+    assert_eq!(
+        prim.replace,
+        Some(6..11),
+        "a range containing the caret grows"
+    );
+}
+
+/// An incomplete list is not reused; the server is asked to refine it.
+#[test]
+fn incomplete_list_re_requests_with_trigger_for_incomplete() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = answered_session(&mut tickets, true);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(10, "i")]);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..11,
+        CompletionTrigger::Typed('i'),
+        Start::Continuing,
+    );
+    let output = client.complete(&doc.snapshot(), &second);
+    assert_eq!(
+        wire(&output.messages),
+        vec![completion_request(3, (0, 11), json!({"triggerKind": 3}))],
+        "the list is asked for again at the new caret",
+    );
+    assert!(output.updates.is_empty(), "nothing is answered locally");
+}
+
+/// While a request is in flight, typing that extends the word adopts it: no cancel, no second
+/// request, and the reply answers the newest ticket against the newest word.
+#[test]
+fn continuation_answers_the_latest_ticket_filtered_to_the_latest_word() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Typed('r'),
+        Start::Fresh,
+    );
+    let sent = client.complete(&doc.snapshot(), &first);
+    assert_eq!(sent.messages.len(), 1, "the first request goes out");
+
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(10, "i")]);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..11,
+        CompletionTrigger::Typed('i'),
+        Start::Continuing,
+    );
+    assert_silent(
+        &client.complete(&doc.snapshot(), &second),
+        "a continuation sends nothing",
+    );
+
+    let output = client
+        .receive(list(2, false))
+        .expect("the reply is accepted");
+    let (stamp, items) = answered(&output);
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(second.ticket()),
+        "the reply answers the latest ticket"
+    );
+    assert_eq!(
+        labels(&items),
+        ["print", "println", "= prim"],
+        "items are filtered by `pri`"
+    );
+    let prim = items.iter().find(|i| i.label == "= prim").expect("kept");
+    assert_eq!(
+        prim.replace,
+        Some(6..11),
+        "a range containing the caret grows by the typed byte"
+    );
+}
+
+/// An incomplete reply for a caret that has since moved answers, and asks again at the caret.
+#[test]
+fn incomplete_reply_after_the_caret_moved_answers_and_re_requests() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Typed('r'),
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(10, "i")]);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..11,
+        CompletionTrigger::Typed('i'),
+        Start::Continuing,
+    );
+    let _ = client.complete(&doc.snapshot(), &second);
+
+    let output = client
+        .receive(list(2, true))
+        .expect("the reply is accepted");
+    let [update] = output.updates.as_slice() else {
+        panic!("expected one update, got {:?}", output.updates)
+    };
+    let (stamp, items) = completions(update);
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(second.ticket()),
+        "the reply answers the latest ticket"
+    );
+    assert_eq!(
+        labels(&items),
+        ["print", "println", "= prim"],
+        "items are filtered by `pri`"
+    );
+    assert_eq!(
+        wire(&output.messages),
+        vec![completion_request(3, (0, 11), json!({"triggerKind": 3}))],
+        "the incomplete list is asked for again at the moved caret",
+    );
+}
+
+/// Deleting after the caret changes the text without moving it; the session ends.
+#[test]
+fn forward_delete_ends_the_session() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = completing("let v = prx");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Typed('r'),
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let _ = client
+        .receive(list(2, false))
+        .expect("the reply is accepted");
+    type_ops(&mut client, &mut doc, vec![EditOp::delete(10..11)]);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Typed('r'),
+        Start::Continuing,
+    );
+    assert_eq!(
+        wire(&client.complete(&doc.snapshot(), &second).messages),
+        vec![completion_request(3, (0, 10), json!({"triggerKind": 1}))],
+        "the list is not reused after a forward delete",
+    );
+}
+
+/// A list is reused for up to 32 typed bytes; one more asks the server again.
+#[test]
+fn typing_past_thirty_two_bytes_supersedes() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = answered_session(&mut tickets, false);
+    type_ops(
+        &mut client,
+        &mut doc,
+        vec![EditOp::insert(10, "i".repeat(32))],
+    );
+    let within = request(
+        &mut tickets,
+        &doc,
+        8..42,
+        CompletionTrigger::Typed('i'),
+        Start::Continuing,
+    );
+    let output = client.complete(&doc.snapshot(), &within);
+    assert!(
+        output.messages.is_empty(),
+        "32 bytes past the caret reuses the list"
+    );
+    assert_eq!(output.updates.len(), 1, "the reuse answers");
+
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(42, "i")]);
+    let beyond = request(
+        &mut tickets,
+        &doc,
+        8..43,
+        CompletionTrigger::Typed('i'),
+        Start::Continuing,
+    );
+    assert_eq!(
+        wire(&client.complete(&doc.snapshot(), &beyond).messages),
+        vec![completion_request(3, (0, 43), json!({"triggerKind": 1}))],
+        "33 bytes past the caret asks again",
+    );
+}
+
+/// A backspace moves the caret left of the session's; the session ends.
+#[test]
+fn caret_left_supersedes() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = answered_session(&mut tickets, false);
+    type_ops(&mut client, &mut doc, vec![EditOp::delete(9..10)]);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..9,
+        CompletionTrigger::Typed('p'),
+        Start::Continuing,
+    );
+    assert_eq!(
+        wire(&client.complete(&doc.snapshot(), &second).messages),
+        vec![completion_request(3, (0, 9), json!({"triggerKind": 1}))],
+        "a caret left of the session's asks again",
+    );
+}
+
+/// An edit inside the word keeps its length arithmetic but changes its text; the session ends.
+#[test]
+fn changed_prefix_supersedes() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = answered_session(&mut tickets, false);
+    type_ops(
+        &mut client,
+        &mut doc,
+        vec![EditOp::new(8..9, "q"), EditOp::insert(10, "i")],
+    );
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..11,
+        CompletionTrigger::Typed('i'),
+        Start::Continuing,
+    );
+    assert_eq!(
+        wire(&client.complete(&doc.snapshot(), &second).messages),
+        vec![completion_request(3, (0, 11), json!({"triggerKind": 1}))],
+        "a changed prefix asks again",
+    );
+}
+
+/// Ctrl+Space always asks the server, even at an unchanged revision.
+#[test]
+fn manual_request_never_continues() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Continuing,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Manual,
+        Start::Continuing,
+    );
+    assert_eq!(
+        wire(&client.complete(&doc.snapshot(), &second).messages),
+        vec![
+            cancel_request(2),
+            completion_request(3, (0, 10), json!({"triggerKind": 1}))
+        ],
+        "the second manual request supersedes the first",
+    );
+}
+
+/// A first request dropped before its list arrived leaves nothing to refine: the continuing
+/// request that follows is sent as a fresh, invoked one.
+#[test]
+fn continuing_request_after_a_dropped_first_request_starts_fresh() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = completing("let v = pr");
+    let first = request(
+        &mut tickets,
+        &doc,
+        8..10,
+        CompletionTrigger::Typed('r'),
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(10, "i")]);
+    let dropped = client
+        .receive(list(2, false))
+        .expect("the reply is accepted");
+    assert_silent(&dropped, "the first reply is behind the synced revision");
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..11,
+        CompletionTrigger::Typed('i'),
+        Start::Continuing,
+    );
+    assert_eq!(
+        wire(&client.complete(&doc.snapshot(), &second).messages),
+        vec![completion_request(3, (0, 11), json!({"triggerKind": 1}))],
+        "the request is invoked, not a refinement of a list never received",
+    );
+}
