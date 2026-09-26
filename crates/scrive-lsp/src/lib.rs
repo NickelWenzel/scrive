@@ -5,13 +5,16 @@
 //! the crate a pure state machine that tests as data in, data out, and builds for wasm32.
 //!
 //! - the JSON-RPC envelope → [`message`]
+//! - LSP positions ↔ scrive byte offsets → [`encoding`]
 //!
 //! Payloads are [`lsp_types`], re-exported so a host and this crate always agree on one version.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod encoding;
 pub mod message;
 
+pub use encoding::Encoding;
 pub use lsp_types;
 pub use message::Message;

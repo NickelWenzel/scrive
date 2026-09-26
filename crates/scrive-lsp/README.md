@@ -8,5 +8,7 @@ updates to apply to scrive-core documents. It keeps no clock, spawns no threads 
 wasm32.
 
 - `message` — a tolerant JSON-RPC 2.0 envelope (`Message`), serde-ready.
+- `encoding` — the negotiated position encoding and conversions between LSP positions and scrive
+  byte offsets.
 
 Payload types come from `lsp-types`, re-exported as `scrive_lsp::lsp_types`.
