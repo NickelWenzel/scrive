@@ -1395,7 +1395,12 @@ impl CodeEditor {
         // Take the provider out so `self` is free for `build_cx`, then restore it
         // (avoids an is_some/unwrap dance and the whole-self borrow conflict).
         let Some(mut provider) = self.comp_provider.take() else {
-            // No synchronous provider: record an async request for the host.
+            // No synchronous provider: record an async request for the host. A
+            // trigger char or manual invoke overrides an Escape dismissal, as it
+            // does for a provider, so its reply may open the popup.
+            if !matches!(trigger, CompletionTrigger::Typed(_)) {
+                self.completion.on_boundary();
+            }
             let head = self.doc.selections().newest().head();
             self.pending_completion_request = Some(CompletionRequest {
                 revision: self.doc.revision(),

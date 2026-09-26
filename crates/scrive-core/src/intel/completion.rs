@@ -35,8 +35,8 @@ pub struct PopupList {
 }
 
 impl PopupList {
-    /// Rebuild `filtered` as the items whose label starts with `word` (folding
-    /// ASCII case — completion labels are code identifiers), in `sort_key` order
+    /// Rebuild `filtered` as the items that [`match`](CompletionItem::matches)
+    /// `word`, in `sort_key` order
     /// (so the provider's tiers survive), and reset the selection to the top.
     ///
     /// Runs on **every word char while the popup is open**, so it allocates
@@ -47,21 +47,12 @@ impl PopupList {
         self.filtered.clear();
         self.filtered.extend(
             (0..self.items.len() as u32)
-                .filter(|&i| prefix_matches(&self.items[i as usize].label, word)),
+                .filter(|&i| self.items[i as usize].matches(word)),
         );
         self.filtered
             .sort_by(|&a, &b| self.items[a as usize].sort_key.cmp(&self.items[b as usize].sort_key));
         self.selected = 0;
     }
-}
-
-/// Whether `label` begins with `prefix`, folding ASCII case only. Compares the
-/// raw bytes (`as_bytes` never panics on a non-char-boundary split, and
-/// `eq_ignore_ascii_case` leaves multi-byte UTF-8 exact), so no lowercased copy
-/// is allocated — the hot completion-filter primitive.
-fn prefix_matches(label: &str, prefix: &str) -> bool {
-    let (l, p) = (label.as_bytes(), prefix.as_bytes());
-    l.len() >= p.len() && l[..p.len()].eq_ignore_ascii_case(p)
 }
 
 /// The completion controller. Holds only the popup state; the document, provider,
@@ -103,13 +94,8 @@ impl CompletionController {
     /// at most once per event.
     pub fn on_input(&mut self, cx: &CompletionCx, word: &str, provider: &mut dyn Completions) {
         match cx.trigger {
-            CompletionTrigger::Typed(_) => match &mut self.state {
-                CompletionState::Open(list) => {
-                    list.refilter(word);
-                    if list.filtered.is_empty() {
-                        self.state = CompletionState::Closed;
-                    }
-                }
+            CompletionTrigger::Typed(_) => match self.state {
+                CompletionState::Open(_) => self.refilter(word),
                 CompletionState::DismissedUntilBoundary => {} // stay dismissed
                 CompletionState::Closed => {
                     let items = provider.complete(cx);
@@ -128,12 +114,28 @@ impl CompletionController {
     /// Ingest an externally-produced item list — an off-thread or
     /// language-server completion result — as if a provider had returned it:
     /// open and filter against the live `word` (with `anchor` the word start),
-    /// or close if nothing matches. The controller stays document-agnostic; the
-    /// caller is responsible for staleness (only call with results computed at
-    /// the current revision, refiltered here against the *current* word so a
-    /// result that arrives after the user typed more still filters correctly).
+    /// or close if nothing matches. An Escape dismissal wins: a list for the
+    /// word the user dismissed stays hidden, as a provider's would. The
+    /// controller stays document-agnostic; the caller is responsible for
+    /// staleness (only call with results computed at the current revision,
+    /// refiltered here against the *current* word so a result that arrives
+    /// after the user typed more still filters correctly).
     pub fn set_items(&mut self, items: Vec<CompletionItem>, word: &str, anchor: u32) {
+        if matches!(self.state, CompletionState::DismissedUntilBoundary) {
+            return;
+        }
         self.set_from_items(items, word, anchor);
+    }
+
+    /// Narrow an open popup to the items matching the live `word`, closing it
+    /// when none do. A no-op when closed or dismissed.
+    pub fn refilter(&mut self, word: &str) {
+        if let CompletionState::Open(list) = &mut self.state {
+            list.refilter(word);
+            if list.filtered.is_empty() {
+                self.state = CompletionState::Closed;
+            }
+        }
     }
 
     /// Open from a fresh item list, or close if empty (either the provider
@@ -359,5 +361,39 @@ mod tests {
         c.close();
         assert!(matches!(c.state(), CompletionState::Closed));
         assert!(!c.escape(), "Escape while closed is not captured");
+    }
+
+    /// An externally produced list does not reopen a popup the user dismissed
+    /// with Escape; once a boundary clears the dismissal, it opens.
+    #[test]
+    fn set_items_respects_an_escape_dismissal() {
+        let mut stub = Stub { items: vec![kw("send", "1")], calls: 0 };
+        let mut c = CompletionController::new();
+        c.on_input(&cx("s", CompletionTrigger::Typed('s')), "s", &mut stub);
+        assert!(c.escape(), "Escape dismisses the open popup");
+        c.set_items(vec![kw("send", "1")], "s", 0);
+        assert!(
+            matches!(c.state(), CompletionState::DismissedUntilBoundary),
+            "a late list stays hidden while dismissed"
+        );
+        c.on_boundary();
+        c.set_items(vec![kw("send", "1")], "s", 0);
+        assert_eq!(labels(&c), ["send"], "after a boundary the list opens");
+    }
+
+    /// `refilter` narrows an open popup in place, closes it when nothing
+    /// matches, and leaves a closed controller closed.
+    #[test]
+    fn refilter_narrows_an_open_popup_and_closes_when_nothing_matches() {
+        let mut c = CompletionController::new();
+        c.set_items(vec![kw("send", "1"), kw("set", "2")], "s", 0);
+        c.refilter("se");
+        assert_eq!(labels(&c), ["send", "set"], "both extend 'se'");
+        c.refilter("set");
+        assert_eq!(labels(&c), ["set"], "only 'set' extends 'set'");
+        c.refilter("x");
+        assert!(matches!(c.state(), CompletionState::Closed), "nothing matches → closed");
+        c.refilter("s");
+        assert!(matches!(c.state(), CompletionState::Closed), "refilter never opens");
     }
 }
