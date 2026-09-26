@@ -4,7 +4,7 @@ members = ["crates/scrive-core", "crates/scrive-lsp", "crates/scrive-iced"]
 
 # Shared metadata.
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
@@ -13,8 +13,8 @@ repository = "https://github.com/robbym/scrive"
 # The internal crates, declared once. A release bump edits the `version`s here
 # and nowhere else; each member opts in with `<crate>.workspace = true`.
 [workspace.dependencies]
-scrive-core = { path = "crates/scrive-core", version = "0.3.0" }
-scrive-lsp = { path = "crates/scrive-lsp", version = "0.3.0" }
+scrive-core = { path = "crates/scrive-core", version = "0.4.0" }
+scrive-lsp = { path = "crates/scrive-lsp", version = "0.4.0" }
 
 # Track iced's git master. The requirements in scrive-iced are `0.15.0-dev`
 # to match it; the dev-dep sub-crates are patched to the same source so their
