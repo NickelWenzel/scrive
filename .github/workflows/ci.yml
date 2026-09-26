@@ -26,6 +26,10 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace
 
+      # The `lsp` feature's glue and its tests compile only with it.
+      - name: Test workspace (all features)
+        run: cargo test --workspace --all-features
+
   wasm:
     name: Wasm
     runs-on: ubuntu-latest
@@ -39,9 +43,10 @@ jobs:
         with:
           tool: wasmtime
 
-      # The browser target: the library, its tests, and the examples must build.
+      # The browser target: the libraries (every feature), their tests, and the
+      # examples must build.
       - name: Build for wasm32-unknown-unknown
-        run: cargo build --workspace --all-targets --target wasm32-unknown-unknown
+        run: cargo build --workspace --all-targets --all-features --target wasm32-unknown-unknown
 
       # The GUI-free core runs its unit tests as wasm (32-bit usize, no threads).
       - name: Test scrive-core on wasm32-wasip1
@@ -68,10 +73,21 @@ jobs:
       - name: Clippy (no warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The glue is `cfg(feature = "lsp")`: lint it too.
+      - name: Clippy, all features (no warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
       # Missing docs and broken intra-doc links are denied at the crate level;
       # this catches every other rustdoc warning.
       - name: Docs build clean
         run: cargo doc --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      # The default build above catches links to gated items from ungated docs;
+      # this one checks the gated docs themselves.
+      - name: Docs build clean (all features)
+        run: cargo doc --no-deps --workspace --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 

@@ -60,6 +60,12 @@ pub use code_editor::{CodeEditor, Event};
 pub use editor::{default_autoscroll_margin, Action, Editor, SCROLLBAR_WIDTH};
 pub use metrics::Metrics;
 
+/// The Language Server Protocol bridge, re-exported so a host names one crate:
+/// `scrive_iced::lsp::Client`, `scrive_iced::lsp::Message`, `scrive_iced::lsp::update`.
+/// Needs the `lsp` feature.
+#[cfg(feature = "lsp")]
+pub use scrive_lsp as lsp;
+
 /// The bundled [Codicon](https://github.com/microsoft/vscode-codicons) icon font
 /// (v0.0.45) — VS Code's own UI glyph set. The host application **must** load
 /// these bytes into iced's font system at startup (e.g.

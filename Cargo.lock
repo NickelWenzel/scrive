@@ -2817,6 +2817,8 @@ dependencies = [
  "iced_tiny_skia",
  "png",
  "scrive-core",
+ "scrive-lsp",
+ "serde_json",
 ]
 
 [[package]]
