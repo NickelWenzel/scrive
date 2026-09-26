@@ -66,6 +66,45 @@ pub enum Target {
     Unopened(jump::Unopened),
 }
 
+/// A definition outside the requesting editor, for the host to route: [`Open`](Jump::Open) goes
+/// to the editor holding that document, and [`Unopened`](Jump::Unopened) needs the file read
+/// first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Jump {
+    /// In another document open on this client.
+    Open(jump::Open),
+    /// In a document this client has not opened.
+    Unopened(jump::Unopened),
+}
+
+/// Why an editor did not apply an update. Nothing was changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    /// The update is for another document.
+    #[error("the update is for another document")]
+    Foreign,
+    /// The update was computed for text the editor has moved past, or answers a request the
+    /// editor no longer awaits.
+    #[error("the update is stale")]
+    Stale,
+    /// The edit batch was rejected: overlapping ranges, or growth past the `u32` offset space.
+    #[error("the edit batch was rejected")]
+    Overlap,
+}
+
+/// What an editor did with one [`Document`] update: the host sends `messages`, routes `jump`,
+/// and may log `refused`.
+#[must_use = "Applied.messages must reach the server, and Applied.jump must be routed"]
+#[derive(Debug, Default)]
+pub struct Applied {
+    /// Messages to send, from the sync that follows every update.
+    pub messages: Vec<message::Message>,
+    /// A definition in another document. Present only when the editor still awaited it.
+    pub jump: Option<Jump>,
+    /// Why the update was not applied, if it was not.
+    pub refused: Option<Refusal>,
+}
+
 /// A rename's edits for a file that is not open: the host reads the file, calls
 /// [`apply`](FileEdits::apply), and writes the result back.
 #[derive(Clone, Debug)]

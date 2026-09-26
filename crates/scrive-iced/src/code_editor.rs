@@ -52,6 +52,9 @@ use scrive_core::{
 use crate::editor::{Action, Editor};
 use crate::highlight_pool::{HighlightPool, PARALLEL_MIN_BYTES};
 
+#[cfg(feature = "lsp")]
+mod lsp;
+
 /// The async request types a host pulls from a [`CodeEditor`]. They live in
 /// scrive-core so a language-service client can use them without iced.
 pub use scrive_core::{CompletionRequest, HoverRequest, SignatureRequest};
@@ -266,6 +269,10 @@ pub struct CodeEditor {
     /// (see [`uses_pool`](Self::uses_pool)), `None` otherwise (the synchronous path). Owned
     /// here so a batteries-included host gets large-document highlighting for free.
     hl_pool: Option<HighlightPool>,
+    /// The language-server client the document is registered with. At most one, because the
+    /// change log and the request slots each have a single consumer.
+    #[cfg(feature = "lsp")]
+    lsp_client: Option<scrive_lsp::client::Id>,
 }
 
 /// What an applied edit means for the completion controller — computed from the
@@ -366,6 +373,8 @@ impl CodeEditor {
             awaiting: Awaiting::default(),
             items_caret: 0,
             hl_pool: None,
+            #[cfg(feature = "lsp")]
+            lsp_client: None,
         }
     }
 
