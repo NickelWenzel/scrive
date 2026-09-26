@@ -1,5 +1,5 @@
 //! Language services — completion, signature help, hover, and the
-//! goto-definition and format commands.
+//! goto-definition, rename and format commands.
 //!
 //! Each service has two ways in. A **provider** is one small trait defined
 //! here and satisfied by the app (not a god-trait with no-op defaults): the
@@ -19,6 +19,7 @@ pub mod definition;
 pub mod format;
 pub mod hover;
 pub mod providers;
+pub mod rename;
 pub mod signature;
 pub mod snippet;
 pub mod ticket;

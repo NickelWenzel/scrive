@@ -362,6 +362,8 @@ pub enum Action {
     },
     /// Go to the definition of the symbol at the caret (F12).
     GotoDefinition,
+    /// Rename the symbol at the caret (F2).
+    Rename,
     /// Format the document (Shift+Alt+F).
     Format,
     /// The pointer rested over byte `offset` long enough for a hover query.
@@ -421,6 +423,7 @@ impl Action {
                 | Action::HoverQuery(_)
                 | Action::HoverDismiss
                 | Action::GotoDefinition
+                | Action::Rename
                 | Action::Format
                 | Action::ToggleFold { .. }
                 | Action::FoldAtCarets { .. }
@@ -3565,6 +3568,7 @@ fn interpret_key(key: &Key, text: Option<&str>, mods: Modifiers) -> Option<Actio
         // F8 / Shift+F8 jump to the next/previous diagnostic.
         Key::Named(Named::F8) => Some(Action::NextDiagnostic { forward: !mods.shift() }),
         Key::Named(Named::F12) => Some(Action::GotoDefinition),
+        Key::Named(Named::F2) => Some(Action::Rename),
         // Ctrl+D add-next-occurrence. The `!alt` guard keeps Ctrl+Alt
         // (AltGr) from ever triggering the gesture.
         Key::Character(c) if mods.control() && !mods.alt() && c.as_str() == "d" => {
@@ -4706,13 +4710,18 @@ mod tests {
         assert!(actions.contains(&Action::HoverDismiss), "without a pending word the same move cancels");
     }
 
-    /// F12 is goto-definition.
+    /// F12 is goto-definition and F2 is rename.
     #[test]
-    fn f12_goes_to_the_definition() {
+    fn f12_and_f2_are_the_language_commands() {
         assert_eq!(
             interpret_key(&Key::Named(Named::F12), None, Modifiers::default()),
             Some(Action::GotoDefinition),
             "F12 goes to the definition"
+        );
+        assert_eq!(
+            interpret_key(&Key::Named(Named::F2), None, Modifiers::default()),
+            Some(Action::Rename),
+            "F2 renames"
         );
     }
 

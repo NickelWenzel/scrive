@@ -43,7 +43,7 @@ use scrive_core::{
     default_indent_size, is_completion_word_char, Bias, CompletionController, CompletionCx, CompletionItem,
     CompletionState, CompletionTrigger, Completions, DefinitionRequest, Diagnostic, DiagnosticsOutcome,
     Document, EditOp, FindQuery, FormatRequest, Hover,
-    HoverCx, HoverInfo, InsertText, Point, Revision, Selection, SelectionId, SelectionSet, Severity,
+    HoverCx, HoverInfo, InsertText, Point, RenameRequest, Revision, Selection, SelectionId, SelectionSet, Severity,
     SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, SyntaxDef, TabOutcome, Ticket,
     TokenTheme, LOOKBACK_LINES,
 };
@@ -64,6 +64,16 @@ const DEFAULT_ID: &str = "scrive-editor";
 /// editor is a proper single-focus model.
 const FIND_INPUT: &str = "scrive-find-input";
 const REPLACE_INPUT: &str = "scrive-replace-input";
+/// The rename field's input. It shares the find bar's focus plumbing.
+const RENAME_INPUT: &str = "scrive-rename-input";
+
+/// The floating bars' input box: width, row height (pinned so the find bar's
+/// chevron can span its rows exactly), and the gap and margin around the
+/// in-box buttons. Shared so the rename field matches the find bar.
+const BAR_INPUT_W: f32 = 264.0;
+const BAR_ROW_H: f32 = 26.0;
+const BAR_BOX_GAP: f32 = 3.0;
+const BAR_BOX_MARGIN: f32 = 3.0;
 
 /// The opaque message a [`CodeEditor`] emits and consumes. The host never
 /// matches on it — it only maps it through the three wires
@@ -88,7 +98,8 @@ pub enum Event {
     OpenFind,
     /// Open the find bar with the replace row expanded (Ctrl+H).
     OpenReplace,
-    /// Close the find bar (Escape), returning focus to the editor.
+    /// Close the open bar (Escape): the rename field if it is open, else the
+    /// find bar. Focus returns to the editor.
     CloseFind,
     /// The query text changed.
     FindQuery(String),
@@ -116,6 +127,10 @@ pub enum Event {
     ReplaceAll,
     /// Toggle the preserve-case (`AB`) replace option.
     TogglePreserveCase,
+    /// The rename field's text changed.
+    RenameText(String),
+    /// Submit the rename field (Enter): record a rename request and close it.
+    SubmitRename,
     /// Tab / Shift+Tab moved focus between the bar's inputs and the editor.
     CycleFocus {
         /// Whether focus moved backwards (Shift+Tab).
@@ -125,11 +140,22 @@ pub enum Event {
     PointerDown,
     /// A bar input gained or lost native focus; mirror it into the ring flags.
     Focused {
-        /// Whether this is the replace input (else the find input).
-        replace: bool,
+        /// Which input.
+        field: Field,
         /// Whether it is now focused.
         on: bool,
     },
+}
+
+/// One of the floating bars' text inputs, for [`Event::Focused`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Field {
+    /// The find bar's query input.
+    Find,
+    /// The find bar's replacement input.
+    Replace,
+    /// The rename field.
+    Rename,
 }
 
 /// A batteries-included code editor: owns a [`Document`], renders the
@@ -219,6 +245,14 @@ pub struct CodeEditor {
     /// A pending format request (Shift+Alt+F), for the host to pull via
     /// [`take_format_request`](CodeEditor::take_format_request).
     pending_format_request: Option<FormatRequest>,
+    /// A pending rename request (the rename field was submitted), for the host
+    /// to pull via [`take_rename_request`](CodeEditor::take_rename_request).
+    pending_rename_request: Option<RenameRequest>,
+    /// Whether F2 opens the rename field. Off by default, because a host with
+    /// no rename provider would show a field that does nothing.
+    rename_enabled: bool,
+    /// The open rename field. Only one floating bar is open at a time.
+    rename: Option<Rename>,
     /// Mints the ticket every async request carries. Per editor, so two
     /// requests at one revision still differ.
     tickets: ticket::Counter,
@@ -257,6 +291,16 @@ struct Awaiting {
     hover: Option<(Ticket, u32, Range<u32>)>,
     /// The goto-definition ticket; a landed range is selected and revealed.
     definition: Option<Ticket>,
+}
+
+/// The open rename field: the name being typed, the caret offset and revision
+/// it opened at (the rename names the symbol there, so an edit underneath
+/// closes it), and whether its input wears the focus ring.
+struct Rename {
+    text: String,
+    offset: u32,
+    revision: Revision,
+    focused: bool,
 }
 
 /// Which awaited slot an `accepts` / `abandon` call addresses.
@@ -314,6 +358,9 @@ impl CodeEditor {
             pending_hover_request: None,
             pending_definition_request: None,
             pending_format_request: None,
+            pending_rename_request: None,
+            rename_enabled: false,
+            rename: None,
             tickets: ticket::Counter::new(),
             awaiting: Awaiting::default(),
             items_caret: 0,
@@ -376,6 +423,14 @@ impl CodeEditor {
     #[must_use]
     pub fn find(mut self, enabled: bool) -> Self {
         self.find_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable the rename field that F2 opens. Default off: turn it on
+    /// when the host answers [`take_rename_request`](CodeEditor::take_rename_request).
+    #[must_use]
+    pub fn rename(mut self, enabled: bool) -> Self {
+        self.rename_enabled = enabled;
         self
     }
 
@@ -620,6 +675,13 @@ impl CodeEditor {
         }
     }
 
+    /// Take the pending rename request, if any. Its answer is an edit batch
+    /// for [`edit`](Self::edit), valid while the document is still at the
+    /// ticket's revision.
+    pub fn take_rename_request(&mut self) -> Option<RenameRequest> {
+        self.pending_rename_request.take()
+    }
+
     /// Take the pending format request, if any. Its answer is an edit batch
     /// for [`edit`](Self::edit), valid while the document is still at the
     /// ticket's revision.
@@ -817,6 +879,24 @@ impl CodeEditor {
                 self.pending_definition_request = Some(DefinitionRequest::new(ticket, head));
                 Task::none()
             }
+            // One bar at a time, so an open find bar closes.
+            Event::Editor(Action::Rename) if self.rename_enabled => {
+                if self.find_open {
+                    self.close_find();
+                }
+                let head = self.doc.selections().newest().head();
+                let word = self.word_around(head);
+                self.rename = Some(Rename {
+                    text: self.doc.buffer().slice(word).into_owned(),
+                    offset: head,
+                    revision: self.doc.revision(),
+                    focused: true,
+                });
+                focus(RENAME_INPUT)
+            }
+            // Kept out of `apply`, whose tail would treat it as a caret move and
+            // close the popup.
+            Event::Editor(Action::Rename) => Task::none(),
             Event::Editor(Action::Format) => {
                 let ticket = self.tickets.issue(self.doc.revision());
                 self.pending_format_request = Some(FormatRequest::new(ticket, default_indent_size()));
@@ -869,6 +949,7 @@ impl CodeEditor {
 
             // ── find bar ────────────────────────────────────────────────────
             Event::OpenFind if self.find_enabled => {
+                self.rename = None;
                 self.find_open = true;
                 // Seed (or re-seed) the query from a non-empty, single-line
                 // selection, as mainstream editors do; an empty selection leaves
@@ -894,16 +975,26 @@ impl CodeEditor {
                 let moved = if back { focus_previous() } else { focus_next() };
                 moved.chain(Self::sync_rings())
             }
-            Event::PointerDown if self.find_open => {
+            Event::PointerDown if self.find_open || self.rename.is_some() => {
                 Task::batch([Self::resync_focus(), Self::sync_rings()])
             }
-            Event::Focused { replace, on } => {
-                if replace {
-                    self.replace_focused = on;
-                } else {
-                    self.find_focused = on;
+            Event::Focused { field, on } => {
+                match field {
+                    Field::Find => self.find_focused = on,
+                    Field::Replace => self.replace_focused = on,
+                    Field::Rename => {
+                        if let Some(rename) = &mut self.rename {
+                            rename.focused = on;
+                        }
+                    }
                 }
                 Task::none()
+            }
+            // Escape arrives here through the global bar chord, whatever holds
+            // focus. At most one bar is open.
+            Event::CloseFind if self.rename.is_some() => {
+                self.rename = None;
+                focus(self.id.clone())
             }
             Event::CloseFind if self.find_open => {
                 self.close_find();
@@ -993,6 +1084,22 @@ impl CodeEditor {
                 self.replace_preserve_case = !self.replace_preserve_case;
                 Task::none()
             }
+            Event::RenameText(text) => {
+                if let Some(rename) = &mut self.rename {
+                    rename.text = text;
+                }
+                Task::none()
+            }
+            // A name typed over text that has since changed, or an empty one,
+            // asks nothing.
+            Event::SubmitRename => {
+                let Some(rename) = self.rename.take() else { return Task::none() };
+                if rename.revision == self.doc.revision() && !rename.text.is_empty() {
+                    let ticket = self.tickets.issue(rename.revision);
+                    self.pending_rename_request = Some(RenameRequest::new(ticket, rename.offset, rename.text));
+                }
+                focus(self.id.clone())
+            }
             // Guarded find variants whose guard did not hold (bar closed, or find
             // disabled): ignore.
             Event::OpenFind
@@ -1033,18 +1140,23 @@ impl CodeEditor {
             .font(self.font)
             .text_size(self.text_size)
             .id(self.id.clone());
-        if self.find_open {
-            // Float the find bar over the editor, top-right (where mainstream
+        let bar = match &self.rename {
+            Some(rename) => Some(rename_bar(rename)),
+            None => self.find_open.then(|| self.find_bar()),
+        };
+        match bar {
+            // Float the bar over the editor, top-right (where mainstream
             // editors place it). The right padding clears the scrollbar lane so
             // the bar never sits over it; the overlay is transparent except the
             // bar, so clicks pass through.
-            let overlay = container(self.find_bar())
-                .width(Length::Fill)
-                .align_x(Horizontal::Right)
-                .padding(iced::Padding::new(8.0).right(8.0 + crate::SCROLLBAR_WIDTH));
-            stack([editor.into(), overlay.into()]).into()
-        } else {
-            editor.into()
+            Some(bar) => {
+                let overlay = container(bar)
+                    .width(Length::Fill)
+                    .align_x(Horizontal::Right)
+                    .padding(iced::Padding::new(8.0).right(8.0 + crate::SCROLLBAR_WIDTH));
+                stack([editor.into(), overlay.into()]).into()
+            }
+            None => editor.into(),
         }
     }
 
@@ -1071,28 +1183,11 @@ impl CodeEditor {
         } else {
             Color::from_rgb8(0xCC, 0xCC, 0xCC)
         };
-        // Both inputs share this width so the two boxes align under each other.
-        const INPUT_W: f32 = 264.0;
         // Fixed so the nav buttons never shuffle as the match-count digits change.
         const COUNT_W: f32 = 78.0;
         const SPACING: f32 = 4.0;
-        // One row's height, pinned so the chevron can span the rows exactly.
-        const ROW_H: f32 = 26.0;
-        // The box look lives on the CONTAINER (`box_of`), so the field is
-        // transparent and sits inside it beside the in-box buttons as a row
-        // sibling — not overlaid in a `Stack` (which early-returns on capture and
-        // would leave a field stale-focused). One style for BOTH fields.
-        let input_style = |_theme: &Theme, _status: text_input::Status| text_input::Style {
-            background: Color::TRANSPARENT.into(),
-            border: iced::border::rounded(0.0),
-            placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
-            value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
-            selection: Color::from_rgb8(0x26, 0x4F, 0x78),
-        };
         const BTN_W: f32 = 22.0;
         const IN_BTN: f32 = 20.0;
-        const IN_GAP: f32 = 3.0;
-        const IN_MARGIN: f32 = 3.0;
         // Flat icon buttons: transparent at rest, translucent gray on hover; `on`
         // latches the background + a focus-blue border so an engaged option reads
         // as pressed at rest, not only under the pointer.
@@ -1129,7 +1224,7 @@ impl CodeEditor {
         let btn = |glyph: char, msg| sized_btn(glyph, false, msg, BTN_W, BTN_W);
         let in_btn = |glyph: char, on: bool, msg| sized_btn(glyph, on, msg, IN_BTN, IN_BTN);
         let box_of =
-            |field, buttons, focused| box_of(field, buttons, focused, INPUT_W, ROW_H, IN_GAP, IN_MARGIN);
+            |field, buttons, focused| box_of(field, buttons, focused, BAR_INPUT_W, BAR_ROW_H, BAR_BOX_GAP, BAR_BOX_MARGIN);
 
         let find_box = box_of(
             text_input("Find", &self.find_query)
@@ -1139,7 +1234,7 @@ impl CodeEditor {
                 .padding(iced::Padding::new(4.0).left(2.0))
                 .size(13)
                 .width(Length::Fill)
-                .style(input_style)
+                .style(bar_input_style)
                 .into(),
             vec![
                 in_btn(crate::icon::CASE_SENSITIVE, self.find_case, Event::ToggleCase).into(),
@@ -1161,7 +1256,7 @@ impl CodeEditor {
             btn(crate::icon::CLOSE, Event::CloseFind),
         ]
         .spacing(SPACING)
-        .height(Length::Fixed(ROW_H))
+        .height(Length::Fixed(BAR_ROW_H))
         .align_y(Alignment::Center);
         let rows = if self.replace_open {
             let replace_box = box_of(
@@ -1172,7 +1267,7 @@ impl CodeEditor {
                     .padding(iced::Padding::new(4.0).left(2.0))
                     .size(13)
                     .width(Length::Fill)
-                    .style(input_style)
+                    .style(bar_input_style)
                     .into(),
                 vec![in_btn(crate::icon::PRESERVE_CASE, self.replace_preserve_case, Event::TogglePreserveCase)
                     .into()],
@@ -1184,7 +1279,7 @@ impl CodeEditor {
                 btn(crate::icon::REPLACE_ALL, Event::ReplaceAll),
             ]
             .spacing(SPACING)
-            .height(Length::Fixed(ROW_H))
+            .height(Length::Fixed(BAR_ROW_H))
             .align_y(Alignment::Center);
             column![find_row, replace_row].spacing(SPACING)
         } else {
@@ -1200,7 +1295,7 @@ impl CodeEditor {
                     false,
                     Event::ToggleReplace,
                     BTN_W,
-                    if self.replace_open { ROW_H * 2.0 + SPACING } else { ROW_H },
+                    if self.replace_open { BAR_ROW_H * 2.0 + SPACING } else { BAR_ROW_H },
                 ),
                 rows,
             ]
@@ -1208,16 +1303,7 @@ impl CodeEditor {
             .align_y(Alignment::Center),
         )
         .padding([6, 8])
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Color::from_rgb8(0x25, 0x25, 0x26).into()),
-            border: iced::border::rounded(8.0).color(Color::from_rgb8(0x45, 0x45, 0x45)).width(1.0),
-            shadow: Shadow {
-                color: Color::from_rgba8(0, 0, 0, 0.36),
-                offset: Vector::new(0.0, 2.0),
-                blur_radius: 8.0,
-            },
-            ..container::Style::default()
-        })
+        .style(bar_panel_style)
         .into()
     }
 
@@ -1241,8 +1327,9 @@ impl CodeEditor {
         // captured it. `listen_with` filters, so non-find keys produce nothing
         // and the editor's own captured keystrokes still route through the widget.
         // The closure is a plain fn (non-capturing), so the `find_open` gating
-        // happens in `update`.
-        let keys = if self.find_enabled {
+        // happens in `update`. The same chords close the rename field, so they
+        // are live while it is open even with find disabled.
+        let keys = if self.find_enabled || self.rename.is_some() {
             iced::event::listen_with(|event, status, _window| match event {
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
                     find_chord(&key, modifiers, status)
@@ -1326,20 +1413,22 @@ impl CodeEditor {
     /// that can't be predicted here (a click, a Tab).
     fn sync_rings() -> Task<Event> {
         Task::batch([
-            is_focused(FIND_INPUT).map(|on| Event::Focused { replace: false, on }),
-            is_focused(REPLACE_INPUT).map(|on| Event::Focused { replace: true, on }),
+            is_focused(FIND_INPUT).map(|on| Event::Focused { field: Field::Find, on }),
+            is_focused(REPLACE_INPUT).map(|on| Event::Focused { field: Field::Replace, on }),
+            is_focused(RENAME_INPUT).map(|on| Event::Focused { field: Field::Rename, on }),
         ])
     }
 
     /// Re-assert single focus after a press: a click inside an input focuses it
     /// natively and captures the event, so the editor's own press handler never
-    /// runs to unfocus itself — focusing whichever input iced reports as focused
-    /// is exactly the repair. When the press landed in the editor, neither input
-    /// is focused and both arms are no-ops.
+    /// runs to unfocus itself — focusing whichever bar input iced reports as
+    /// focused is exactly the repair. When the press landed in the editor, no
+    /// bar input is focused and every arm is a no-op.
     fn resync_focus() -> Task<Event> {
         Task::batch([
             is_focused(FIND_INPUT).then(|f| if f { focus(FIND_INPUT) } else { Task::none() }),
             is_focused(REPLACE_INPUT).then(|f| if f { focus(REPLACE_INPUT) } else { Task::none() }),
+            is_focused(RENAME_INPUT).then(|f| if f { focus(RENAME_INPUT) } else { Task::none() }),
         ])
     }
 
@@ -1419,6 +1508,7 @@ impl CodeEditor {
             | Action::HoverQuery(_)
             | Action::HoverDismiss
             | Action::GotoDefinition
+            | Action::Rename
             | Action::Format
             | Action::ToggleFold { .. }
             | Action::FoldAtCarets { .. } => {}
@@ -1457,6 +1547,11 @@ impl CodeEditor {
         if matches!(comp_event, CompletionEvent::CaretOrClose) {
             self.abandon(Awaited::Hover);
             self.abandon(Awaited::Definition);
+        }
+        // The rename field names the symbol at the revision it opened on, so an
+        // edit underneath (a host edit, an undo) makes it stale.
+        if self.rename.as_ref().is_some_and(|r| r.revision != self.doc.revision()) {
+            self.rename = None;
         }
         // `dirty` is set by the callers on an actual text change (a bare caret
         // move runs the tail but must not dirty the document — see `apply`).
@@ -1894,6 +1989,59 @@ fn box_of<'a>(
         }),
         ..container::Style::default()
     })
+    .into()
+}
+
+/// The bars' text-input look. The field is transparent: the box and the focus
+/// ring live on the `box_of` container around it, beside the in-box buttons as
+/// a row sibling. A `Stack` overlay would early-return on capture and leave a
+/// field stale-focused.
+fn bar_input_style(_theme: &Theme, _status: text_input::Status) -> text_input::Style {
+    text_input::Style {
+        background: Color::TRANSPARENT.into(),
+        border: iced::border::rounded(0.0),
+        placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
+        value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
+        selection: Color::from_rgb8(0x26, 0x4F, 0x78),
+    }
+}
+
+/// The floating bars' panel: dark fill, hairline border, soft drop shadow.
+fn bar_panel_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Color::from_rgb8(0x25, 0x25, 0x26).into()),
+        border: iced::border::rounded(8.0).color(Color::from_rgb8(0x45, 0x45, 0x45)).width(1.0),
+        shadow: Shadow {
+            color: Color::from_rgba8(0, 0, 0, 0.36),
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 8.0,
+        },
+        ..container::Style::default()
+    }
+}
+
+/// The rename field: one input seeded with the symbol under the caret, in the
+/// find bar's panel. Enter submits; Escape (the shared bar chord) closes it.
+fn rename_bar(rename: &Rename) -> Element<'_, Event> {
+    let field = text_input("Rename symbol", &rename.text)
+        .id(RENAME_INPUT)
+        .on_input(Event::RenameText)
+        .on_submit(Event::SubmitRename)
+        .padding(iced::Padding::new(4.0).left(2.0))
+        .size(13)
+        .width(Length::Fill)
+        .style(bar_input_style);
+    container(box_of(
+        field.into(),
+        Vec::new(),
+        rename.focused,
+        BAR_INPUT_W,
+        BAR_ROW_H,
+        BAR_BOX_GAP,
+        BAR_BOX_MARGIN,
+    ))
+    .padding([6, 8])
+    .style(bar_panel_style)
     .into()
 }
 
@@ -2608,5 +2756,96 @@ mod tests {
         assert_eq!(req.tab_size, default_indent_size(), "the editor's indent width");
         assert_eq!(req.ticket.revision(), ed.document().revision(), "asked at the current revision");
         assert_eq!(ed.document().text(), "fn f(){}\n", "asking changes nothing");
+    }
+
+    /// The Escape the global bar chord produces, as a focused input sees it.
+    fn escape_chord() -> Event {
+        use iced::keyboard::{key::Named, Key, Modifiers};
+        find_chord(&Key::Named(Named::Escape), Modifiers::empty(), iced::event::Status::Captured)
+            .expect("Escape is a bar chord")
+    }
+
+    /// F2 opens the field on the symbol under the caret, and Enter asks to
+    /// rename that symbol to the typed name, closing the field.
+    #[test]
+    fn rename_submits_the_typed_name_for_the_symbol_at_the_caret() {
+        let mut ed = CodeEditor::new("let foo = 1;\n").rename(true);
+        act(&mut ed, Action::PlaceCaret(5));
+        act(&mut ed, Action::Rename);
+        assert_eq!(ed.rename.as_ref().map(|r| r.text.as_str()), Some("foo"), "seeded with the symbol");
+        let _ = ed.update(Event::RenameText("bar".into()), Instant::now());
+        let _ = ed.update(Event::SubmitRename, Instant::now());
+        let req = ed.take_rename_request().expect("Enter asks");
+        assert_eq!((req.offset, req.new_name.as_str()), (5, "bar"), "the symbol at the caret, renamed");
+        assert_eq!(req.ticket.revision(), ed.document().revision(), "asked at the current revision");
+        assert!(ed.rename.is_none(), "submitting closes the field");
+
+        act(&mut ed, Action::Rename);
+        let _ = ed.update(Event::RenameText(String::new()), Instant::now());
+        let _ = ed.update(Event::SubmitRename, Instant::now());
+        assert!(ed.take_rename_request().is_none(), "an empty name asks nothing");
+        assert!(ed.rename.is_none(), "submitting an empty name still closes the field");
+    }
+
+    /// Without the opt-in, F2 opens nothing and leaves an open popup alone.
+    #[test]
+    fn rename_is_ignored_unless_enabled() {
+        let mut ed = CodeEditor::new("hello\n");
+        act(&mut ed, Action::Type('h'));
+        let req = ed.take_completion_request().expect("a word char asks");
+        ed.set_completions(req.ticket(), vec![item("hello")]);
+        act(&mut ed, Action::Rename);
+        assert!(ed.rename.is_none(), "rename is off by default");
+        assert!(ed.completion.is_open(), "F2 does not act as a caret move");
+    }
+
+    /// An edit underneath the open field closes it, so it can never submit a
+    /// name for a stale offset.
+    #[test]
+    fn rename_closes_when_the_revision_moves() {
+        let mut ed = CodeEditor::new("let foo = 1;\n").rename(true);
+        act(&mut ed, Action::PlaceCaret(5));
+        act(&mut ed, Action::Rename);
+        ed.edit(vec![EditOp::insert(0, "x")]);
+        assert!(ed.rename.is_none(), "a host edit closes the field");
+        let _ = ed.update(Event::SubmitRename, Instant::now());
+        assert!(ed.take_rename_request().is_none(), "a closed field asks nothing");
+    }
+
+    /// Only one bar is open, and Escape through the bar chord closes the
+    /// rename field without reopening find.
+    #[test]
+    fn escape_through_the_bar_chord_closes_rename_not_find() {
+        let mut ed = CodeEditor::new("let foo = 1;\n").rename(true);
+        let _ = ed.update(Event::OpenFind, Instant::now());
+        act(&mut ed, Action::Rename);
+        assert!(!ed.find_open && ed.rename.is_some(), "one bar at a time");
+        let _ = ed.update(escape_chord(), Instant::now());
+        assert!(ed.rename.is_none(), "Escape closes the rename field");
+        assert!(!ed.find_open, "find stays closed");
+
+        let _ = ed.update(Event::OpenFind, Instant::now());
+        let _ = ed.update(escape_chord(), Instant::now());
+        assert!(!ed.find_open, "with no rename field, Escape closes find");
+    }
+
+    /// The bar chords stay live for the rename field when find is disabled.
+    #[test]
+    fn escape_closes_rename_even_with_find_disabled() {
+        let mut ed = CodeEditor::new("let foo = 1;\n").find(false).rename(true);
+        act(&mut ed, Action::Rename);
+        assert!(ed.rename.is_some(), "F2 opens the field");
+        let _ = ed.update(escape_chord(), Instant::now());
+        assert!(ed.rename.is_none(), "Escape closes it");
+    }
+
+    /// Opening find closes the rename field.
+    #[test]
+    fn opening_find_closes_rename() {
+        let mut ed = CodeEditor::new("let foo = 1;\n").rename(true);
+        act(&mut ed, Action::Rename);
+        let _ = ed.update(Event::OpenFind, Instant::now());
+        assert!(ed.rename.is_none(), "one bar at a time");
+        assert!(ed.find_open, "find opened");
     }
 }
