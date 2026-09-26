@@ -40,7 +40,7 @@ use iced::{Alignment, Color, Element, Font, Length, Shadow, Subscription, Task, 
 use scrive_core::intel::completion::Start;
 use scrive_core::intel::ticket;
 use scrive_core::{
-    default_indent_size, is_completion_word_char, CompletionController, CompletionCx, CompletionItem,
+    default_indent_size, is_completion_word_char, Bias, CompletionController, CompletionCx, CompletionItem,
     CompletionState, CompletionTrigger, Completions, Diagnostic, DiagnosticsOutcome, Document, EditOp,
     FindQuery, Hover,
     HoverCx, HoverInfo, InsertText, Point, Revision, Selection, SelectionId, SelectionSet, Severity,
@@ -218,6 +218,9 @@ pub struct CodeEditor {
     tickets: ticket::Counter,
     /// The ticket each async service's reply must carry to land.
     awaiting: Awaiting,
+    /// The caret the popup's current items were produced against. Accepting an
+    /// item shifts its additional edits by how far the caret has moved since.
+    items_caret: u32,
     /// The off-thread parallel highlight sweep — `Some` for a large document
     /// (see [`uses_pool`](Self::uses_pool)), `None` otherwise (the synchronous path). Owned
     /// here so a batteries-included host gets large-document highlighting for free.
@@ -302,6 +305,7 @@ impl CodeEditor {
             pending_hover_request: None,
             tickets: ticket::Counter::new(),
             awaiting: Awaiting::default(),
+            items_caret: 0,
             hl_pool: None,
         }
     }
@@ -535,6 +539,7 @@ impl CodeEditor {
         if !self.accepts(Awaited::Completion, ticket) {
             return;
         }
+        self.items_caret = self.doc.selections().newest().head();
         let word = self.completion_word_text();
         let anchor = self.completion_word().start;
         self.completion.set_items(items, &word, anchor);
@@ -1465,10 +1470,17 @@ impl CodeEditor {
                 Some(CompletionRequest::new(ticket, self.completion_word(), trigger, start));
             return;
         };
+        // A provider call replaces the list, unless a word char is refiltering
+        // an open popup, which keeps the items and the caret they belong to.
+        let fresh = !(self.completion.is_open() && matches!(trigger, CompletionTrigger::Typed(_)));
+        let head = self.doc.selections().newest().head();
         let cx = self.build_cx(trigger);
         let word = self.completion_word_text();
         self.completion.on_input(&cx, &word, &mut *provider);
         self.comp_provider = Some(provider);
+        if fresh {
+            self.items_caret = head;
+        }
     }
 
     /// Drive the signature-help box: `(` opens it; while it shows, or while a
@@ -1497,63 +1509,105 @@ impl CodeEditor {
         }
     }
 
-    /// Accept the popup's selected item: replace the completion word with the
-    /// item's insertion (a snippet expands and starts an interactive tab-stop
-    /// session, selecting the first stop), sealed as one edit. Fires the retrigger
-    /// if requested.
+    /// Accept the popup's selected item as one edit: the main replacement and
+    /// the item's additional edits (an auto-import, say) in a single batch, so
+    /// one undo reverts all of it. A snippet expands and starts a tab-stop
+    /// session at the first stop. Fires the retrigger and the signature-help
+    /// follow-up if the item asks for them.
+    ///
+    /// The item's ranges were produced at `items_caret`. Since then the user
+    /// may have typed on inside the word, so a replace range ending in the live
+    /// word stretches to the caret, and additional edits at or past the popup
+    /// anchor shift by the caret's movement. The snippet base and the caret come
+    /// from where the patch put the main replacement, since an import above it
+    /// moves it.
     fn accept_completion(&mut self) {
+        let CompletionState::Open(list) = self.completion.state() else { return };
+        let anchor = list.anchor;
         let Some(item) = self.completion.accept() else { return };
         // The accept retires the in-flight request; a retrigger below asks
         // afresh, so this must come first.
         self.abandon(Awaited::Completion);
-        let replace = item.replace.clone().unwrap_or_else(|| self.completion_word());
-        self.set_selection_range(replace.clone());
 
-        let expanded = match &item.insert {
-            InsertText::Plain(s) => {
-                self.doc.insert_text(s);
-                None
-            }
+        let caret = self.doc.selections().newest().head();
+        let word = self.completion_word();
+        let replace = match item.replace.clone() {
+            None => word.clone(),
+            Some(r) if (word.start..=word.end).contains(&r.end) => r.start..word.end,
+            Some(r) => r,
+        };
+        let delta = i64::from(caret) - i64::from(self.items_caret);
+        let shift = |o: u32| (i64::from(o) + delta).clamp(0, i64::from(u32::MAX)) as u32;
+        let mut batch: Vec<EditOp> = item
+            .additional
+            .iter()
+            .map(|op| {
+                if op.range.start >= anchor {
+                    EditOp::new(shift(op.range.start)..shift(op.range.end), op.text.clone())
+                } else {
+                    op.clone()
+                }
+            })
+            // An edit touching the replaced word would fight the insertion; the
+            // insertion wins.
+            .filter(|op| op.range.end < replace.start || op.range.start > replace.end)
+            .collect();
+
+        // Read before the batch can move the line.
+        let indent = self.line_indent(replace.start);
+        let (text, expanded) = match &item.insert {
+            InsertText::Plain(s) => (s.clone(), None),
             InsertText::Snippet(body) => match Snippet::parse(body) {
                 Ok(snip) => {
-                    let indent = self.line_indent(replace.start);
                     let e = snip.for_insertion(&indent, default_indent_size() as usize);
-                    self.doc.insert_text(&e.text);
-                    Some(e)
+                    (e.text.clone(), Some(e))
                 }
-                Err(_) => {
-                    self.doc.insert_text(body);
-                    None
-                }
+                Err(_) => (body.clone(), None),
             },
         };
+        let main = EditOp::new(replace.clone(), text.clone());
+        batch.push(main.clone());
+        batch.sort_by_key(|op| (op.range.start, op.range.end));
+        let before = self.doc.revision();
+        // A malformed set of additional edits must not cost the user the
+        // completion itself.
+        let committed = match self.doc.edit(batch) {
+            Ok(c) => c,
+            Err(_) => match self.doc.edit(vec![main]) {
+                Ok(c) => c,
+                Err(_) => return,
+            },
+        };
+        let base = committed.patch().map_offset(replace.start, Bias::Left);
 
         if let Some(mut s) = self.snippet.take() {
             s.cancel(self.doc.decorations_mut());
         }
-        if let Some(e) = expanded {
-            match SnippetSession::start(&e, replace.start, self.doc.decorations_mut()) {
+        match expanded {
+            Some(e) => match SnippetSession::start(&e, base, self.doc.decorations_mut()) {
                 Some((session, first)) => {
                     self.set_selection_range(first);
                     self.snippet = Some(session);
                 }
                 None => {
                     let fin = e.stops.last().map_or(e.text.len() as u32, |s| s.range.start);
-                    self.set_caret(replace.start + fin);
+                    self.set_caret(base + fin);
                 }
-            }
+            },
+            None => self.set_caret(base + text.len() as u32),
         }
         self.doc.tokenize_highlight(self.viewport.end);
         let now = self.now_ms;
         self.doc.maybe_rescan_find(now);
-        self.dirty = true;
+        if self.doc.revision() != before {
+            self.dirty = true;
+        }
 
         if item.retrigger && self.snippet.is_none() {
-            let cx = self.build_cx(CompletionTrigger::Manual);
-            let word = self.completion_word_text();
-            if let Some(provider) = self.comp_provider.as_mut() {
-                self.completion.on_input(&cx, &word, &mut **provider);
-            }
+            self.request_completions(CompletionTrigger::Manual);
+        }
+        if item.signature_after {
+            self.drive_signature(CompletionEvent::Typed('('));
         }
     }
 
@@ -2296,5 +2350,58 @@ mod tests {
         let req = ed.take_completion_request().expect("a trigger char asks");
         ed.set_completions(req.ticket(), vec![item("send")]);
         assert_eq!(shown(&ed), ["send"], "the trigger's reply opens the popup");
+    }
+
+    /// A retrigger item asks the async host for a fresh list after accepting,
+    /// and that list opens the popup.
+    #[test]
+    fn accepting_a_retrigger_item_opens_the_popup_when_the_reply_lands() {
+        let mut ed = CodeEditor::new("");
+        act(&mut ed, Action::Type('s'));
+        let req = ed.take_completion_request().expect("a word char asks");
+        ed.set_completions(req.ticket(), vec![item("size=").with_retrigger(true)]);
+        act(&mut ed, Action::PopupAccept);
+        assert_eq!(ed.document().text(), "size=", "the item is inserted");
+        let again = ed.take_completion_request().expect("the retrigger asks the async host");
+        assert_eq!(again.trigger(), CompletionTrigger::Manual, "a retrigger is a manual invoke");
+        ed.set_completions(again.ticket(), vec![item("8")]);
+        assert_eq!(shown(&ed), ["8"], "the retrigger reply opens the popup");
+    }
+
+    /// An additional edit above a snippet lands in the same undo step, and the
+    /// tab stops sit where the snippet text ended up, not where it would have
+    /// been without the import.
+    #[test]
+    fn an_auto_import_above_a_snippet_keeps_the_tab_stops_on_the_placeholders() {
+        let mut ed = CodeEditor::new("\n");
+        act(&mut ed, Action::PlaceCaret(1));
+        act(&mut ed, Action::Type('i'));
+        let req = ed.take_completion_request().expect("a word char asks");
+        let snippet = CompletionItem::new(
+            "iflet",
+            scrive_core::CompletionKind::Keyword,
+            InsertText::Snippet("if ${1:cond} {\n\t$0\n}".into()),
+        )
+        .with_additional(vec![EditOp::insert(0, "use a;\n")]);
+        ed.set_completions(req.ticket(), vec![snippet]);
+        act(&mut ed, Action::PopupAccept);
+        let text = ed.document().text().into_owned();
+        assert!(text.starts_with("use a;\n"), "the import landed");
+        let cond = text.find("cond").expect("the placeholder is inserted") as u32;
+        assert_eq!(ed.selection(), cond..cond + 4, "the first stop sits on its placeholder");
+        act(&mut ed, Action::Undo);
+        assert_eq!(ed.document().text(), "\ni", "one undo reverts import and insertion together");
+    }
+
+    /// Accepting an item marked `signature_after` asks for signature help.
+    #[test]
+    fn accepting_a_signature_after_item_asks_for_signature_help() {
+        let mut ed = CodeEditor::new("");
+        act(&mut ed, Action::Type('f'));
+        let req = ed.take_completion_request().expect("a word char asks");
+        ed.set_completions(req.ticket(), vec![item("foo(").with_signature_after(true)]);
+        assert!(ed.take_signature_request().is_none(), "nothing asked for signature help yet");
+        act(&mut ed, Action::PopupAccept);
+        assert!(ed.take_signature_request().is_some(), "the accept asks for signature help");
     }
 }
