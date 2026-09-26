@@ -3,7 +3,8 @@ use std::str::FromStr;
 use scrive_core::intel::completion::Start;
 use scrive_core::intel::ticket::Counter;
 use scrive_core::{
-    CompletionItem, Document, EditOp, GroupingHint, OpClass, Point, SignatureInfo,
+    CompletionItem, Document, EditOp, GroupingHint, HoverInfo, HoverRequest, OpClass, Point,
+    SignatureInfo,
 };
 use serde_json::{json, Value};
 
@@ -88,8 +89,8 @@ fn whole(text: &str) -> Value {
     json!({"text": text})
 }
 
-/// With [`completions`] and [`signature`], the only place tests read a `Change`, so a new variant
-/// changes only these helpers.
+/// With [`completions`], [`signature`] and [`hover`], the only place tests read a `Change`, so a
+/// new variant changes only these helpers.
 fn diagnostics(update: &Update) -> (DocId, update::Stamp, Vec<scrive_core::Diagnostic>) {
     let Update::Document(document) = update else {
         panic!("expected a document update, got {update:?}")
@@ -119,6 +120,17 @@ fn signature(update: &Update) -> (update::Stamp, Option<SignatureInfo>) {
     match document.change() {
         update::Change::Signature(info) => (document.stamp(), info.clone()),
         other => panic!("expected a signature, got {other:?}"),
+    }
+}
+
+/// The stamp and card of a hover update.
+fn hover(update: &Update) -> (update::Stamp, Option<HoverInfo>) {
+    let Update::Document(document) = update else {
+        panic!("expected a document update, got {update:?}")
+    };
+    match document.change() {
+        update::Change::Hover(info) => (document.stamp(), info.clone()),
+        other => panic!("expected a hover, got {other:?}"),
     }
 }
 
@@ -1862,15 +1874,20 @@ fn continuing_request_after_a_dropped_first_request_starts_fresh() {
     );
 }
 
-/// Server capabilities with incremental sync and signature help triggered by `(` and `,`.
-fn signature_capabilities() -> Value {
-    json!({"textDocumentSync": 2, "signatureHelpProvider": {"triggerCharacters": ["(", ","]}})
+/// Server capabilities with incremental sync, hover, and signature help triggered by `(` and `,`.
+fn signature_hover_capabilities() -> Value {
+    json!({
+        "textDocumentSync": 2,
+        "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
+        "hoverProvider": true,
+    })
 }
 
-/// A running client with `text` open as `file:///a.rs`, whose server offers signature help.
+/// A running client with `text` open as `file:///a.rs`, whose server offers signature help and
+/// hover.
 fn signing(text: &str) -> (Client, Document) {
     let doc = document(text);
-    let (mut client, _) = running(Client::builder(), signature_capabilities());
+    let (mut client, _) = running(Client::builder(), signature_hover_capabilities());
     let _ = client
         .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
         .expect("opens");
@@ -1917,9 +1934,9 @@ fn signed(output: &Output) -> (update::Stamp, Option<SignatureInfo>) {
 }
 
 /// `initialize` advertises plain-text signature documentation, label offsets and per-signature
-/// active parameters, and no context.
+/// active parameters, no signature context, and markdown hover contents.
 #[test]
-fn signature_capabilities_are_advertised() {
+fn signature_and_hover_capabilities_are_advertised() {
     let (_, initialize) = Client::builder().build();
     let initialize = serde_json::to_value(&initialize).expect("serializes");
     let signature = &initialize["params"]["capabilities"]["textDocument"]["signatureHelp"];
@@ -1943,6 +1960,11 @@ fn signature_capabilities_are_advertised() {
         signature.get("contextSupport"),
         None,
         "context is not advertised"
+    );
+    assert_eq!(
+        initialize["params"]["capabilities"]["textDocument"]["hover"]["contentFormat"],
+        json!(["markdown", "plaintext"]),
+        "markdown hover is preferred"
     );
 }
 
@@ -2135,18 +2157,164 @@ fn content_modified_reissues_signature_help_once() {
     );
 }
 
-/// A request from an older revision is neither sent nor answered.
+/// Requests from an older revision are neither sent nor answered.
 #[test]
-fn stale_signature_request_is_ignored() {
+fn stale_signature_and_hover_requests_are_ignored() {
+    let mut tickets = Counter::new();
     let (mut client, mut doc) = signing("foo(");
     type_ops(&mut client, &mut doc, vec![EditOp::insert(4, "a")]);
-    let stale = SignatureRequest::new(
-        Counter::new().issue(Revision(0)),
-        Point::new(0, 4),
-        Some(3),
-    );
+    let stale = SignatureRequest::new(tickets.issue(Revision(0)), Point::new(0, 4), Some(3));
     assert_silent(
         &client.signature_help(&doc.snapshot(), &stale),
-        "a stale request is ignored",
+        "a stale signature request is ignored",
     );
+    let stale = HoverRequest::new(tickets.issue(Revision(0)), 1, 0..3);
+    assert_silent(
+        &client.hover(&doc.snapshot(), &stale),
+        "a stale hover request is ignored",
+    );
+}
+
+/// A hover request for `value` in `doc` (`let value = 1;`), under a fresh ticket.
+fn hover_request(tickets: &mut Counter, doc: &Document) -> HoverRequest {
+    HoverRequest::new(tickets.issue(doc.revision()), 5, 4..9)
+}
+
+fn hover_wire(id: i64) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/hover", "params": {
+        "textDocument": {"uri": "file:///a.rs"},
+        "position": {"line": 0, "character": 5},
+    }})
+}
+
+/// The one hover update in `output`, which sends nothing.
+fn hovered(output: &Output) -> (update::Stamp, Option<HoverInfo>) {
+    assert!(
+        output.messages.is_empty(),
+        "an answer sends nothing: {output:?}"
+    );
+    let [update] = output.updates.as_slice() else {
+        panic!("expected one update, got {:?}", output.updates)
+    };
+    hover(update)
+}
+
+/// A hover request goes out at the offset under the pointer.
+#[test]
+fn hover_request_carries_the_offset_position() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = signing("let value = 1;");
+    let output = client.hover(&doc.snapshot(), &hover_request(&mut tickets, &doc));
+    assert_eq!(
+        wire(&output.messages),
+        vec![hover_wire(2)],
+        "the request asks at the pointer"
+    );
+    assert!(output.updates.is_empty(), "nothing is answered yet");
+}
+
+/// With no server to ask, or one without a provider, the card gets no docs at once.
+#[test]
+fn hover_declines_before_initialize_and_without_a_provider() {
+    let doc = document("let value = 1;");
+    let (initializing, _) = Client::builder().build();
+    let (without, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
+    let (disabled, _) = running(
+        Client::builder(),
+        json!({"textDocumentSync": 2, "hoverProvider": false}),
+    );
+    for mut client in [initializing, without, disabled] {
+        let mut tickets = Counter::new();
+        let _ = client
+            .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+            .expect("opens");
+        let first = hover_request(&mut tickets, &doc);
+        let (stamp, info) = hovered(&client.hover(&doc.snapshot(), &first));
+        assert_eq!(
+            stamp,
+            update::Stamp::Ticket(first.ticket),
+            "the decline answers the ticket"
+        );
+        assert!(info.is_none(), "the decline has no docs");
+    }
+}
+
+/// A new hover cancels the one in flight.
+#[test]
+fn new_hover_supersedes_the_previous_one() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = signing("let value = 1;");
+    let _ = client.hover(&doc.snapshot(), &hover_request(&mut tickets, &doc));
+    assert_eq!(
+        wire(&client.hover(&doc.snapshot(), &hover_request(&mut tickets, &doc)).messages),
+        vec![cancel_request(2), hover_wire(3)],
+        "the first hover is cancelled before the second goes out"
+    );
+}
+
+/// A reply becomes a card in the editor's markdown subset over the server's range.
+#[test]
+fn hover_reply_answers_with_the_converted_card() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = signing("let value = 1;");
+    let first = hover_request(&mut tickets, &doc);
+    let _ = client.hover(&doc.snapshot(), &first);
+    let (stamp, info) = hovered(
+        &client
+            .receive(from_server(json!({"jsonrpc": "2.0", "id": 2, "result": {
+                "contents": {"kind": "markdown", "value": "```rust\nlet value: i32\n```"},
+                "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 9}},
+            }})))
+            .expect("the reply is accepted"),
+    );
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(first.ticket),
+        "the card answers the ticket"
+    );
+    let info = info.expect("a card");
+    assert_eq!(info.markdown, "`let value: i32`", "the fence is a code line");
+    assert_eq!(info.range, 4..9, "the server's range is kept");
+}
+
+/// A `null` reply means no docs.
+#[test]
+fn null_hover_reply_answers_none() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = signing("let value = 1;");
+    let first = hover_request(&mut tickets, &doc);
+    let _ = client.hover(&doc.snapshot(), &first);
+    let (_, info) = hovered(
+        &client
+            .receive(from_server(
+                json!({"jsonrpc": "2.0", "id": 2, "result": null}),
+            ))
+            .expect("the reply is accepted"),
+    );
+    assert!(info.is_none(), "null has no docs");
+}
+
+/// A failed or undecodable hover reply settles the card instead of leaving it waiting.
+#[test]
+fn failed_hover_request_answers_none() {
+    for reply in [
+        failure(2, -32603),
+        from_server(json!({"jsonrpc": "2.0", "id": 2, "result": "x"})),
+    ] {
+        let mut tickets = Counter::new();
+        let (mut client, doc) = signing("let value = 1;");
+        let first = hover_request(&mut tickets, &doc);
+        let _ = client.hover(&doc.snapshot(), &first);
+        let (stamp, info) = hovered(
+            &client
+                .receive(reply)
+                .expect("a hover failure is not an error"),
+        );
+        assert_eq!(
+            stamp,
+            update::Stamp::Ticket(first.ticket),
+            "stamped with the request's ticket"
+        );
+        assert!(info.is_none(), "the failure has no docs");
+    }
 }

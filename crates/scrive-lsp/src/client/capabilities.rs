@@ -2,10 +2,11 @@
 
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-    GeneralClientCapabilities, MarkupKind, ParameterInformationSettings,
-    PublishDiagnosticsClientCapabilities, ServerCapabilities, SignatureHelpClientCapabilities,
-    SignatureInformationSettings, TextDocumentClientCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncClientCapabilities, TextDocumentSyncKind, WorkspaceClientCapabilities,
+    GeneralClientCapabilities, HoverClientCapabilities, HoverProviderCapability, MarkupKind,
+    ParameterInformationSettings, PublishDiagnosticsClientCapabilities, ServerCapabilities,
+    SignatureHelpClientCapabilities, SignatureInformationSettings, TextDocumentClientCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
+    WorkspaceClientCapabilities,
 };
 
 use crate::Encoding;
@@ -21,6 +22,8 @@ pub(crate) struct Server {
     pub(crate) completion: Option<Vec<String>>,
     /// Whether the server answers `textDocument/signatureHelp`.
     pub(crate) signature: bool,
+    /// Whether the server answers `textDocument/hover`.
+    pub(crate) hover: bool,
 }
 
 impl Server {
@@ -46,6 +49,10 @@ impl Server {
             change,
             completion,
             signature: capabilities.signature_help_provider.is_some(),
+            hover: matches!(
+                capabilities.hover_provider,
+                Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+            ),
         }
     }
 }
@@ -85,6 +92,10 @@ pub(crate) fn client() -> ClientCapabilities {
                     active_parameter_support: Some(true),
                 }),
                 ..SignatureHelpClientCapabilities::default()
+            }),
+            hover: Some(HoverClientCapabilities {
+                content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
+                ..HoverClientCapabilities::default()
             }),
             ..TextDocumentClientCapabilities::default()
         }),

@@ -14,20 +14,20 @@ use lsp_types::{
     ApplyWorkspaceEditResponse, ClientInfo, CompletionContext, CompletionParams,
     CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
+    HoverParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
     SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
     WorkspaceFolder,
 };
 use scrive_core::{
-    document, Bias, CompletionRequest, CompletionTrigger, DocId, Revision, SignatureRequest,
-    Snapshot, Ticket,
+    document, Bias, CompletionRequest, CompletionTrigger, DocId, HoverRequest, Revision,
+    SignatureRequest, Snapshot, Ticket,
 };
 use serde_json::Value;
 
 use crate::message::{self, Message};
 use crate::update::{self, Update};
-use crate::{completion, diagnostics, signature, uri, Encoding};
+use crate::{completion, diagnostics, hover, signature, uri, Encoding};
 
 /// JSON-RPC's "method not found": a server request this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -165,6 +165,7 @@ struct Pending {
 enum Kind {
     Completion,
     Signature,
+    Hover,
 }
 
 /// What a pending request asked, with what its reply needs.
@@ -172,6 +173,7 @@ enum Kind {
 enum Query {
     Completion(completion::Query),
     Signature(signature::Query),
+    Hover(hover::Query),
 }
 
 impl Client {
@@ -397,6 +399,34 @@ impl Client {
         )
     }
 
+    /// Answers the editor's hover request with a `textDocument/hover` at its offset, superseding
+    /// the document's previous hover request.
+    ///
+    /// When the server is not running or has no hover provider, the request is declined with
+    /// [`update::Change::Hover`]`(None)` under its ticket. A request from a revision other than
+    /// `snapshot`'s or the last synced one, or for a document that is not registered, gets
+    /// nothing.
+    pub fn hover(&mut self, snapshot: &Snapshot, request: &HoverRequest) -> Output {
+        let doc_id = snapshot.doc_id();
+        let ticket = request.ticket;
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
+            return Output::default();
+        };
+        if ticket.revision() != snapshot.revision()
+            || snapshot.revision() != tracked.synced.revision()
+        {
+            return Output::default();
+        }
+        if !matches!(&self.state, State::Running(server) if server.hover) {
+            return Output::answer(doc_id, ticket, update::Change::Hover(None));
+        }
+        let query = hover::Query {
+            offset: request.offset,
+            word: request.word.clone(),
+        };
+        self.send(doc_id, ticket, Query::Hover(query), None)
+    }
+
     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
     /// it leads exactly from what the server has to `snapshot`, and the server syncs
     /// incrementally, the edits go out as ranges; otherwise the whole text goes out. Servers that
@@ -618,6 +648,12 @@ impl Client {
                 }),
                 Some(entry.latest_ticket),
             ),
+            Query::Hover(query) => self.send(
+                entry.doc_id,
+                entry.latest_ticket,
+                Query::Hover(query),
+                Some(entry.latest_ticket),
+            ),
         }
     }
 
@@ -625,6 +661,7 @@ impl Client {
         match &entry.query {
             Query::Completion(query) => self.completed(entry, query, value),
             Query::Signature(query) => self.signed(entry, query, value),
+            Query::Hover(query) => self.hovered(entry, query, value),
         }
     }
 
@@ -832,6 +869,16 @@ impl Client {
         output
     }
 
+    /// Answers the ticket with the reply's card.
+    fn hovered(&self, entry: &Pending, query: &hover::Query, value: Value) -> Output {
+        let Ok(reply) = serde_json::from_value::<Option<lsp_types::Hover>>(value) else {
+            return entry.failed();
+        };
+        let card = reply
+            .and_then(|reply| hover::convert(self.encoding, &entry.request_snapshot, query, reply));
+        Output::answer(entry.doc_id, entry.latest_ticket, update::Change::Hover(card))
+    }
+
     fn answer(&self, request: message::Request) -> Output {
         let response = match self.state {
             // After `shutdown()` the client promises nothing; `null` keeps the server unblocked.
@@ -1023,6 +1070,9 @@ impl Pending {
                 self.latest_ticket,
                 update::Change::Signature(None),
             ),
+            Query::Hover(_) => {
+                Output::answer(self.doc_id, self.latest_ticket, update::Change::Hover(None))
+            }
         }
     }
 }
@@ -1032,6 +1082,7 @@ impl Query {
         match self {
             Query::Completion(_) => Kind::Completion,
             Query::Signature(_) => Kind::Signature,
+            Query::Hover(_) => Kind::Hover,
         }
     }
 
@@ -1040,6 +1091,7 @@ impl Query {
         match self {
             Query::Completion(query) => query.word.end,
             Query::Signature(query) => query.caret,
+            Query::Hover(query) => query.offset,
         }
     }
 
@@ -1077,6 +1129,16 @@ impl Query {
                     },
                 )
             }
+            Query::Hover(query) => message::Request::new::<lsp_types::request::HoverRequest>(
+                id,
+                HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier { uri: uri.clone() },
+                        position: encoding.position(snapshot, query.offset),
+                    },
+                    work_done_progress_params: Default::default(),
+                },
+            ),
         }
     }
 }

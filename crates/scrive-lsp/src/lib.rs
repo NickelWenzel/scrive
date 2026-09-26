@@ -7,6 +7,7 @@
 //! - the client state machine → [`Client`] ([`client`])
 //! - completion → [`Client::complete`]
 //! - signature help → [`Client::signature_help`]
+//! - hover → [`Client::hover`]
 //! - what the client hands back → [`Update`] ([`update`])
 //! - the JSON-RPC envelope → [`message`]
 //! - LSP positions ↔ scrive byte offsets → [`encoding`]
@@ -20,6 +21,7 @@
 pub mod client;
 mod completion;
 mod diagnostics;
+mod hover;
 pub mod encoding;
 mod markdown;
 pub mod message;
