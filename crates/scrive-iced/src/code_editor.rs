@@ -694,6 +694,12 @@ impl CodeEditor {
                 self.accept_completion();
                 Task::none()
             }
+            // Handled here rather than in `apply`, whose post-edit tail would
+            // treat it as a caret move and abandon the request it just made.
+            Event::Editor(Action::TriggerCompletion) => {
+                self.request_completions(CompletionTrigger::Manual);
+                Task::none()
+            }
             // Snippet tab-stop navigation (captured while a session is active).
             Event::Editor(Action::SnippetTab) => {
                 self.snippet_tab(true);
@@ -1345,6 +1351,7 @@ impl CodeEditor {
             | Action::PopupAccept
             | Action::PopupClickAccept(_)
             | Action::PopupDismiss
+            | Action::TriggerCompletion
             | Action::SnippetTab
             | Action::SnippetTabPrev
             | Action::SnippetCancel
@@ -2403,5 +2410,23 @@ mod tests {
         assert!(ed.take_signature_request().is_none(), "nothing asked for signature help yet");
         act(&mut ed, Action::PopupAccept);
         assert!(ed.take_signature_request().is_some(), "the accept asks for signature help");
+    }
+
+    /// Two manual invokes at one revision get distinct tickets, and only the
+    /// newer one's reply lands.
+    #[test]
+    fn two_manual_invokes_at_one_revision_accept_only_the_second() {
+        let mut ed = CodeEditor::new("");
+        act(&mut ed, Action::TriggerCompletion);
+        let first = ed.take_completion_request().expect("Ctrl+Space asks");
+        act(&mut ed, Action::TriggerCompletion);
+        let second = ed.take_completion_request().expect("Ctrl+Space asks again");
+        assert_eq!(first.ticket().revision(), second.ticket().revision(), "same revision");
+        assert_eq!(second.trigger(), CompletionTrigger::Manual, "a manual invoke");
+        assert_eq!((first.start(), second.start()), (Start::Fresh, Start::Continuing), "the second continues the first");
+        ed.set_completions(first.ticket(), vec![item("stale")]);
+        assert!(shown(&ed).is_empty(), "the superseded reply is dropped");
+        ed.set_completions(second.ticket(), vec![item("fresh")]);
+        assert_eq!(shown(&ed), ["fresh"], "the newest reply lands");
     }
 }

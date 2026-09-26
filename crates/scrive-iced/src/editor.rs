@@ -342,6 +342,9 @@ pub enum Action {
     PopupClickAccept(u32),
     /// Dismiss the popup (Escape) — sticky until a word boundary.
     PopupDismiss,
+    /// Ask for completions at the caret (Ctrl+Space). A manual invoke: it also
+    /// overrides an Escape dismissal.
+    TriggerCompletion,
     /// Advance / retreat the active snippet tab stop (Tab / Shift+Tab).
     /// Captured only while a session is active; the app drives it.
     SnippetTab,
@@ -406,6 +409,7 @@ impl Action {
                 | Action::PopupAccept
                 | Action::PopupClickAccept(_)
                 | Action::PopupDismiss
+                | Action::TriggerCompletion
                 | Action::SnippetTab
                 | Action::SnippetTabPrev
                 | Action::SnippetCancel
@@ -3530,6 +3534,9 @@ fn interpret_key(key: &Key, text: Option<&str>, mods: Modifiers) -> Option<Actio
         Key::Named(Named::Enter) => None,
         Key::Named(Named::Tab) if mods.shift() => Some(Action::Outdent),
         Key::Named(Named::Tab) => Some(Action::Tab),
+        // Ctrl+Space asks for completions; the `!alt` guard keeps Ctrl+Alt
+        // (AltGr) layouts typing.
+        Key::Named(Named::Space) if mods.control() && !mods.alt() => Some(Action::TriggerCompletion),
         Key::Named(Named::Space) => Some(Action::Type(' ')),
         Key::Named(Named::Escape) => Some(Action::Collapse),
         // F8 / Shift+F8 jump to the next/previous diagnostic.
@@ -4054,6 +4061,24 @@ mod tests {
         assert_eq!(
             interpret_key(&Key::Named(Named::ArrowLeft), None, Modifiers::CTRL),
             Some(Action::Move { motion: Motion::WordLeft, extend: false })
+        );
+    }
+
+    /// Ctrl+Space is a manual completion invoke; plain Space and AltGr+Space
+    /// still type.
+    #[test]
+    fn ctrl_space_is_trigger_completion() {
+        let space = Key::Named(Named::Space);
+        assert_eq!(
+            interpret_key(&space, Some(" "), Modifiers::CTRL),
+            Some(Action::TriggerCompletion),
+            "Ctrl+Space asks for completions"
+        );
+        assert_eq!(interpret_key(&space, Some(" "), Modifiers::empty()), Some(Action::Type(' ')), "plain Space types");
+        assert_eq!(
+            interpret_key(&space, Some(" "), Modifiers::CTRL | Modifiers::ALT),
+            Some(Action::Type(' ')),
+            "AltGr+Space stays typing"
         );
     }
 
