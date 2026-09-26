@@ -80,6 +80,8 @@ pub use highlight::{
 };
 pub use history::{GroupingHint, OpClass};
 pub use intel::completion::{CompletionController, CompletionRequest, CompletionState, PopupList};
+pub use intel::definition::DefinitionRequest;
+pub use intel::format::FormatRequest;
 pub use intel::hover::{Hover, HoverCx, HoverInfo, HoverRequest, HOVER_IDLE_DELAY_MS};
 pub use intel::signature::{SignatureCx, SignatureHelp, SignatureInfo, SignatureRequest};
 pub use intel::snippet::{CaretOutcome, Snippet, SnippetError, SnippetSession, TabOutcome, TabStop};

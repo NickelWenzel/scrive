@@ -41,8 +41,8 @@ use scrive_core::intel::completion::Start;
 use scrive_core::intel::ticket;
 use scrive_core::{
     default_indent_size, is_completion_word_char, Bias, CompletionController, CompletionCx, CompletionItem,
-    CompletionState, CompletionTrigger, Completions, Diagnostic, DiagnosticsOutcome, Document, EditOp,
-    FindQuery, Hover,
+    CompletionState, CompletionTrigger, Completions, DefinitionRequest, Diagnostic, DiagnosticsOutcome,
+    Document, EditOp, FindQuery, FormatRequest, Hover,
     HoverCx, HoverInfo, InsertText, Point, Revision, Selection, SelectionId, SelectionSet, Severity,
     SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, SyntaxDef, TabOutcome, Ticket,
     TokenTheme, LOOKBACK_LINES,
@@ -213,6 +213,12 @@ pub struct CodeEditor {
     /// A pending async hover request (same pattern), recorded when the pointer
     /// rested over a word and no synchronous hover provider is set.
     pending_hover_request: Option<HoverRequest>,
+    /// A pending goto-definition request (F12), for the host to pull via
+    /// [`take_definition_request`](CodeEditor::take_definition_request).
+    pending_definition_request: Option<DefinitionRequest>,
+    /// A pending format request (Shift+Alt+F), for the host to pull via
+    /// [`take_format_request`](CodeEditor::take_format_request).
+    pending_format_request: Option<FormatRequest>,
     /// Mints the ticket every async request carries. Per editor, so two
     /// requests at one revision still differ.
     tickets: ticket::Counter,
@@ -249,6 +255,8 @@ struct Awaiting {
     /// The hover ticket, plus the pointer offset and word it asked about: the
     /// word keeps a pointer move inside it from cancelling the request.
     hover: Option<(Ticket, u32, Range<u32>)>,
+    /// The goto-definition ticket; a landed range is selected and revealed.
+    definition: Option<Ticket>,
 }
 
 /// Which awaited slot an `accepts` / `abandon` call addresses.
@@ -257,6 +265,7 @@ enum Awaited {
     Completion,
     Signature,
     Hover,
+    Definition,
 }
 
 impl CodeEditor {
@@ -303,6 +312,8 @@ impl CodeEditor {
             pending_completion_request: None,
             pending_signature_request: None,
             pending_hover_request: None,
+            pending_definition_request: None,
+            pending_format_request: None,
             tickets: ticket::Counter::new(),
             awaiting: Awaiting::default(),
             items_caret: 0,
@@ -589,6 +600,33 @@ impl CodeEditor {
         self.hover = info;
     }
 
+    /// Take the pending goto-definition request, if any. Answer a target in
+    /// this document through [`set_definition`](Self::set_definition).
+    pub fn take_definition_request(&mut self) -> Option<DefinitionRequest> {
+        self.pending_definition_request.take()
+    }
+
+    /// Land a goto-definition answer stamped with the request's `ticket`. A
+    /// range in this document is selected and revealed; `None` (no definition,
+    /// or one the host opens elsewhere) retires the request. Dropped if the
+    /// caret moved or the text changed since the request.
+    pub fn set_definition(&mut self, ticket: Ticket, target: Option<Range<u32>>) {
+        if !self.accepts(Awaited::Definition, ticket) {
+            return;
+        }
+        self.abandon(Awaited::Definition);
+        if let Some(range) = target {
+            self.select(range);
+        }
+    }
+
+    /// Take the pending format request, if any. Its answer is an edit batch
+    /// for [`edit`](Self::edit), valid while the document is still at the
+    /// ticket's revision.
+    pub fn take_format_request(&mut self) -> Option<FormatRequest> {
+        self.pending_format_request.take()
+    }
+
     /// Select `range` and reveal it centered, unfolding whatever hides it: the
     /// programmatic jump for host navigation such as goto-definition. The range
     /// is clamped to the document and snapped to char boundaries. Like a caret
@@ -770,6 +808,18 @@ impl CodeEditor {
             Event::Editor(Action::HoverDismiss) => {
                 self.hover = None;
                 self.abandon(Awaited::Hover);
+                Task::none()
+            }
+            Event::Editor(Action::GotoDefinition) => {
+                let head = self.doc.selections().newest().head();
+                let ticket = self.tickets.issue(self.doc.revision());
+                self.awaiting.definition = Some(ticket);
+                self.pending_definition_request = Some(DefinitionRequest::new(ticket, head));
+                Task::none()
+            }
+            Event::Editor(Action::Format) => {
+                let ticket = self.tickets.issue(self.doc.revision());
+                self.pending_format_request = Some(FormatRequest::new(ticket, default_indent_size()));
                 Task::none()
             }
             Event::Editor(action) => {
@@ -1368,6 +1418,8 @@ impl CodeEditor {
             | Action::SignatureClose
             | Action::HoverQuery(_)
             | Action::HoverDismiss
+            | Action::GotoDefinition
+            | Action::Format
             | Action::ToggleFold { .. }
             | Action::FoldAtCarets { .. } => {}
         }
@@ -1399,10 +1451,12 @@ impl CodeEditor {
         self.drive_signature(comp_event);
         self.reconcile_snippet();
         self.hover = None;
-        // A caret jump abandons a pending hover. Typing keeps it: its reply is
-        // then dropped by revision, and the pointer re-arm asks again.
+        // A caret jump abandons a pending hover and definition. Typing keeps
+        // them: their replies are then dropped by revision, and the pointer
+        // re-arm asks for hover again.
         if matches!(comp_event, CompletionEvent::CaretOrClose) {
             self.abandon(Awaited::Hover);
+            self.abandon(Awaited::Definition);
         }
         // `dirty` is set by the callers on an actual text change (a bare caret
         // move runs the tail but must not dirty the document — see `apply`).
@@ -1637,6 +1691,7 @@ impl CodeEditor {
             Awaited::Completion => self.awaiting.completion,
             Awaited::Signature => self.awaiting.signature,
             Awaited::Hover => self.awaiting.hover.as_ref().map(|(t, ..)| *t),
+            Awaited::Definition => self.awaiting.definition,
         };
         awaited == Some(ticket) && ticket.revision() == self.doc.revision()
     }
@@ -1656,6 +1711,10 @@ impl CodeEditor {
             Awaited::Hover => {
                 self.awaiting.hover = None;
                 self.pending_hover_request = None;
+            }
+            Awaited::Definition => {
+                self.awaiting.definition = None;
+                self.pending_definition_request = None;
             }
         }
     }
@@ -2484,5 +2543,70 @@ mod tests {
         assert!(matches!(ed.completion.state(), CompletionState::Closed), "selecting closes the popup");
         assert_eq!(ed.selection(), 0..1, "the range is selected");
         assert!(ed.document().reveal_seq() > seq, "the selection is revealed");
+    }
+
+    /// A definition answer for the request's caret selects the range and
+    /// reveals it.
+    #[test]
+    fn goto_definition_selects_the_landed_range_and_reveals_it() {
+        let mut ed = CodeEditor::new("fn foo() {}\nfoo();\n");
+        act(&mut ed, Action::PlaceCaret(13));
+        act(&mut ed, Action::GotoDefinition);
+        let req = ed.take_definition_request().expect("F12 asks");
+        assert_eq!(req.offset, 13, "asked at the caret");
+        let seq = ed.document().reveal_seq();
+        ed.set_definition(req.ticket, Some(3..6));
+        assert_eq!(ed.selection(), 3..6, "the definition is selected");
+        assert!(ed.document().reveal_seq() > seq, "the definition is revealed");
+    }
+
+    /// A click before the definition lands abandons the request.
+    #[test]
+    fn a_click_before_the_definition_lands_drops_it() {
+        let mut ed = CodeEditor::new("fn foo() {}\nfoo();\n");
+        act(&mut ed, Action::PlaceCaret(13));
+        act(&mut ed, Action::GotoDefinition);
+        let req = ed.take_definition_request().expect("F12 asks");
+        act(&mut ed, Action::PlaceCaret(0));
+        ed.set_definition(req.ticket, Some(3..6));
+        assert_eq!(ed.selection(), 0..0, "the click abandoned the request");
+    }
+
+    /// Typing before the definition lands drops it by revision.
+    #[test]
+    fn typing_before_the_definition_lands_drops_it() {
+        let mut ed = CodeEditor::new("fn foo() {}\nfoo();\n");
+        act(&mut ed, Action::PlaceCaret(13));
+        act(&mut ed, Action::GotoDefinition);
+        let req = ed.take_definition_request().expect("F12 asks");
+        act(&mut ed, Action::Type('x'));
+        let caret = ed.selection();
+        ed.set_definition(req.ticket, Some(3..6));
+        assert_eq!(ed.selection(), caret, "the text moved past the request");
+    }
+
+    /// An accepted `None` retires the request, so a second answer under the
+    /// same ticket is dropped.
+    #[test]
+    fn a_none_definition_retires_the_request() {
+        let mut ed = CodeEditor::new("fn foo() {}\nfoo();\n");
+        act(&mut ed, Action::PlaceCaret(13));
+        act(&mut ed, Action::GotoDefinition);
+        let req = ed.take_definition_request().expect("F12 asks");
+        ed.set_definition(req.ticket, None);
+        ed.set_definition(req.ticket, Some(3..6));
+        assert_eq!(ed.selection(), 13..13, "the retired request's second answer is dropped");
+    }
+
+    /// Format asks at the current revision with scrive's indent width and
+    /// leaves the text alone.
+    #[test]
+    fn format_records_a_request_with_the_indent_size() {
+        let mut ed = CodeEditor::new("fn f(){}\n");
+        act(&mut ed, Action::Format);
+        let req = ed.take_format_request().expect("Shift+Alt+F asks");
+        assert_eq!(req.tab_size, default_indent_size(), "the editor's indent width");
+        assert_eq!(req.ticket.revision(), ed.document().revision(), "asked at the current revision");
+        assert_eq!(ed.document().text(), "fn f(){}\n", "asking changes nothing");
     }
 }

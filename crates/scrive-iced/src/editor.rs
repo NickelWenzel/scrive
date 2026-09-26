@@ -360,6 +360,10 @@ pub enum Action {
         /// Forward if true (F8), backward if false (Shift+F8).
         forward: bool,
     },
+    /// Go to the definition of the symbol at the caret (F12).
+    GotoDefinition,
+    /// Format the document (Shift+Alt+F).
+    Format,
     /// The pointer rested over byte `offset` long enough for a hover query.
     /// The app resolves the word + queries its provider.
     HoverQuery(u32),
@@ -416,6 +420,8 @@ impl Action {
                 | Action::SignatureClose
                 | Action::HoverQuery(_)
                 | Action::HoverDismiss
+                | Action::GotoDefinition
+                | Action::Format
                 | Action::ToggleFold { .. }
                 | Action::FoldAtCarets { .. }
                 // These verbs reveal through the core's request_reveal —
@@ -2457,6 +2463,23 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     shell.capture_event();
                     return;
                 }
+                // Matched on the physical key: with Alt held the logical char
+                // depends on the layout (macOS gives `Ï`), and `interpret_key`
+                // would type it.
+                if modifiers.shift()
+                    && modifiers.alt()
+                    && !modifiers.control()
+                    && !modifiers.logo()
+                    && matches!(
+                        physical_key,
+                        iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyF)
+                    )
+                {
+                    state.ping();
+                    shell.publish((self.on_action)(Action::Format));
+                    shell.capture_event();
+                    return;
+                }
                 if let Some(action) = interpret_key(key, text.as_deref(), *modifiers) {
                     if action.moves_caret() {
                         state.autoscroll = true;
@@ -3541,6 +3564,7 @@ fn interpret_key(key: &Key, text: Option<&str>, mods: Modifiers) -> Option<Actio
         Key::Named(Named::Escape) => Some(Action::Collapse),
         // F8 / Shift+F8 jump to the next/previous diagnostic.
         Key::Named(Named::F8) => Some(Action::NextDiagnostic { forward: !mods.shift() }),
+        Key::Named(Named::F12) => Some(Action::GotoDefinition),
         // Ctrl+D add-next-occurrence. The `!alt` guard keeps Ctrl+Alt
         // (AltGr) from ever triggering the gesture.
         Key::Character(c) if mods.control() && !mods.alt() && c.as_str() == "d" => {
@@ -4680,5 +4704,38 @@ mod tests {
         let (_, cache) = pump(&doc, None, cache, &mut r, over, &rest_on(over));
         let (actions, _) = pump(&doc, None, cache, &mut r, inside, &moved);
         assert!(actions.contains(&Action::HoverDismiss), "without a pending word the same move cancels");
+    }
+
+    /// F12 is goto-definition.
+    #[test]
+    fn f12_goes_to_the_definition() {
+        assert_eq!(
+            interpret_key(&Key::Named(Named::F12), None, Modifiers::default()),
+            Some(Action::GotoDefinition),
+            "F12 goes to the definition"
+        );
+    }
+
+    /// Shift+Alt+F formats by physical key, whatever character the layout
+    /// makes of it, and never types that character.
+    #[test]
+    fn shift_alt_f_formats_by_physical_key() {
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::Location;
+        let doc = Document::new("x\n").expect("doc fits");
+        let mut r = headless_renderer();
+        let press = iced::Event::Keyboard(Keyboard::KeyPressed {
+            key: Key::Character("Ï".into()),
+            modified_key: Key::Character("Ï".into()),
+            physical_key: Physical::Code(Code::KeyF),
+            location: Location::Standard,
+            modifiers: Modifiers::SHIFT | Modifiers::ALT,
+            text: Some("Ï".into()),
+            repeat: false,
+        });
+        let cache = iced_runtime::user_interface::Cache::new();
+        let (actions, _) = pump(&doc, None, cache, &mut r, Point::new(200.0, 5.0), &[press]);
+        assert!(actions.contains(&Action::Format), "Shift+Alt+F formats: {actions:?}");
+        assert!(!actions.iter().any(|a| matches!(a, Action::Type(_))), "the layout's character is not typed");
     }
 }
