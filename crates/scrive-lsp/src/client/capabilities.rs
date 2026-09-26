@@ -2,8 +2,9 @@
 
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-    GeneralClientCapabilities, MarkupKind, PublishDiagnosticsClientCapabilities,
-    ServerCapabilities, TextDocumentClientCapabilities, TextDocumentSyncCapability,
+    GeneralClientCapabilities, MarkupKind, ParameterInformationSettings,
+    PublishDiagnosticsClientCapabilities, ServerCapabilities, SignatureHelpClientCapabilities,
+    SignatureInformationSettings, TextDocumentClientCapabilities, TextDocumentSyncCapability,
     TextDocumentSyncClientCapabilities, TextDocumentSyncKind, WorkspaceClientCapabilities,
 };
 
@@ -18,6 +19,8 @@ pub(crate) struct Server {
     pub(crate) change: TextDocumentSyncKind,
     /// The completion trigger strings; `None` when the server has no completion provider.
     pub(crate) completion: Option<Vec<String>>,
+    /// Whether the server answers `textDocument/signatureHelp`.
+    pub(crate) signature: bool,
 }
 
 impl Server {
@@ -42,6 +45,7 @@ impl Server {
             open_close,
             change,
             completion,
+            signature: capabilities.signature_help_provider.is_some(),
         }
     }
 }
@@ -70,6 +74,17 @@ pub(crate) fn client() -> ClientCapabilities {
                 }),
                 context_support: Some(true),
                 ..CompletionClientCapabilities::default()
+            }),
+            signature_help: Some(SignatureHelpClientCapabilities {
+                signature_information: Some(SignatureInformationSettings {
+                    // The box renders documentation as plain text.
+                    documentation_format: Some(vec![MarkupKind::PlainText]),
+                    parameter_information: Some(ParameterInformationSettings {
+                        label_offset_support: Some(true),
+                    }),
+                    active_parameter_support: Some(true),
+                }),
+                ..SignatureHelpClientCapabilities::default()
             }),
             ..TextDocumentClientCapabilities::default()
         }),

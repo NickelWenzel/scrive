@@ -15,18 +15,19 @@ use lsp_types::{
     CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
     WorkspaceFolder,
 };
 use scrive_core::{
-    document, Bias, CompletionRequest, CompletionTrigger, DocId, Revision, Snapshot, Ticket,
+    document, Bias, CompletionRequest, CompletionTrigger, DocId, Revision, SignatureRequest,
+    Snapshot, Ticket,
 };
 use serde_json::Value;
 
 use crate::message::{self, Message};
 use crate::update::{self, Update};
-use crate::{completion, diagnostics, uri, Encoding};
+use crate::{completion, diagnostics, signature, uri, Encoding};
 
 /// JSON-RPC's "method not found": a server request this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -163,12 +164,14 @@ struct Pending {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Completion,
+    Signature,
 }
 
 /// What a pending request asked, with what its reply needs.
 #[derive(Debug)]
 enum Query {
     Completion(completion::Query),
+    Signature(signature::Query),
 }
 
 impl Client {
@@ -345,6 +348,53 @@ impl Client {
             }
         }
         self.request_completion(doc_id, ticket, word, context, None)
+    }
+
+    /// Answers the editor's signature request with a `textDocument/signatureHelp` at its caret.
+    ///
+    /// While the caret stays in one call (the same [`SignatureRequest::call`]), a request already
+    /// in flight for that call is adopted instead of superseded: its reply answers the newest
+    /// ticket, and if the caret moved meanwhile the request is sent again at the new caret. A
+    /// request in another call, or outside any call, supersedes the document's previous one.
+    ///
+    /// When the server is not running or has no signature provider, the request is declined with
+    /// [`update::Change::Signature`]`(None)` under its ticket. A request from a revision other
+    /// than `snapshot`'s or the last synced one, or for a document that is not registered, gets
+    /// nothing.
+    pub fn signature_help(&mut self, snapshot: &Snapshot, request: &SignatureRequest) -> Output {
+        let doc_id = snapshot.doc_id();
+        let ticket = request.ticket();
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
+            return Output::default();
+        };
+        if ticket.revision() != snapshot.revision()
+            || snapshot.revision() != tracked.synced.revision()
+        {
+            return Output::default();
+        }
+        if !matches!(&self.state, State::Running(server) if server.signature) {
+            return Output::answer(doc_id, ticket, update::Change::Signature(None));
+        }
+        let caret = snapshot.clip_offset(snapshot.point_to_offset(request.position()), Bias::Left);
+        let call = request.call();
+        // Two requests outside any call share no call, so only a known call continues.
+        if call.is_some() {
+            let same_call = |p: &&mut Pending| {
+                p.doc_id == doc_id
+                    && matches!(&p.query, Query::Signature(query) if query.call == call)
+            };
+            if let Some(entry) = self.pending.iter_mut().find(same_call) {
+                entry.latest_ticket = ticket;
+                entry.latest_caret = caret;
+                return Output::default();
+            }
+        }
+        self.send(
+            doc_id,
+            ticket,
+            Query::Signature(signature::Query { call, caret }),
+            None,
+        )
     }
 
     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
@@ -559,12 +609,22 @@ impl Client {
                 query.at(entry.latest_caret),
                 Some(entry.latest_ticket),
             ),
+            Query::Signature(query) => self.send(
+                entry.doc_id,
+                entry.latest_ticket,
+                Query::Signature(signature::Query {
+                    call: query.call,
+                    caret: entry.latest_caret,
+                }),
+                Some(entry.latest_ticket),
+            ),
         }
     }
 
     fn resolved(&mut self, entry: &Pending, value: Value) -> Output {
         match &entry.query {
             Query::Completion(query) => self.completed(entry, query, value),
+            Query::Signature(query) => self.signed(entry, query, value),
         }
     }
 
@@ -740,6 +800,32 @@ impl Client {
                 entry.latest_ticket,
                 query.word.start..entry.latest_caret,
                 for_incomplete(),
+                entry.reissued_for,
+            ));
+        }
+        output
+    }
+
+    /// Answers the latest ticket with the reply's signature. When the caret moved while the
+    /// request was out, the answer may describe the old caret's parameter, so the request is also
+    /// sent again at the new caret; once typing stops the carets agree and this ends.
+    fn signed(&mut self, entry: &Pending, query: &signature::Query, value: Value) -> Output {
+        let Ok(help) = serde_json::from_value::<Option<lsp_types::SignatureHelp>>(value) else {
+            return entry.failed();
+        };
+        let mut output = Output::answer(
+            entry.doc_id,
+            entry.latest_ticket,
+            update::Change::Signature(help.and_then(signature::convert)),
+        );
+        if entry.latest_caret != query.caret {
+            output.append(self.send(
+                entry.doc_id,
+                entry.latest_ticket,
+                Query::Signature(signature::Query {
+                    call: query.call,
+                    caret: entry.latest_caret,
+                }),
                 entry.reissued_for,
             ));
         }
@@ -932,6 +1018,11 @@ impl Pending {
                 self.latest_ticket,
                 update::Change::Completions(Vec::new()),
             ),
+            Query::Signature(_) => Output::answer(
+                self.doc_id,
+                self.latest_ticket,
+                update::Change::Signature(None),
+            ),
         }
     }
 }
@@ -940,6 +1031,7 @@ impl Query {
     fn kind(&self) -> Kind {
         match self {
             Query::Completion(_) => Kind::Completion,
+            Query::Signature(_) => Kind::Signature,
         }
     }
 
@@ -947,6 +1039,7 @@ impl Query {
     fn caret(&self) -> u32 {
         match self {
             Query::Completion(query) => query.word.end,
+            Query::Signature(query) => query.caret,
         }
     }
 
@@ -971,6 +1064,19 @@ impl Query {
                     context: Some(query.context.clone()),
                 },
             ),
+            Query::Signature(query) => {
+                message::Request::new::<lsp_types::request::SignatureHelpRequest>(
+                    id,
+                    SignatureHelpParams {
+                        context: None,
+                        text_document_position_params: TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier { uri: uri.clone() },
+                            position: encoding.position(snapshot, query.caret),
+                        },
+                        work_done_progress_params: Default::default(),
+                    },
+                )
+            }
         }
     }
 }

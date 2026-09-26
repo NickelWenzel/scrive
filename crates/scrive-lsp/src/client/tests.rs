@@ -2,7 +2,9 @@ use std::str::FromStr;
 
 use scrive_core::intel::completion::Start;
 use scrive_core::intel::ticket::Counter;
-use scrive_core::{CompletionItem, Document, EditOp, GroupingHint, OpClass};
+use scrive_core::{
+    CompletionItem, Document, EditOp, GroupingHint, OpClass, Point, SignatureInfo,
+};
 use serde_json::{json, Value};
 
 use super::*;
@@ -86,8 +88,8 @@ fn whole(text: &str) -> Value {
     json!({"text": text})
 }
 
-/// With [`completions`], the only place tests read a `Change`, so a new variant changes only
-/// these helpers.
+/// With [`completions`] and [`signature`], the only place tests read a `Change`, so a new variant
+/// changes only these helpers.
 fn diagnostics(update: &Update) -> (DocId, update::Stamp, Vec<scrive_core::Diagnostic>) {
     let Update::Document(document) = update else {
         panic!("expected a document update, got {update:?}")
@@ -106,6 +108,17 @@ fn completions(update: &Update) -> (update::Stamp, Vec<CompletionItem>) {
     match document.change() {
         update::Change::Completions(items) => (document.stamp(), items.clone()),
         other => panic!("expected completions, got {other:?}"),
+    }
+}
+
+/// The stamp and signature of a signature update.
+fn signature(update: &Update) -> (update::Stamp, Option<SignatureInfo>) {
+    let Update::Document(document) = update else {
+        panic!("expected a document update, got {update:?}")
+    };
+    match document.change() {
+        update::Change::Signature(info) => (document.stamp(), info.clone()),
+        other => panic!("expected a signature, got {other:?}"),
     }
 }
 
@@ -1846,5 +1859,294 @@ fn continuing_request_after_a_dropped_first_request_starts_fresh() {
         wire(&client.complete(&doc.snapshot(), &second).messages),
         vec![completion_request(3, (0, 11), json!({"triggerKind": 1}))],
         "the request is invoked, not a refinement of a list never received",
+    );
+}
+
+/// Server capabilities with incremental sync and signature help triggered by `(` and `,`.
+fn signature_capabilities() -> Value {
+    json!({"textDocumentSync": 2, "signatureHelpProvider": {"triggerCharacters": ["(", ","]}})
+}
+
+/// A running client with `text` open as `file:///a.rs`, whose server offers signature help.
+fn signing(text: &str) -> (Client, Document) {
+    let doc = document(text);
+    let (mut client, _) = running(Client::builder(), signature_capabilities());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    (client, doc)
+}
+
+/// A signature request at `column` on line 0 of `doc`, inside the call whose `(` is at `call`,
+/// under a fresh ticket.
+fn signature_request(
+    tickets: &mut Counter,
+    doc: &Document,
+    column: u32,
+    call: Option<u32>,
+) -> SignatureRequest {
+    SignatureRequest::new(tickets.issue(doc.revision()), Point::new(0, column), call)
+}
+
+fn signature_help_request(id: i64, column: u32) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/signatureHelp", "params": {
+        "textDocument": {"uri": "file:///a.rs"},
+        "position": {"line": 0, "character": column},
+    }})
+}
+
+/// The reply to request `id`: one signature `foo(a: i32, b: i32)` with the first parameter
+/// active.
+fn signature_reply(id: i64) -> Message {
+    from_server(json!({"jsonrpc": "2.0", "id": id, "result": {
+        "signatures": [{"label": "foo(a: i32, b: i32)", "parameters": [{"label": "a: i32"}, {"label": "b: i32"}]}],
+        "activeParameter": 0,
+    }}))
+}
+
+/// The one signature update in `output`, which sends nothing.
+fn signed(output: &Output) -> (update::Stamp, Option<SignatureInfo>) {
+    assert!(
+        output.messages.is_empty(),
+        "an answer sends nothing: {output:?}"
+    );
+    let [update] = output.updates.as_slice() else {
+        panic!("expected one update, got {:?}", output.updates)
+    };
+    signature(update)
+}
+
+/// `initialize` advertises plain-text signature documentation, label offsets and per-signature
+/// active parameters, and no context.
+#[test]
+fn signature_capabilities_are_advertised() {
+    let (_, initialize) = Client::builder().build();
+    let initialize = serde_json::to_value(&initialize).expect("serializes");
+    let signature = &initialize["params"]["capabilities"]["textDocument"]["signatureHelp"];
+    let information = &signature["signatureInformation"];
+    assert_eq!(
+        information["documentationFormat"],
+        json!(["plaintext"]),
+        "documentation is plain text"
+    );
+    assert_eq!(
+        information["parameterInformation"]["labelOffsetSupport"],
+        json!(true),
+        "label offsets are advertised"
+    );
+    assert_eq!(
+        information["activeParameterSupport"],
+        json!(true),
+        "per-signature active parameters are advertised"
+    );
+    assert_eq!(
+        signature.get("contextSupport"),
+        None,
+        "context is not advertised"
+    );
+}
+
+/// A request goes out at the caret, without a context.
+#[test]
+fn signature_request_carries_the_caret_position() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = signing("foo(");
+    let first = signature_request(&mut tickets, &doc, 4, Some(3));
+    let output = client.signature_help(&doc.snapshot(), &first);
+    assert_eq!(
+        wire(&output.messages),
+        vec![signature_help_request(2, 4)],
+        "the request asks at the caret"
+    );
+    assert!(output.updates.is_empty(), "nothing is answered yet");
+}
+
+/// With no server to ask, or one without a provider, the editor stops waiting at once.
+#[test]
+fn signature_declines_before_initialize_and_without_a_provider() {
+    let doc = document("foo(");
+    let (initializing, _) = Client::builder().build();
+    let (running, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
+    for mut client in [initializing, running] {
+        let mut tickets = Counter::new();
+        let _ = client
+            .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+            .expect("opens");
+        let first = signature_request(&mut tickets, &doc, 4, Some(3));
+        let (stamp, info) = signed(&client.signature_help(&doc.snapshot(), &first));
+        assert_eq!(
+            stamp,
+            update::Stamp::Ticket(first.ticket()),
+            "the decline answers the ticket"
+        );
+        assert!(info.is_none(), "the decline closes the box");
+    }
+}
+
+/// Typing inside the call of the request in flight sends nothing new.
+#[test]
+fn same_call_adopts_the_in_flight_signature_request() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = signing("foo(");
+    let first = signature_request(&mut tickets, &doc, 4, Some(3));
+    let _ = client.signature_help(&doc.snapshot(), &first);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(4, "a")]);
+    let second = signature_request(&mut tickets, &doc, 5, Some(3));
+    assert_silent(
+        &client.signature_help(&doc.snapshot(), &second),
+        "the same call adopts the in-flight request",
+    );
+}
+
+/// When the adopted request's reply lands with the caret elsewhere, the answer is delivered and
+/// the request re-issued at the new caret.
+#[test]
+fn signature_reply_after_the_caret_moved_is_delivered_and_reissued() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = signing("foo(");
+    let first = signature_request(&mut tickets, &doc, 4, Some(3));
+    let _ = client.signature_help(&doc.snapshot(), &first);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(4, "a")]);
+    let second = signature_request(&mut tickets, &doc, 5, Some(3));
+    let _ = client.signature_help(&doc.snapshot(), &second);
+    let output = client
+        .receive(signature_reply(2))
+        .expect("the reply is accepted");
+    let [update] = output.updates.as_slice() else {
+        panic!("expected one update, got {:?}", output.updates)
+    };
+    let (stamp, info) = signature(update);
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(second.ticket()),
+        "the reply answers the latest ticket"
+    );
+    let info = info.expect("the signature is delivered");
+    assert_eq!(info.params, vec![4..10, 12..18], "the parameters are located");
+    assert_eq!(
+        wire(&output.messages),
+        vec![signature_help_request(3, 5)],
+        "the request is re-issued at the moved caret"
+    );
+}
+
+/// A reply at the caret the editor last asked about ends the continuation.
+#[test]
+fn reissued_signature_reply_at_the_latest_caret_ends_the_continuation() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = signing("foo(");
+    let first = signature_request(&mut tickets, &doc, 4, Some(3));
+    let _ = client.signature_help(&doc.snapshot(), &first);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(4, "a")]);
+    let second = signature_request(&mut tickets, &doc, 5, Some(3));
+    let _ = client.signature_help(&doc.snapshot(), &second);
+    let _ = client
+        .receive(signature_reply(2))
+        .expect("the reply is accepted");
+    let (stamp, info) = signed(
+        &client
+            .receive(signature_reply(3))
+            .expect("the reply is accepted"),
+    );
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(second.ticket()),
+        "the re-issue answers the latest ticket"
+    );
+    assert!(info.is_some(), "the signature is delivered");
+}
+
+/// A request in another call replaces the one in flight.
+#[test]
+fn different_call_supersedes_with_a_cancel() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = signing("foo(bar(");
+    let outer = signature_request(&mut tickets, &doc, 8, Some(3));
+    let _ = client.signature_help(&doc.snapshot(), &outer);
+    let inner = signature_request(&mut tickets, &doc, 8, Some(7));
+    assert_eq!(
+        wire(&client.signature_help(&doc.snapshot(), &inner).messages),
+        vec![cancel_request(2), signature_help_request(3, 8)],
+        "the outer call's request is cancelled before the inner one goes out"
+    );
+}
+
+/// Requests outside any call share no call, so the newer one supersedes.
+#[test]
+fn request_outside_any_call_never_continues() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = signing("foo");
+    let first = signature_request(&mut tickets, &doc, 3, None);
+    let _ = client.signature_help(&doc.snapshot(), &first);
+    let second = signature_request(&mut tickets, &doc, 3, None);
+    assert_eq!(
+        wire(&client.signature_help(&doc.snapshot(), &second).messages),
+        vec![cancel_request(2), signature_help_request(3, 3)],
+        "the second request cancels the first"
+    );
+}
+
+/// A failed or undecodable signature reply closes the box instead of leaving it waiting.
+#[test]
+fn failed_signature_request_answers_none() {
+    for reply in [
+        failure(2, -32603),
+        from_server(json!({"jsonrpc": "2.0", "id": 2, "result": "x"})),
+    ] {
+        let mut tickets = Counter::new();
+        let (mut client, doc) = signing("foo(");
+        let first = signature_request(&mut tickets, &doc, 4, Some(3));
+        let _ = client.signature_help(&doc.snapshot(), &first);
+        let (stamp, info) = signed(
+            &client
+                .receive(reply)
+                .expect("a signature failure is not an error"),
+        );
+        assert_eq!(
+            stamp,
+            update::Stamp::Ticket(first.ticket()),
+            "stamped with the request's ticket"
+        );
+        assert!(info.is_none(), "the failure closes the box");
+    }
+}
+
+/// A content-modified signature request is sent again once, then given up.
+#[test]
+fn content_modified_reissues_signature_help_once() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = signing("foo(");
+    let first = signature_request(&mut tickets, &doc, 4, Some(3));
+    let _ = client.signature_help(&doc.snapshot(), &first);
+    let reissued = client
+        .receive(failure(2, -32801))
+        .expect("content modified is not an error");
+    assert_eq!(
+        wire(&reissued.messages),
+        vec![signature_help_request(3, 4)],
+        "the request goes out again at its caret"
+    );
+    assert!(reissued.updates.is_empty(), "nothing is answered yet");
+    assert_silent(
+        &client
+            .receive(failure(3, -32801))
+            .expect("content modified is not an error"),
+        "a second content-modified reply for one ticket is final",
+    );
+}
+
+/// A request from an older revision is neither sent nor answered.
+#[test]
+fn stale_signature_request_is_ignored() {
+    let (mut client, mut doc) = signing("foo(");
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(4, "a")]);
+    let stale = SignatureRequest::new(
+        Counter::new().issue(Revision(0)),
+        Point::new(0, 4),
+        Some(3),
+    );
+    assert_silent(
+        &client.signature_help(&doc.snapshot(), &stale),
+        "a stale request is ignored",
     );
 }

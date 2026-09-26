@@ -1,6 +1,6 @@
 //! What the client hands back: document-bound changes, and notifications it passes through.
 
-use scrive_core::{CompletionItem, Diagnostic, DocId, Revision, Ticket};
+use scrive_core::{CompletionItem, Diagnostic, DocId, Revision, SignatureInfo, Ticket};
 
 use crate::message;
 
@@ -37,6 +37,8 @@ pub enum Change {
     Diagnostics(Vec<Diagnostic>),
     /// Completion items answering the ticket's request; an empty list closes the popup.
     Completions(Vec<CompletionItem>),
+    /// The signature answering the ticket's request; `None` closes the box.
+    Signature(Option<SignatureInfo>),
 }
 
 impl Document {
