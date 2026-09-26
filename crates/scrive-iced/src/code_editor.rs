@@ -578,19 +578,22 @@ impl CodeEditor {
         }
     }
 
-    /// Enable or disable the incremental-change log — for a host mirroring edits
-    /// to a language server (`textDocument/didChange`). Off by default (zero
-    /// overhead); forwards to [`Document::observe_changes`]. Full-document sync
+    /// Enable or disable the per-commit change log, for a host mirroring
+    /// edits to a language server (`textDocument/didChange`). Off by default
+    /// (zero overhead); turning it on starts a fresh chain at the current
+    /// revision. Forwards to [`Document::observe_changes`]. Full-document sync
     /// hosts leave this off and re-read `document().snapshot()` instead.
     pub fn observe_changes(&mut self, on: bool) {
         self.doc.observe_changes(on);
     }
 
-    /// Drain the incremental-change log: every applied edit since the last drain,
-    /// as `EditOp` deltas ready to translate into LSP content changes. Empty
-    /// unless [`observe_changes`](CodeEditor::observe_changes) is on. Forwards to
+    /// Drain the change log: one entry per commit since the last drain (edits,
+    /// undos and redos alike), each with the snapshot it applied to, ready to
+    /// translate into LSP content changes. Empty unless
+    /// [`observe_changes`](CodeEditor::observe_changes) is on. Forwards to
     /// [`Document::drain_changes`].
-    pub fn drain_changes(&mut self) -> Vec<EditOp> {
+    #[must_use]
+    pub fn drain_changes(&mut self) -> scrive_core::document::Changes {
         self.doc.drain_changes()
     }
 
@@ -2001,17 +2004,21 @@ mod tests {
         assert!(ed.is_dirty(), "typing dirties the document");
     }
 
-    /// The incremental-change log (LSP `didChange`) is off by default and logs
-    /// applied edits once enabled, draining clean. Full-sync hosts never touch it.
+    /// The change log (LSP `didChange`) is off by default and, once enabled,
+    /// logs one entry per commit and drains clean. Full-sync hosts never touch it.
     #[test]
     fn drain_changes_mirrors_edits_when_observing() {
         let mut ed = CodeEditor::new("hello\n");
-        assert!(ed.drain_changes().is_empty(), "the change log is off by default");
+        let off = ed.drain_changes();
+        assert!(off.is_empty() && off.from().is_none(), "the change log is off by default");
         ed.observe_changes(true);
         let _ = ed.update(Event::Editor(Action::Type('X')), Instant::now()); // insert 'X' at the caret (offset 0)
         let changes = ed.drain_changes();
-        assert_eq!(changes.len(), 1, "one keystroke logs one change");
-        assert_eq!(changes[0].text, "X");
+        assert_eq!(changes.len(), 1, "one keystroke logs one commit");
+        assert_eq!(changes.doc_id(), ed.document().doc_id(), "the drain names its document");
+        let entry = changes.iter().next().expect("one entry");
+        assert_eq!(entry.ops()[0].text, "X", "the entry carries the typed text");
+        assert_eq!(entry.before().text(), "hello\n", "the entry carries the pre-edit text");
         assert!(ed.drain_changes().is_empty(), "draining clears the log");
     }
 }

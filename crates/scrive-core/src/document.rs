@@ -99,12 +99,12 @@ pub struct Document {
     reveal_seq: u64,
     /// The strategy of the last reveal request.
     reveal_mode: RevealMode,
-    /// Opt-in incremental-change log. Off by default (zero overhead per edit);
-    /// when [`Document::observe_changes`] enables it, every committed edit's
-    /// applied ops are appended for a host to [`drain`](Document::drain_changes)
-    /// — e.g. to mirror edits to a language server as `textDocument/didChange`.
-    observe_changes: bool,
-    changes: Vec<EditOp>,
+    /// Opt-in per-commit change log. Off by default (zero overhead per edit);
+    /// while [`Document::observe_changes`] has it on, every committed
+    /// transaction, forward edits and each undo/redo step alike, appends one
+    /// [`Change`] for a host to [`drain`](Document::drain_changes), e.g. to
+    /// mirror edits to a language server as `textDocument/didChange`.
+    changes: ChangeLog,
     /// Memoized [`FoldMap`]. The render path queries it ~20× per frame, so it is
     /// cached rather than rebuilt (a fresh build is O(folds), which at document
     /// scale with everything collapsed would stall scrolling). A fold toggle
@@ -163,6 +163,138 @@ struct CellCorner {
     cell: u32,
 }
 
+/// How many undrained commits the change log holds before it breaks. Each
+/// entry pins a rope version, so an observer that never drains must not grow
+/// the log without bound; the next drain reports [`Changes::from`] as `None`,
+/// the consumer's cue to resync from a full snapshot.
+const CHANGE_LOG_CAP: usize = 1024;
+
+/// One committed transaction: the text just before the commit, and the edits
+/// that turned it into the text just after.
+///
+/// `ops` are ordered for **sequential** replay: each op's range is in the
+/// coordinates of `before` with every earlier-listed op already applied, so
+/// applying them one by one onto `before.text()` reproduces the commit
+/// exactly, including several inserts at one offset.
+#[derive(Clone, Debug)]
+pub struct Change {
+    before: Snapshot,
+    ops: Vec<EditOp>,
+}
+
+impl Change {
+    /// The document just before this commit. Its revision is the commit's
+    /// starting revision; the commit ends at `revision + 1`.
+    #[must_use]
+    pub fn before(&self) -> &Snapshot {
+        &self.before
+    }
+
+    /// The commit's edits, in descending offset order, for sequential replay
+    /// onto [`before`](Self::before).
+    #[must_use]
+    pub fn ops(&self) -> &[EditOp] {
+        &self.ops
+    }
+}
+
+/// Everything the change log recorded since the previous drain: the commits
+/// in order, the document they belong to, and the revision the first one
+/// starts from.
+///
+/// When [`from`](Self::from) is `Some`, the entries form a complete chain:
+/// each entry's `before().revision()` is one more than the previous one's, and
+/// the last entry ends at the live revision. `from() == None` means the log
+/// was off or overflowed its cap; there are no entries, and a consumer resyncs
+/// from a full snapshot.
+#[derive(Clone, Debug)]
+pub struct Changes {
+    doc_id: DocId,
+    from: Option<Revision>,
+    entries: Vec<Change>,
+}
+
+impl Changes {
+    /// The document these changes belong to.
+    #[must_use]
+    pub fn doc_id(&self) -> DocId {
+        self.doc_id
+    }
+
+    /// The revision the first entry starts from, or `None` when the chain is
+    /// broken (the log was off, or overflowed its cap since the last drain).
+    #[must_use]
+    pub fn from(&self) -> Option<Revision> {
+        self.from
+    }
+
+    /// The recorded commits, oldest first.
+    pub fn iter(&self) -> impl Iterator<Item = &Change> + '_ {
+        self.entries.iter()
+    }
+
+    /// How many commits were recorded.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether nothing was recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+/// The change log: whether it is on, the revision its chain starts from
+/// (`None` while off or broken), and the commits since the last drain.
+#[derive(Debug, Default)]
+struct ChangeLog {
+    on: bool,
+    from: Option<Revision>,
+    entries: Vec<Change>,
+}
+
+impl ChangeLog {
+    /// The snapshot a commit hands to [`record`](Self::record), or `None` when
+    /// nothing would be logged, so an unobserved commit takes no snapshot.
+    fn capture(&self, buffer: &Buffer) -> Option<Snapshot> {
+        (self.on && self.from.is_some()).then(|| buffer.snapshot())
+    }
+
+    /// Log one committed transaction applied to `before`. `applied` is the
+    /// normalized forward batch: ascending, ties in caller order. The rope
+    /// applies a batch back to front, so the reversed batch replays
+    /// sequentially in the rope's order, ties included.
+    fn record(&mut self, before: Snapshot, applied: &[EditOp]) {
+        if self.from.is_none() {
+            return;
+        }
+        if self.entries.len() >= CHANGE_LOG_CAP {
+            self.entries = Vec::new();
+            self.from = None;
+            return;
+        }
+        self.entries.push(Change { before, ops: applied.iter().rev().cloned().collect() });
+    }
+
+    fn set(&mut self, on: bool, revision: Revision) {
+        self.on = on;
+        self.entries = Vec::new();
+        self.from = on.then_some(revision);
+    }
+
+    /// Hand out everything since the last drain. The next chain starts at
+    /// `revision`, which also heals a broken log.
+    fn drain(&mut self, doc_id: DocId, revision: Revision) -> Changes {
+        let changes = Changes { doc_id, from: self.from, entries: std::mem::take(&mut self.entries) };
+        if self.on {
+            self.from = Some(revision);
+        }
+        changes
+    }
+}
+
 impl Document {
     /// Load `text` as a new document (see [`Buffer::new`] for the load
     /// contract: size limit, CRLF normalization, EOL-flavor detection). Starts
@@ -189,8 +321,7 @@ impl Document {
             expand_stack: Vec::new(),
             reveal_seq: 0,
             reveal_mode: RevealMode::Fit,
-            observe_changes: false,
-            changes: Vec::new(),
+            changes: ChangeLog::default(),
             // Seed with a never-matching key so the first `fold_map()` builds it.
             fold_cache: RefCell::new(FoldMapCache { key: (u64::MAX, u64::MAX), map: FoldMap::empty() }),
         })
@@ -965,6 +1096,7 @@ impl Document {
         // The (revision, fold generation) the fold cache would need to be at to
         // shift it in place instead of rebuilding — captured before the edit.
         let pre_fold_key = (self.buffer.revision().0, self.folds.generation());
+        let before = self.changes.capture(&self.buffer);
         let committed = apply(&mut self.buffer, ops)?;
         if !committed.is_empty() {
             // Whether the edit added or removed a bracket character — the
@@ -1039,16 +1171,9 @@ impl Document {
                     cache.key = (u64::MAX, u64::MAX);
                 }
             }
-            // Log the applied deltas for a host draining incremental changes
-            // (LSP `didChange`) — only when observing, so the common path pays
-            // nothing. Descending start order so sequential application within
-            // this batch is offset-stable; ops move into history next, so read
-            // them here. Their ranges are in the pre-edit coordinates the batch
-            // was applied against — exactly what a content-change wants.
-            if self.observe_changes {
-                let mut ops = committed.forward_ops().to_vec();
-                ops.sort_by_key(|op| core::cmp::Reverse(op.range.start));
-                self.changes.extend(ops);
+            // The ops move into history next, so the log reads them here.
+            if let Some(before) = before {
+                self.changes.record(before, committed.forward_ops());
             }
             // Record history LAST, moving the forward + inverse op batches out of
             // `committed` with no clone (rebase_views already used its borrow of
@@ -1062,27 +1187,27 @@ impl Document {
         Ok(committed)
     }
 
-    /// Enable or disable the incremental-change log. Off by default so the common
-    /// path pays nothing; a host mirroring edits to a language server
-    /// (`textDocument/didChange`) turns it on and drains
-    /// [`drain_changes`](Document::drain_changes) after each edit. Turning it off
-    /// clears any pending log. For full-document sync, leave this off and re-read
-    /// [`snapshot`](Document::snapshot) instead.
+    /// Turn the per-commit change log on or off. Off by default, so the common
+    /// path pays nothing. Turning it on, even when it already is, starts a
+    /// fresh chain at the current revision; turning it off drops anything
+    /// pending. A host mirroring edits to a language server
+    /// (`textDocument/didChange`) turns it on and calls
+    /// [`drain_changes`](Document::drain_changes) after each round of edits; a
+    /// full-document-sync host leaves it off and re-reads
+    /// [`snapshot`](Document::snapshot).
     pub fn observe_changes(&mut self, on: bool) {
-        self.observe_changes = on;
-        if !on {
-            self.changes.clear();
-        }
+        let revision = self.buffer.revision();
+        self.changes.set(on, revision);
     }
 
-    /// Drain the incremental-change log: every applied edit since the last drain,
-    /// in commit order (offset-stable within each commit), as `EditOp` deltas
-    /// whose `range` is in the coordinates of the document just before that edit —
-    /// ready to translate into language-server content changes. Empty unless
+    /// Drain the change log: one [`Change`] per commit since the last drain
+    /// (forward edits and every undo/redo step), oldest first, each with the
+    /// snapshot it was applied to. Empty, with [`Changes::from`] `None`, unless
     /// [`observe_changes`](Document::observe_changes) is on.
     #[must_use]
-    pub fn drain_changes(&mut self) -> Vec<EditOp> {
-        core::mem::take(&mut self.changes)
+    pub fn drain_changes(&mut self) -> Changes {
+        let (doc_id, revision) = (self.buffer.doc_id(), self.buffer.revision());
+        self.changes.drain(doc_id, revision)
     }
 
     /// Undo the most recent undo unit. Returns `false` if there is nothing to
@@ -1103,13 +1228,21 @@ impl Document {
         let mut caret_home: Option<u32> = None;
         let bracket_cfg = self.bracket_config();
         let Self {
-            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find, ..
+            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find,
+            changes, ..
         } = self;
         let mut views = Views { highlight, brackets, decorations, autoclose, folds, find };
+        // Each step is its own commit (its own revision), so the log gets one
+        // entry per step, each recorded against the text the step applied to.
+        let mut before = changes.capture(buffer);
         let undone = history.undo(buffer, selections, |committed, buffer| {
             // The one mover — highlight, brackets, decorations, folds (position +
             // fold reveal) all ride it, so undo needs no per-feature resync.
             rebase_views(&mut views, buffer, tab, committed, &bracket_cfg);
+            if let Some(prev) = before.as_mut() {
+                let prev = std::mem::replace(prev, buffer.snapshot());
+                changes.record(prev, committed.forward_ops());
+            }
             if let Some(e) = committed.patch().edits().first() {
                 caret_home = Some(e.new.start);
             }
@@ -1139,12 +1272,18 @@ impl Document {
         let mut caret_home: Option<u32> = None;
         let bracket_cfg = self.bracket_config();
         let Self {
-            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find, ..
+            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find,
+            changes, ..
         } = self;
         let mut views = Views { highlight, brackets, decorations, autoclose, folds, find };
+        let mut before = changes.capture(buffer);
         let redone = history.redo(buffer, selections, |committed, buffer| {
             // The same one mover as `undo` (folds ride it, position + fold reveal).
             rebase_views(&mut views, buffer, tab, committed, &bracket_cfg);
+            if let Some(prev) = before.as_mut() {
+                let prev = std::mem::replace(prev, buffer.snapshot());
+                changes.record(prev, committed.forward_ops());
+            }
             if let Some(e) = committed.patch().edits().last() {
                 caret_home = Some(e.new.end);
             }
@@ -5671,5 +5810,165 @@ mod tests {
         assert_eq!(match_ranges(&d), vec![0..3]);
         d.edit(vec![EditOp::insert(0, "f")]).unwrap(); // "fFOO bar"
         assert_eq!(match_ranges(&d), vec![1..4], "re-anchored, still folded");
+    }
+
+    /// Apply `ops` one by one, the consumer's replay of one logged commit.
+    fn replay(text: &str, ops: &[EditOp]) -> String {
+        let mut s = text.to_owned();
+        for op in ops {
+            s.replace_range(op.range.start as usize..op.range.end as usize, &op.text);
+        }
+        s
+    }
+
+    /// The drained chain is complete and replays: each entry starts where the
+    /// previous one ended, its ops turn its `before` into the next entry's
+    /// `before`, and the last one reaches `live`.
+    fn assert_chain(changes: &Changes, live: &Document) {
+        let entries: Vec<&Change> = changes.iter().collect();
+        let mut cursor = changes.from().expect("an unbroken log has a start revision");
+        for (i, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.before().revision(), cursor, "entry {i} starts where the chain is");
+            let next = entries
+                .get(i + 1)
+                .map_or_else(|| live.text().into_owned(), |n| n.before().text().into_owned());
+            assert_eq!(replay(&entry.before().text(), entry.ops()), next, "entry {i} replays");
+            cursor = Revision(cursor.0 + 1);
+        }
+        assert_eq!(cursor, live.revision(), "the chain ends at the live revision");
+        assert_eq!(changes.doc_id(), live.doc_id(), "the drain names its document");
+    }
+
+    /// Every logged commit replays onto its `before` snapshot, across batches
+    /// with tied inserts, typing runs, undo, redo, and drains covering one or
+    /// many commits.
+    #[test]
+    fn change_log_replays_each_commit_onto_its_before_snapshot() {
+        let mut d = doc("fn a() {\n    é\n}\n");
+        d.observe_changes(true);
+        let mut next = xorshift(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..300 {
+            match next() % 5 {
+                0 | 1 => {
+                    let len = d.buffer().len();
+                    let mut offsets: Vec<u32> = (0..1 + next() % 4)
+                        .map(|_| d.buffer().clip_offset((next() % u64::from(len + 1)) as u32, Bias::Left))
+                        .collect();
+                    offsets.sort_unstable();
+                    offsets.dedup();
+                    let mut batch = Vec::new();
+                    for (i, &p) in offsets.iter().enumerate() {
+                        let bound = offsets.get(i + 1).copied().unwrap_or(len + 1);
+                        batch.push(EditOp::insert(p, "A"));
+                        if next().is_multiple_of(2) {
+                            batch.push(EditOp::insert(p, "Bé"));
+                        }
+                        let q = d.buffer().clip_offset(p + 1, Bias::Right);
+                        if next().is_multiple_of(2) && q > p && q < bound {
+                            batch.push(EditOp::delete(p..q));
+                        }
+                    }
+                    d.edit(batch).expect("inserts before a delete at one start are disjoint");
+                }
+                2 => {
+                    for _ in 0..1 + next() % 5 {
+                        d.type_char(char::from(b'a' + (next() % 5) as u8));
+                    }
+                }
+                3 => {
+                    d.undo();
+                }
+                _ => {
+                    d.redo();
+                }
+            }
+            if next().is_multiple_of(3) {
+                assert_chain(&d.drain_changes(), &d);
+            }
+        }
+        assert_chain(&d.drain_changes(), &d);
+    }
+
+    /// Two inserts at one offset replay in the order the rope placed them.
+    #[test]
+    fn tied_inserts_replay_in_the_order_the_rope_applied_them() {
+        let mut d = doc("");
+        d.observe_changes(true);
+        d.edit(vec![EditOp::insert(0, "A"), EditOp::insert(0, "B")]).unwrap();
+        assert_eq!(d.text(), "AB", "ties apply in caller order");
+        let changes = d.drain_changes();
+        let entry = changes.iter().next().expect("one commit logs one entry");
+        assert_eq!(
+            entry.ops(),
+            [EditOp::insert(0, "B"), EditOp::insert(0, "A")],
+            "the later tied insert replays first, as the rope applied it"
+        );
+        assert_eq!(replay("", entry.ops()), "AB", "sequential replay reproduces the commit");
+    }
+
+    /// A typing run is one undo element of several steps, and each step of its
+    /// undo and redo is its own logged commit.
+    #[test]
+    fn undo_and_redo_of_a_typing_run_log_one_entry_per_step() {
+        let mut d = doc("");
+        d.observe_changes(true);
+        for ch in ['a', 'b', 'c'] {
+            d.type_char(ch);
+        }
+        let _ = d.drain_changes();
+        assert!(d.undo(), "the run undoes");
+        assert_eq!(d.text(), "", "one undo reverts the whole run");
+        let undone = d.drain_changes();
+        assert_eq!(undone.len(), 3, "each reverted step logs an entry");
+        assert_chain(&undone, &d);
+        assert!(d.redo(), "the run redoes");
+        assert_eq!(d.text(), "abc", "one redo replays the whole run");
+        let redone = d.drain_changes();
+        assert_eq!(redone.len(), 3, "each replayed step logs an entry");
+        assert_chain(&redone, &d);
+    }
+
+    /// Turning the log on starts its chain at the current revision; turning it
+    /// off stops logging and reports a broken chain.
+    #[test]
+    fn observing_starts_the_chain_at_the_current_revision() {
+        let mut d = doc("abc");
+        d.edit(vec![EditOp::insert(0, "x")]).unwrap();
+        d.edit(vec![EditOp::insert(0, "y")]).unwrap();
+        d.observe_changes(true);
+        let start = d.revision();
+        let empty = d.drain_changes();
+        assert!(empty.is_empty(), "nothing is logged before observing");
+        assert_eq!(empty.from(), Some(start), "the chain starts at the current revision");
+        d.edit(vec![EditOp::insert(0, "z")]).unwrap();
+        let one = d.drain_changes();
+        assert_eq!(one.len(), 1, "one edit logs one entry");
+        assert_eq!(one.iter().next().map(|c| c.before().revision()), Some(start), "it starts the chain");
+        assert_chain(&one, &d);
+        d.observe_changes(false);
+        d.edit(vec![EditOp::insert(0, "w")]).unwrap();
+        let off = d.drain_changes();
+        assert!(off.is_empty(), "an off log records nothing");
+        assert_eq!(off.from(), None, "an off log has no chain");
+    }
+
+    /// An observer that never drains breaks the log at the cap, and the next
+    /// drain restarts a complete chain.
+    #[test]
+    fn hitting_the_cap_breaks_the_log_until_the_next_drain() {
+        let mut d = doc("");
+        d.observe_changes(true);
+        for _ in 0..=CHANGE_LOG_CAP {
+            d.edit(vec![EditOp::insert(0, "a")]).unwrap();
+        }
+        let broken = d.drain_changes();
+        assert_eq!(broken.from(), None, "overflowing the cap breaks the chain");
+        assert!(broken.is_empty(), "a broken log holds nothing");
+        let start = d.revision();
+        d.edit(vec![EditOp::insert(0, "b")]).unwrap();
+        let healed = d.drain_changes();
+        assert_eq!(healed.from(), Some(start), "the drain restarts the chain");
+        assert_eq!(healed.len(), 1, "logging resumes after the drain");
+        assert_chain(&healed, &d);
     }
 }
