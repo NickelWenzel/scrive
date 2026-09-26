@@ -14,20 +14,20 @@ use lsp_types::{
     ApplyWorkspaceEditResponse, ClientInfo, CompletionContext, CompletionParams,
     CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, FormattingOptions, HoverParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
+    DocumentFormattingParams, FormattingOptions, GotoDefinitionParams, HoverParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
     SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
     WorkspaceFolder,
 };
 use scrive_core::{
-    document, Bias, CompletionRequest, CompletionTrigger, DocId, FormatRequest, HoverRequest,
-    Revision, SignatureRequest, Snapshot, Ticket,
+    document, Bias, CompletionRequest, CompletionTrigger, DefinitionRequest, DocId, FormatRequest,
+    HoverRequest, Revision, SignatureRequest, Snapshot, Ticket,
 };
 use serde_json::Value;
 
 use crate::message::{self, Message};
-use crate::update::{self, Update};
-use crate::{completion, diagnostics, edits, hover, signature, uri, Encoding};
+use crate::update::{self, jump, Update};
+use crate::{completion, diagnostics, edits, hover, signature, uri, workspace, Encoding};
 
 /// JSON-RPC's "method not found": a server request this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -158,6 +158,10 @@ struct Pending {
     /// The ticket this request was re-issued for after `ContentModified`. Requests that follow
     /// from it inherit it, so each ticket is re-issued at most once.
     reissued_for: Option<Ticket>,
+    /// For requests whose results name other documents: the synced revision of every open
+    /// document when the request went out. A result pointing into a document that has moved
+    /// since, or opened since, is stale.
+    revisions: Vec<(uri::Key, Revision)>,
 }
 
 /// The kind of a pending request; with the document, it keys the pending table.
@@ -166,6 +170,7 @@ enum Kind {
     Completion,
     Signature,
     Hover,
+    Definition,
     Format,
 }
 
@@ -175,6 +180,8 @@ enum Query {
     Completion(completion::Query),
     Signature(signature::Query),
     Hover(hover::Query),
+    /// The definition of the symbol at `offset`.
+    Definition { offset: u32 },
     /// Formatting of the whole document at this indent width.
     Format { tab_size: u32 },
 }
@@ -428,6 +435,33 @@ impl Client {
             word: request.word.clone(),
         };
         self.send(doc_id, ticket, Query::Hover(query), None)
+    }
+
+    /// Asks the server where the symbol at the request's offset is defined. The answer is an
+    /// [`update::Change::Definition`] under the request's ticket.
+    ///
+    /// When the server is not running or has no definition provider, the request is declined
+    /// with [`update::Change::Definition`]`(None)` under its ticket. A request from a revision
+    /// other than `snapshot`'s or the last synced one, or for a document that is not registered,
+    /// gets nothing.
+    pub fn definition(&mut self, snapshot: &Snapshot, request: &DefinitionRequest) -> Output {
+        let doc_id = snapshot.doc_id();
+        let ticket = request.ticket;
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
+            return Output::default();
+        };
+        if ticket.revision() != snapshot.revision()
+            || snapshot.revision() != tracked.synced.revision()
+        {
+            return Output::default();
+        }
+        if !matches!(&self.state, State::Running(server) if server.definition) {
+            return Output::answer(doc_id, ticket, update::Change::Definition(None));
+        }
+        let query = Query::Definition {
+            offset: request.offset,
+        };
+        self.send(doc_id, ticket, query, None)
     }
 
     /// Asks the server to format the whole document, indenting with spaces. The answer is a
@@ -688,7 +722,7 @@ impl Client {
                 }),
                 Some(entry.latest_ticket),
             ),
-            query @ (Query::Hover(_) | Query::Format { .. }) => self.send(
+            query @ (Query::Hover(_) | Query::Definition { .. } | Query::Format { .. }) => self.send(
                 entry.doc_id,
                 entry.latest_ticket,
                 query,
@@ -702,6 +736,7 @@ impl Client {
             Query::Completion(query) => Ok(self.completed(entry, query, value)),
             Query::Signature(query) => Ok(self.signed(entry, query, value)),
             Query::Hover(query) => Ok(self.hovered(entry, query, value)),
+            Query::Definition { .. } => self.defined(entry, value),
             Query::Format { .. } => self.formatted(entry, value),
         }
     }
@@ -826,6 +861,14 @@ impl Client {
         let Some(index) = self.tracked.iter().position(|t| t.doc_id == doc_id) else {
             return output;
         };
+        let revisions = match query.kind() {
+            Kind::Definition => self
+                .tracked
+                .iter()
+                .map(|t| (t.key.clone(), t.synced.revision()))
+                .collect(),
+            Kind::Completion | Kind::Signature | Kind::Hover | Kind::Format => Vec::new(),
+        };
         let id = self.next_request();
         let tracked = &self.tracked[index];
         output.messages.push(Message::Request(query.request(
@@ -842,6 +885,7 @@ impl Client {
             latest_caret: query.caret(),
             query,
             reissued_for,
+            revisions,
         });
         output
     }
@@ -918,6 +962,53 @@ impl Client {
         let card = reply
             .and_then(|reply| hover::convert(self.encoding, &entry.request_snapshot, query, reply));
         Output::answer(entry.doc_id, entry.latest_ticket, update::Change::Hover(card))
+    }
+
+    /// Answers the ticket with the first location in the reply.
+    ///
+    /// # Errors
+    /// [`Error::Decode`] when the result is not a location, a list of them, or `null`.
+    fn defined(&self, entry: &Pending, value: Value) -> Result<Output, Error> {
+        let locations: Option<workspace::Locations> = decode(entry.query.method(), Some(value))?;
+        let target = locations
+            .and_then(workspace::Locations::first)
+            .and_then(|(key, range)| self.target(entry, key, range));
+        Ok(Output::answer(
+            entry.doc_id,
+            entry.latest_ticket,
+            update::Change::Definition(target),
+        ))
+    }
+
+    /// Where `range` in `key` lies relative to `entry`'s document; `None` when it is in another
+    /// open document whose text is not the one the server answered for.
+    fn target(
+        &self,
+        entry: &Pending,
+        key: uri::Key,
+        range: lsp_types::Range,
+    ) -> Option<update::Target> {
+        let requester = self.tracked.iter().find(|t| t.doc_id == entry.doc_id)?;
+        if key == requester.key {
+            return Some(update::Target::Local(
+                self.encoding.span(&entry.request_snapshot, range),
+            ));
+        }
+        let Some(tracked) = self.tracked.iter().find(|t| t.key == key) else {
+            return Some(update::Target::Unopened(jump::Unopened::new(
+                key,
+                range,
+                self.encoding,
+            )));
+        };
+        if entry.revision_of(&key) != Some(tracked.synced.revision()) {
+            return None;
+        }
+        Some(update::Target::Open(jump::Open::new(
+            tracked.doc_id,
+            tracked.synced.revision(),
+            self.encoding.span(&tracked.synced, range),
+        )))
     }
 
     /// Answers the ticket with the reply's edits, converted against the request's text, which
@@ -1137,9 +1228,17 @@ impl Pending {
             Query::Hover(_) => {
                 Output::answer(self.doc_id, self.latest_ticket, update::Change::Hover(None))
             }
-            // Commands have no slot to settle: `settled` reports their failures as errors.
-            Query::Format { .. } => Output::default(),
+            // `settled` reports command failures as errors before they get here.
+            Query::Definition { .. } | Query::Format { .. } => Output::default(),
         }
+    }
+
+    /// The synced revision `key` was at when the request went out, if it was open then.
+    fn revision_of(&self, key: &uri::Key) -> Option<Revision> {
+        self.revisions
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|&(_, revision)| revision)
     }
 }
 
@@ -1148,7 +1247,7 @@ impl Kind {
     fn is_command(self) -> bool {
         match self {
             Kind::Completion | Kind::Signature | Kind::Hover => false,
-            Kind::Format => true,
+            Kind::Definition | Kind::Format => true,
         }
     }
 }
@@ -1159,6 +1258,7 @@ impl Query {
             Query::Completion(_) => Kind::Completion,
             Query::Signature(_) => Kind::Signature,
             Query::Hover(_) => Kind::Hover,
+            Query::Definition { .. } => Kind::Definition,
             Query::Format { .. } => Kind::Format,
         }
     }
@@ -1170,6 +1270,7 @@ impl Query {
             Query::Completion(_) => lsp_types::request::Completion::METHOD,
             Query::Signature(_) => lsp_types::request::SignatureHelpRequest::METHOD,
             Query::Hover(_) => lsp_types::request::HoverRequest::METHOD,
+            Query::Definition { .. } => lsp_types::request::GotoDefinition::METHOD,
             Query::Format { .. } => lsp_types::request::Formatting::METHOD,
         }
     }
@@ -1180,6 +1281,7 @@ impl Query {
             Query::Completion(query) => query.word.end,
             Query::Signature(query) => query.caret,
             Query::Hover(query) => query.offset,
+            Query::Definition { offset } => *offset,
             // Formatting covers the whole document and asks at no caret.
             Query::Format { .. } => 0,
         }
@@ -1229,6 +1331,19 @@ impl Query {
                     work_done_progress_params: Default::default(),
                 },
             ),
+            Query::Definition { offset } => {
+                message::Request::new::<lsp_types::request::GotoDefinition>(
+                    id,
+                    GotoDefinitionParams {
+                        text_document_position_params: TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier { uri: uri.clone() },
+                            position: encoding.position(snapshot, *offset),
+                        },
+                        work_done_progress_params: Default::default(),
+                        partial_result_params: Default::default(),
+                    },
+                )
+            }
             Query::Format { tab_size } => message::Request::new::<lsp_types::request::Formatting>(
                 id,
                 DocumentFormattingParams {

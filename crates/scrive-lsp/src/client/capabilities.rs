@@ -2,7 +2,7 @@
 
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-    DocumentFormattingClientCapabilities, GeneralClientCapabilities, HoverClientCapabilities, HoverProviderCapability, MarkupKind, OneOf,
+    DocumentFormattingClientCapabilities, GeneralClientCapabilities, GotoCapability, HoverClientCapabilities, HoverProviderCapability, MarkupKind, OneOf,
     ParameterInformationSettings, PublishDiagnosticsClientCapabilities, ServerCapabilities,
     SignatureHelpClientCapabilities, SignatureInformationSettings, TextDocumentClientCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
@@ -24,6 +24,8 @@ pub(crate) struct Server {
     pub(crate) signature: bool,
     /// Whether the server answers `textDocument/hover`.
     pub(crate) hover: bool,
+    /// Whether the server answers `textDocument/definition`.
+    pub(crate) definition: bool,
     /// Whether the server answers `textDocument/formatting`.
     pub(crate) formatting: bool,
 }
@@ -54,6 +56,10 @@ impl Server {
             hover: matches!(
                 capabilities.hover_provider,
                 Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+            ),
+            definition: matches!(
+                capabilities.definition_provider,
+                Some(OneOf::Left(true) | OneOf::Right(_))
             ),
             formatting: matches!(
                 capabilities.document_formatting_provider,
@@ -102,6 +108,10 @@ pub(crate) fn client() -> ClientCapabilities {
             hover: Some(HoverClientCapabilities {
                 content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                 ..HoverClientCapabilities::default()
+            }),
+            definition: Some(GotoCapability {
+                link_support: Some(true),
+                ..GotoCapability::default()
             }),
             formatting: Some(DocumentFormattingClientCapabilities::default()),
             ..TextDocumentClientCapabilities::default()

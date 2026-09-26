@@ -3,8 +3,8 @@ use std::str::FromStr;
 use scrive_core::intel::completion::Start;
 use scrive_core::intel::ticket::Counter;
 use scrive_core::{
-    CompletionItem, Document, EditOp, FormatRequest, GroupingHint, HoverInfo, HoverRequest,
-    OpClass, Point, SignatureInfo,
+    CompletionItem, DefinitionRequest, Document, EditOp, FormatRequest, GroupingHint, HoverInfo,
+    HoverRequest, OpClass, Point, SignatureInfo,
 };
 use serde_json::{json, Value};
 
@@ -89,7 +89,8 @@ fn whole(text: &str) -> Value {
     json!({"text": text})
 }
 
-/// With the other per-variant helpers ([`completions`], [`signature`], [`hover`], [`edits`]),
+/// With the other per-variant helpers ([`completions`], [`signature`], [`hover`], [`edits`],
+/// [`definition`]),
 /// the only place tests read a `Change`, so a new variant changes only these helpers.
 fn diagnostics(update: &Update) -> (DocId, update::Stamp, Vec<scrive_core::Diagnostic>) {
     let Update::Document(document) = update else {
@@ -142,6 +143,17 @@ fn edits(update: &Update) -> (update::Stamp, Vec<EditOp>) {
     match document.change() {
         update::Change::Edits(ops) => (document.stamp(), ops.clone()),
         other => panic!("expected edits, got {other:?}"),
+    }
+}
+
+/// The stamp and target of a definition update.
+fn definition(update: &Update) -> (update::Stamp, Option<update::Target>) {
+    let Update::Document(document) = update else {
+        panic!("expected a document update, got {update:?}")
+    };
+    match document.change() {
+        update::Change::Definition(target) => (document.stamp(), target.clone()),
+        other => panic!("expected a definition, got {other:?}"),
     }
 }
 
@@ -2336,6 +2348,7 @@ fn command_capabilities() -> Value {
     json!({
         "positionEncoding": "utf-8",
         "textDocumentSync": 2,
+        "definitionProvider": true,
         "documentFormattingProvider": true,
     })
 }
@@ -2495,4 +2508,221 @@ fn format_declines_before_initialize_and_without_a_provider() {
             "a declined format sends nothing",
         );
     }
+}
+
+/// `a.rs` calls `greet`, which `b.rs` defines at `3..8`.
+const CALLER: &str = "fn a() {}\ngreet();\n";
+const CALLEE: &str = "fn greet() {}\n";
+
+/// Opens `doc` on `client` as `uri`.
+fn open_as(client: &mut Client, doc: &Document, uri_text: &str) {
+    let _ = client
+        .open(&doc.snapshot(), &uri(uri_text), "rust")
+        .expect("opens");
+}
+
+/// A range on one line.
+fn span_on(line: u32, start: u32, end: u32) -> Value {
+    json!({"start": {"line": line, "character": start}, "end": {"line": line, "character": end}})
+}
+
+/// The one definition update in `output`, which sends nothing.
+fn defined(output: &Output) -> (update::Stamp, Option<update::Target>) {
+    assert!(
+        output.messages.is_empty(),
+        "an answer sends nothing: {output:?}"
+    );
+    let [update] = output.updates.as_slice() else {
+        panic!("expected one update, got {:?}", output.updates)
+    };
+    definition(update)
+}
+
+/// `initialize` advertises goto definition with location links.
+#[test]
+fn initialize_advertises_definition_links() {
+    let (_, initialize) = Client::builder().build();
+    let initialize = serde_json::to_value(&initialize).expect("serializes");
+    assert_eq!(
+        initialize.pointer("/params/capabilities/textDocument/definition/linkSupport"),
+        Some(&json!(true)),
+        "location links are accepted",
+    );
+}
+
+/// A definition in the requesting document selects its span there, under the request's ticket.
+#[test]
+fn definition_in_the_same_document_is_a_local_target() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding("fn f() {}\nf();\n");
+    let request = DefinitionRequest::new(tickets.issue(doc.revision()), 10);
+    assert_eq!(
+        wire(&client.definition(&doc.snapshot(), &request).messages),
+        vec![json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/definition", "params": {
+            "textDocument": {"uri": "file:///a.rs"},
+            "position": {"line": 1, "character": 0},
+        }})],
+        "the request asks at the offset",
+    );
+    let (stamp, target) = defined(
+        &client
+            .receive(reply(2, json!({"uri": "file:///a.rs", "range": span_on(0, 3, 4)})))
+            .expect("the reply is accepted"),
+    );
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(request.ticket),
+        "stamped with the request's ticket"
+    );
+    assert_eq!(target, Some(update::Target::Local(3..4)), "the local span");
+}
+
+/// A definition in another open document is converted against that document's synced text.
+#[test]
+fn definition_in_another_open_document_is_an_open_target() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding(CALLER);
+    let callee = document(CALLEE);
+    open_as(&mut client, &callee, "file:///b.rs");
+    let request = DefinitionRequest::new(tickets.issue(doc.revision()), 10);
+    let _ = client.definition(&doc.snapshot(), &request);
+    let (_, target) = defined(
+        &client
+            .receive(reply(2, json!([{"uri": "file:///b.rs", "range": span_on(0, 3, 8)}])))
+            .expect("the reply is accepted"),
+    );
+    let Some(update::Target::Open(open)) = target else {
+        panic!("expected an open target, got {target:?}")
+    };
+    assert_eq!(open.doc_id(), callee.doc_id(), "the callee's document");
+    assert_eq!(open.revision(), callee.revision(), "at its synced revision");
+    assert_eq!(open.span(), 3..8, "over `greet`");
+}
+
+/// A definition in an open document that moved since the request points at text the server
+/// never saw, so it is dropped.
+#[test]
+fn definition_in_an_open_document_that_moved_is_dropped() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding(CALLER);
+    let mut callee = document(CALLEE);
+    open_as(&mut client, &callee, "file:///b.rs");
+    let request = DefinitionRequest::new(tickets.issue(doc.revision()), 10);
+    let _ = client.definition(&doc.snapshot(), &request);
+    type_ops(&mut client, &mut callee, vec![EditOp::insert(0, "\n")]);
+    let (stamp, target) = defined(
+        &client
+            .receive(reply(2, json!({"uri": "file:///b.rs", "range": span_on(0, 3, 8)})))
+            .expect("the reply is accepted"),
+    );
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(request.ticket),
+        "the requester still settles"
+    );
+    assert_eq!(target, None, "the moved target is dropped");
+}
+
+/// A document opened after the request has no recorded revision, so a definition in it is
+/// dropped.
+#[test]
+fn definition_in_a_document_opened_after_the_request_is_dropped() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding(CALLER);
+    let request = DefinitionRequest::new(tickets.issue(doc.revision()), 10);
+    let _ = client.definition(&doc.snapshot(), &request);
+    open_as(&mut client, &document(CALLEE), "file:///b.rs");
+    let (_, target) = defined(
+        &client
+            .receive(reply(2, json!({"uri": "file:///b.rs", "range": span_on(0, 3, 8)})))
+            .expect("the reply is accepted"),
+    );
+    assert_eq!(target, None, "the late-opened target is dropped");
+}
+
+/// A definition in a file nobody opened keeps the server's range for the host to convert.
+#[test]
+fn definition_in_an_unopened_document_is_an_unopened_target() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding(CALLER);
+    let request = DefinitionRequest::new(tickets.issue(doc.revision()), 10);
+    let _ = client.definition(&doc.snapshot(), &request);
+    let (_, target) = defined(
+        &client
+            .receive(reply(2, json!({"uri": "file:///w/c.rs", "range": span_on(1, 3, 4)})))
+            .expect("the reply is accepted"),
+    );
+    let Some(update::Target::Unopened(unopened)) = target else {
+        panic!("expected an unopened target, got {target:?}")
+    };
+    assert_eq!(unopened.uri().as_str(), "file:///w/c.rs", "the file");
+    assert_eq!(unopened.span("x\nfn c() {}\n"), 5..6, "converted against the file's text");
+}
+
+/// A `LocationLink` selects its name, not the whole definition.
+#[test]
+fn location_link_definition_uses_the_target_selection_range() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding(CALLER);
+    let callee = document(CALLEE);
+    open_as(&mut client, &callee, "file:///b.rs");
+    let request = DefinitionRequest::new(tickets.issue(doc.revision()), 10);
+    let _ = client.definition(&doc.snapshot(), &request);
+    let (_, target) = defined(
+        &client
+            .receive(reply(2, json!([{
+                "targetUri": "file:///b.rs",
+                "targetRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 13}},
+                "targetSelectionRange": span_on(0, 3, 8),
+            }])))
+            .expect("the reply is accepted"),
+    );
+    let Some(update::Target::Open(open)) = target else {
+        panic!("expected an open target, got {target:?}")
+    };
+    assert_eq!(open.span(), 3..8, "the selection range");
+}
+
+/// With no server to ask, or one without a provider, the editor stops waiting at once.
+#[test]
+fn definition_without_a_provider_declines_with_none() {
+    let doc = document(CALLER);
+    let (initializing, _) = Client::builder().build();
+    let (without, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
+    for mut client in [initializing, without] {
+        let mut tickets = Counter::new();
+        open_as(&mut client, &doc, "file:///a.rs");
+        let request = DefinitionRequest::new(tickets.issue(doc.revision()), 10);
+        let (stamp, target) = defined(&client.definition(&doc.snapshot(), &request));
+        assert_eq!(
+            stamp,
+            update::Stamp::Ticket(request.ticket),
+            "the decline answers the ticket"
+        );
+        assert_eq!(target, None, "the decline has no target");
+    }
+}
+
+/// A user asked for the definition, so a failed or undecodable reply is reported.
+#[test]
+fn definition_server_error_is_a_server_error() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding(CALLER);
+    let request = DefinitionRequest::new(tickets.issue(doc.revision()), 10);
+    let _ = client.definition(&doc.snapshot(), &request);
+    let error = client
+        .receive(failure(2, -32603))
+        .expect_err("a server error is reported");
+    assert!(
+        matches!(&error, Error::Server { method, .. } if method == "textDocument/definition"),
+        "the error names the method: {error:?}",
+    );
+    let _ = client.definition(&doc.snapshot(), &request);
+    let error = client
+        .receive(reply(3, json!("x")))
+        .expect_err("an undecodable result is reported");
+    assert!(
+        matches!(&error, Error::Decode { method, .. } if method == "textDocument/definition"),
+        "the error names the method: {error:?}",
+    );
 }

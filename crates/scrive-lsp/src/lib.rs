@@ -8,6 +8,7 @@
 //! - completion → [`Client::complete`]
 //! - signature help → [`Client::signature_help`]
 //! - hover → [`Client::hover`]
+//! - goto definition → [`Client::definition`]
 //! - formatting → [`Client::format`]
 //! - what the client hands back → [`Update`] ([`update`])
 //! - the JSON-RPC envelope → [`message`]
@@ -31,6 +32,7 @@ mod signature;
 mod snippet;
 pub mod update;
 pub mod uri;
+mod workspace;
 
 pub use client::{Client, Error, Output};
 pub use encoding::Encoding;
