@@ -46,7 +46,7 @@ use scrive_core::{
     Document, EditOp, FindQuery, FormatRequest, Hover,
     HoverCx, HoverInfo, InsertText, Point, RenameRequest, Revision, Selection, SelectionId, SelectionSet, Severity,
     SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, SyntaxDef, TabOutcome, Ticket,
-    TokenTheme, LOOKBACK_LINES,
+    TokenTheme, TransactionError, LOOKBACK_LINES,
 };
 
 use crate::editor::{Action, Editor};
@@ -522,14 +522,26 @@ impl CodeEditor {
     /// Apply a programmatic batch of edits as one transaction, then run the
     /// post-edit tail. The tail is why this exists instead of a raw `&mut
     /// Document`: it keeps highlighting, find, and the intel controllers current.
+    /// A rejected batch is dropped silently; [`try_edit`](Self::try_edit) says why.
     pub fn edit(&mut self, ops: Vec<EditOp>) {
+        let _ = self.try_edit(ops);
+    }
+
+    /// [`edit`](Self::edit), with a rejected batch returned instead of dropped.
+    /// A transaction is all-or-nothing, so nothing is applied on `Err`.
+    ///
+    /// # Errors
+    /// [`TransactionError::Overlap`] when two ops overlap in the pre-edit text,
+    /// and [`TransactionError::WouldOverflow`] when the result would grow past
+    /// the `u32` offset space.
+    pub fn try_edit(&mut self, ops: Vec<EditOp>) -> Result<(), TransactionError> {
         let before = self.doc.revision();
-        if self.doc.edit(ops).is_ok() {
-            self.after_edit(CompletionEvent::CaretOrClose);
-            if self.doc.revision() != before {
-                self.dirty = true;
-            }
+        self.doc.edit(ops)?;
+        self.after_edit(CompletionEvent::CaretOrClose);
+        if self.doc.revision() != before {
+            self.dirty = true;
         }
+        Ok(())
     }
 
     /// Swap the whole buffer (load a new file), keeping the current grammar and
@@ -2278,6 +2290,16 @@ mod tests {
         ed.edit(vec![scrive_core::EditOp::new(0..0, "X")]);
         assert_eq!(ed.document().text().into_owned(), "Xabc\n");
         assert!(ed.is_dirty());
+    }
+
+    /// `try_edit` reports an overlapping batch instead of dropping it, and applies nothing.
+    #[test]
+    fn try_edit_reports_an_overlapping_batch() {
+        let mut ed = CodeEditor::new("abcd\n");
+        let result = ed.try_edit(vec![EditOp::new(0..3, "x"), EditOp::new(1..4, "y")]);
+        assert!(matches!(result, Err(TransactionError::Overlap { .. })), "the overlap is reported");
+        assert_eq!(ed.document().text().into_owned(), "abcd\n", "nothing was applied");
+        assert!(!ed.is_dirty(), "a rejected batch doesn't dirty the document");
     }
 
     /// Async completions, end to end: with no sync provider, typing a word char
