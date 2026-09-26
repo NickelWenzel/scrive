@@ -6,7 +6,7 @@ use scrive_core::{
     CompletionItem, Diagnostic, DocId, EditOp, HoverInfo, Revision, SignatureInfo, Ticket,
 };
 
-use crate::message;
+use crate::{edits, message, uri, Encoding};
 
 /// One thing a host must act on.
 #[derive(Clone, Debug)]
@@ -15,6 +15,8 @@ pub enum Update {
     Document(Document),
     /// A server notification the client does not consume (`window/logMessage`, `$/progress`, …).
     Notification(message::Notification),
+    /// A rename's edits for a file that is not open, for the host to apply on disk.
+    FileEdits(FileEdits),
 }
 
 /// A change for one document, stamped with what it is valid against.
@@ -62,6 +64,62 @@ pub enum Target {
     Open(jump::Open),
     /// In a document this client has not opened.
     Unopened(jump::Unopened),
+}
+
+/// A rename's edits for a file that is not open: the host reads the file, calls
+/// [`apply`](FileEdits::apply), and writes the result back.
+#[derive(Clone, Debug)]
+pub struct FileEdits {
+    uri: uri::Key,
+    edits: Vec<lsp_types::TextEdit>,
+    encoding: Encoding,
+}
+
+impl FileEdits {
+    pub(crate) fn new(uri: uri::Key, edits: Vec<lsp_types::TextEdit>, encoding: Encoding) -> Self {
+        Self {
+            uri,
+            edits,
+            encoding,
+        }
+    }
+
+    /// The file to edit.
+    #[must_use]
+    pub fn uri(&self) -> &uri::Key {
+        &self.uri
+    }
+
+    /// `text`, the file's content, with the edits applied. Text containing `\r\n` comes back
+    /// with `\r\n` line breaks, and any other text with `\n`. Of two overlapping edits, which
+    /// the protocol forbids, the one that sorts first by `(start, end)` applies and the other is
+    /// skipped.
+    #[must_use]
+    pub fn apply(&self, text: &str) -> String {
+        let crlf = text.contains("\r\n");
+        let mut out = edits::lf(text);
+        let ops = edits::hygiene(edits::Text::Str(&out), self.encoding, &self.edits);
+        let mut end = 0;
+        let kept: Vec<EditOp> = ops
+            .into_iter()
+            .filter(|op| {
+                let disjoint = op.range.start >= end;
+                if disjoint {
+                    end = op.range.end;
+                }
+                disjoint
+            })
+            .collect();
+        // Descending, so the offsets of the ops still to apply stay valid.
+        for op in kept.iter().rev() {
+            out.replace_range(op.range.start as usize..op.range.end as usize, &op.text);
+        }
+        if crlf {
+            out.replace('\n', "\r\n")
+        } else {
+            out
+        }
+    }
 }
 
 /// Definition targets outside the requesting document.
@@ -186,14 +244,46 @@ mod tests {
     use lsp_types::Position;
 
     use super::*;
-    use crate::{uri, Encoding};
+
+    fn key(text: &str) -> uri::Key {
+        uri::normalize(&lsp_types::Uri::from_str(text).expect("fixture URI parses"))
+    }
+
+    fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> lsp_types::TextEdit {
+        lsp_types::TextEdit::new(
+            lsp_types::Range::new(Position::new(start.0, start.1), Position::new(end.0, end.1)),
+            text.to_owned(),
+        )
+    }
+
+    /// A CRLF file stays CRLF after its edits.
+    #[test]
+    fn file_edits_apply_keeps_crlf_line_endings() {
+        let file_edits = FileEdits::new(
+            key("file:///w/c.rs"),
+            vec![edit((1, 0), (1, 1), "X")],
+            Encoding::Utf8,
+        );
+        assert_eq!(file_edits.apply("a\r\nb\r\n"), "a\r\nX\r\n", "CRLF survives");
+        assert_eq!(file_edits.apply("a\nb\n"), "a\nX\n", "LF survives");
+    }
+
+    /// Of two overlapping edits the first by `(start, end)` applies.
+    #[test]
+    fn file_edits_apply_skips_an_overlapping_edit() {
+        let file_edits = FileEdits::new(
+            key("file:///w/c.rs"),
+            vec![edit((0, 0), (0, 3), "x"), edit((0, 1), (0, 4), "y")],
+            Encoding::Utf8,
+        );
+        assert_eq!(file_edits.apply("abcd"), "xd", "the second edit is skipped");
+    }
 
     /// The server's range converts against the text the host hands in, in the negotiated unit.
     #[test]
     fn unopened_span_converts_against_the_given_text() {
-        let key = uri::normalize(&lsp_types::Uri::from_str("file:///w/c.rs").expect("parses"));
         let range = lsp_types::Range::new(Position::new(1, 1), Position::new(1, 2));
-        let unopened = jump::Unopened::new(key, range, Encoding::Utf16);
+        let unopened = jump::Unopened::new(key("file:///w/c.rs"), range, Encoding::Utf16);
         assert_eq!(unopened.span("é\nab"), 4..5, "line 1 starts after the two-byte é");
     }
 }

@@ -4,7 +4,7 @@ use scrive_core::intel::completion::Start;
 use scrive_core::intel::ticket::Counter;
 use scrive_core::{
     CompletionItem, DefinitionRequest, Document, EditOp, FormatRequest, GroupingHint, HoverInfo,
-    HoverRequest, OpClass, Point, SignatureInfo,
+    HoverRequest, OpClass, Point, RenameRequest, SignatureInfo,
 };
 use serde_json::{json, Value};
 
@@ -2349,6 +2349,7 @@ fn command_capabilities() -> Value {
         "positionEncoding": "utf-8",
         "textDocumentSync": 2,
         "definitionProvider": true,
+        "renameProvider": true,
         "documentFormattingProvider": true,
     })
 }
@@ -2725,4 +2726,318 @@ fn definition_server_error_is_a_server_error() {
         matches!(&error, Error::Decode { method, .. } if method == "textDocument/definition"),
         "the error names the method: {error:?}",
     );
+}
+
+/// A running client with [`CALLER`] open as `a.rs` and [`CALLEE`] as `b.rs`, and a rename of
+/// `greet` in the caller sent as request 2.
+fn renaming(tickets: &mut Counter) -> (Client, Document, Document) {
+    let (mut client, caller) = commanding(CALLER);
+    let callee = document(CALLEE);
+    open_as(&mut client, &callee, "file:///b.rs");
+    let request = RenameRequest::new(tickets.issue(caller.revision()), 10, "hail");
+    let _ = client.rename(&caller.snapshot(), &request);
+    (client, caller, callee)
+}
+
+/// A `TextDocumentEdit` renaming `greet` in the caller (`file:///a.rs`) or the callee.
+fn rename_in(uri: &str, version: Value) -> Value {
+    let range = if uri == "file:///a.rs" {
+        span_on(1, 0, 5)
+    } else {
+        span_on(0, 3, 8)
+    };
+    json!({"textDocument": {"uri": uri, "version": version},
+        "edits": [{"range": range, "newText": "hail"}]})
+}
+
+/// The documents, stamps and ops of `output`'s document updates.
+fn renamed_documents(output: &Output) -> Vec<(DocId, update::Stamp, Vec<EditOp>)> {
+    output
+        .updates
+        .iter()
+        .map(|update| {
+            let Update::Document(document) = update else {
+                panic!("expected a document update, got {update:?}")
+            };
+            let (stamp, ops) = edits(update);
+            (document.doc_id(), stamp, ops)
+        })
+        .collect()
+}
+
+/// The stale document of a rename reply that `receive` refused.
+fn stale(result: Result<Output, Error>) -> String {
+    match result {
+        Err(Error::StaleEdit { uri }) => uri.as_str().to_owned(),
+        other => panic!("expected a stale edit, got {other:?}"),
+    }
+}
+
+/// `initialize` advertises rename without prepare, and versioned, transactional workspace edits
+/// without file operations.
+#[test]
+fn initialize_advertises_rename_and_transactional_edits() {
+    let (_, initialize) = Client::builder().build();
+    let initialize = serde_json::to_value(&initialize).expect("serializes");
+    for (pointer, expected) in [
+        ("/params/capabilities/textDocument/rename", Some(json!({}))),
+        (
+            "/params/capabilities/workspace/workspaceEdit/documentChanges",
+            Some(json!(true)),
+        ),
+        (
+            "/params/capabilities/workspace/workspaceEdit/failureHandling",
+            Some(json!("transactional")),
+        ),
+        (
+            "/params/capabilities/workspace/workspaceEdit/resourceOperations",
+            None,
+        ),
+    ] {
+        assert_eq!(
+            initialize.pointer(pointer),
+            expected.as_ref(),
+            "{pointer} is advertised as expected"
+        );
+    }
+}
+
+/// A rename request asks at the offset for the new name.
+#[test]
+fn rename_request_carries_the_position_and_new_name() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = commanding(CALLER);
+    let request = RenameRequest::new(tickets.issue(doc.revision()), 10, "hail");
+    assert_eq!(
+        wire(&client.rename(&doc.snapshot(), &request).messages),
+        vec![json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/rename", "params": {
+            "textDocument": {"uri": "file:///a.rs"},
+            "position": {"line": 1, "character": 0},
+            "newName": "hail",
+        }})],
+        "the request goes out",
+    );
+}
+
+/// `documentChanges` for two open documents land as one revision-stamped batch each.
+#[test]
+fn rename_via_document_changes_edits_two_open_documents() {
+    let mut tickets = Counter::new();
+    let (mut client, caller, callee) = renaming(&mut tickets);
+    let output = client
+        .receive(reply(2, json!({"documentChanges": [
+            rename_in("file:///a.rs", json!(1)),
+            rename_in("file:///b.rs", json!(1)),
+        ]})))
+        .expect("the rename is accepted");
+    assert!(output.messages.is_empty(), "the answer sends nothing");
+    assert_eq!(
+        renamed_documents(&output),
+        vec![
+            (
+                caller.doc_id(),
+                update::Stamp::Revision(caller.revision()),
+                vec![EditOp::new(10..15, "hail")]
+            ),
+            (
+                callee.doc_id(),
+                update::Stamp::Revision(callee.revision()),
+                vec![EditOp::new(3..8, "hail")]
+            ),
+        ],
+        "both documents are renamed at their synced revisions",
+    );
+}
+
+/// The `changes` map lands in URI order.
+#[test]
+fn rename_via_the_changes_map_edits_two_open_documents() {
+    let mut tickets = Counter::new();
+    let (mut client, caller, callee) = renaming(&mut tickets);
+    let output = client
+        .receive(reply(2, json!({"changes": {
+            "file:///b.rs": [{"range": span_on(0, 3, 8), "newText": "hail"}],
+            "file:///a.rs": [{"range": span_on(1, 0, 5), "newText": "hail"}],
+        }})))
+        .expect("the rename is accepted");
+    let documents: Vec<DocId> = renamed_documents(&output)
+        .into_iter()
+        .map(|(doc_id, _, _)| doc_id)
+        .collect();
+    assert_eq!(
+        documents,
+        vec![caller.doc_id(), callee.doc_id()],
+        "a.rs before b.rs"
+    );
+}
+
+/// A touched document that moved since the request refuses the whole rename.
+#[test]
+fn rename_rejects_a_document_that_moved_since_the_request() {
+    let mut tickets = Counter::new();
+    let (mut client, _, mut callee) = renaming(&mut tickets);
+    type_ops(&mut client, &mut callee, vec![EditOp::insert(0, "\n")]);
+    assert_eq!(
+        stale(client.receive(reply(2, json!({"documentChanges": [
+            rename_in("file:///a.rs", json!(1)),
+            rename_in("file:///b.rs", json!(null)),
+        ]})))),
+        "file:///b.rs",
+        "the moved callee is stale",
+    );
+}
+
+/// A document opened after the request was never seen by the rename.
+#[test]
+fn rename_rejects_a_document_opened_after_the_request() {
+    let mut tickets = Counter::new();
+    let (mut client, caller) = commanding(CALLER);
+    let request = RenameRequest::new(tickets.issue(caller.revision()), 10, "hail");
+    let _ = client.rename(&caller.snapshot(), &request);
+    open_as(&mut client, &document(CALLEE), "file:///b.rs");
+    assert_eq!(
+        stale(client.receive(reply(2, json!({"documentChanges": [
+            rename_in("file:///a.rs", json!(1)),
+            rename_in("file:///b.rs", json!(null)),
+        ]})))),
+        "file:///b.rs",
+        "the late-opened callee is stale",
+    );
+}
+
+/// A document closed since the request lost the text the server edited.
+#[test]
+fn rename_rejects_a_document_closed_since_the_request() {
+    let mut tickets = Counter::new();
+    let (mut client, _, callee) = renaming(&mut tickets);
+    let _ = client.close(callee.doc_id());
+    assert_eq!(
+        stale(client.receive(reply(2, json!({"documentChanges": [
+            rename_in("file:///a.rs", json!(1)),
+            rename_in("file:///b.rs", json!(null)),
+        ]})))),
+        "file:///b.rs",
+        "the closed callee is stale",
+    );
+}
+
+/// An edit naming a version other than the one last sent was computed for other text.
+#[test]
+fn rename_rejects_a_version_the_server_did_not_see() {
+    let mut tickets = Counter::new();
+    let (mut client, _, _) = renaming(&mut tickets);
+    assert_eq!(
+        stale(client.receive(reply(2, json!({"documentChanges": [
+            rename_in("file:///a.rs", json!(1)),
+            rename_in("file:///b.rs", json!(8)),
+        ]})))),
+        "file:///b.rs",
+        "the callee's named version is stale",
+    );
+}
+
+/// A file operation refuses the whole rename.
+#[test]
+fn rename_rejects_resource_operations() {
+    let mut tickets = Counter::new();
+    let (mut client, _, _) = renaming(&mut tickets);
+    let result = client.receive(reply(2, json!({"documentChanges": [
+        rename_in("file:///a.rs", json!(1)),
+        {"kind": "create", "uri": "file:///w/n.rs"},
+    ]})));
+    assert!(
+        matches!(&result, Err(Error::Unsupported { operation }) if operation == "create"),
+        "a create is unsupported: {result:?}",
+    );
+}
+
+/// Edits for a file nobody opened come back for the host to apply on disk.
+#[test]
+fn rename_of_an_unopened_document_yields_file_edits() {
+    let mut tickets = Counter::new();
+    let (mut client, caller, _) = renaming(&mut tickets);
+    let output = client
+        .receive(reply(2, json!({"documentChanges": [
+            rename_in("file:///a.rs", json!(1)),
+            rename_in("file:///w/c.rs", json!(null)),
+        ]})))
+        .expect("the rename is accepted");
+    let [Update::Document(document), Update::FileEdits(file_edits)] = output.updates.as_slice()
+    else {
+        panic!("expected a document and a file, got {:?}", output.updates)
+    };
+    assert_eq!(document.doc_id(), caller.doc_id(), "the caller is renamed");
+    assert_eq!(file_edits.uri().as_str(), "file:///w/c.rs", "the unopened file");
+    assert_eq!(
+        file_edits.apply(CALLEE),
+        "fn hail() {}\n",
+        "the file's edits apply to its text"
+    );
+}
+
+/// A rename whose requesting document moved is dropped; the user can ask again.
+#[test]
+fn rename_whose_requester_moved_is_dropped_silently() {
+    let mut tickets = Counter::new();
+    let (mut client, mut caller, _) = renaming(&mut tickets);
+    type_ops(&mut client, &mut caller, vec![EditOp::insert(0, "\n")]);
+    assert_silent(
+        &client
+            .receive(reply(2, json!({"documentChanges": [rename_in("file:///a.rs", json!(1))]})))
+            .expect("a stale reply is not an error"),
+        "the stale rename is dropped",
+    );
+}
+
+/// A `null` result renames nothing.
+#[test]
+fn null_rename_result_changes_nothing() {
+    let mut tickets = Counter::new();
+    let (mut client, _, _) = renaming(&mut tickets);
+    assert_silent(
+        &client
+            .receive(reply(2, json!(null)))
+            .expect("null is accepted"),
+        "nothing to rename",
+    );
+}
+
+/// A user asked for the rename, so a failed or malformed reply is reported.
+#[test]
+fn rename_failures_are_errors() {
+    let mut tickets = Counter::new();
+    let (mut client, caller, _) = renaming(&mut tickets);
+    let error = client
+        .receive(failure(2, -32603))
+        .expect_err("a server error is reported");
+    assert!(
+        matches!(&error, Error::Server { method, .. } if method == "textDocument/rename"),
+        "the error names the method: {error:?}",
+    );
+    let request = RenameRequest::new(tickets.issue(caller.revision()), 10, "hail");
+    let _ = client.rename(&caller.snapshot(), &request);
+    let error = client
+        .receive(reply(3, json!({"documentChanges": "x"})))
+        .expect_err("a malformed edit is reported");
+    assert!(
+        matches!(&error, Error::Decode { method, .. } if method == "textDocument/rename"),
+        "the error names the method: {error:?}",
+    );
+}
+
+/// With no server to ask, or one without a provider, a rename sends nothing and answers nothing.
+#[test]
+fn rename_declines_before_initialize_and_without_a_provider() {
+    let doc = document(CALLER);
+    let (initializing, _) = Client::builder().build();
+    let (without, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
+    for mut client in [initializing, without] {
+        let mut tickets = Counter::new();
+        open_as(&mut client, &doc, "file:///a.rs");
+        let request = RenameRequest::new(tickets.issue(doc.revision()), 10, "hail");
+        assert_silent(
+            &client.rename(&doc.snapshot(), &request),
+            "a declined rename sends nothing",
+        );
+    }
 }

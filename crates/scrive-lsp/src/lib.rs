@@ -9,6 +9,7 @@
 //! - signature help → [`Client::signature_help`]
 //! - hover → [`Client::hover`]
 //! - goto definition → [`Client::definition`]
+//! - rename → [`Client::rename`]
 //! - formatting → [`Client::format`]
 //! - what the client hands back → [`Update`] ([`update`])
 //! - the JSON-RPC envelope → [`message`]

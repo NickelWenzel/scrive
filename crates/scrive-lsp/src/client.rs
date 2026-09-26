@@ -14,14 +14,15 @@ use lsp_types::{
     ApplyWorkspaceEditResponse, ClientInfo, CompletionContext, CompletionParams,
     CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentFormattingParams, FormattingOptions, GotoDefinitionParams, HoverParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
+    DocumentFormattingParams, FormattingOptions, GotoDefinitionParams, HoverParams,
+    InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams, RenameParams,
     SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
     WorkspaceFolder,
 };
 use scrive_core::{
     document, Bias, CompletionRequest, CompletionTrigger, DefinitionRequest, DocId, FormatRequest,
-    HoverRequest, Revision, SignatureRequest, Snapshot, Ticket,
+    HoverRequest, RenameRequest, Revision, SignatureRequest, Snapshot, Ticket,
 };
 use serde_json::Value;
 
@@ -113,6 +114,20 @@ pub enum Error {
         /// The normalized URI.
         uri: uri::Key,
     },
+    /// A rename's edit touches a document that moved since the request, opened or closed since,
+    /// or is not at the version the edit names. None of the rename applies.
+    #[error("the rename's edit for `{uri}` is stale: the document changed since the request")]
+    StaleEdit {
+        /// The stale document.
+        uri: uri::Key,
+    },
+    /// A rename's edit asks for a file operation, which the client does not perform. None of the
+    /// rename applies.
+    #[error("unsupported workspace edit: a `{operation}` file operation")]
+    Unsupported {
+        /// The operation's `kind`: `create`, `rename` or `delete`.
+        operation: String,
+    },
 }
 
 /// The connection lifecycle.
@@ -171,6 +186,7 @@ enum Kind {
     Signature,
     Hover,
     Definition,
+    Rename,
     Format,
 }
 
@@ -182,6 +198,8 @@ enum Query {
     Hover(hover::Query),
     /// The definition of the symbol at `offset`.
     Definition { offset: u32 },
+    /// A rename of the symbol at `offset` to `new_name`.
+    Rename { offset: u32, new_name: String },
     /// Formatting of the whole document at this indent width.
     Format { tab_size: u32 },
 }
@@ -464,6 +482,37 @@ impl Client {
         self.send(doc_id, ticket, query, None)
     }
 
+    /// Asks the server to rename the symbol at the request's offset to its new name. The answer
+    /// is edits: an [`update::Change::Edits`] stamped with the synced revision for each open
+    /// document, and an [`Update::FileEdits`] for each file that is not open. Either the whole
+    /// rename arrives, or `receive` reports why none of it can: [`Error::StaleEdit`] or
+    /// [`Error::Unsupported`]. A reply that arrives after the requesting document moved is
+    /// dropped.
+    ///
+    /// When the server is not running or has no rename provider, nothing is sent. A request from
+    /// a revision other than `snapshot`'s or the last synced one, or for a document that is not
+    /// registered, gets nothing either.
+    pub fn rename(&mut self, snapshot: &Snapshot, request: &RenameRequest) -> Output {
+        let doc_id = snapshot.doc_id();
+        let ticket = request.ticket;
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
+            return Output::default();
+        };
+        if ticket.revision() != snapshot.revision()
+            || snapshot.revision() != tracked.synced.revision()
+        {
+            return Output::default();
+        }
+        if !matches!(&self.state, State::Running(server) if server.rename) {
+            return Output::default();
+        }
+        let query = Query::Rename {
+            offset: request.offset,
+            new_name: request.new_name.clone(),
+        };
+        self.send(doc_id, ticket, query, None)
+    }
+
     /// Asks the server to format the whole document, indenting with spaces. The answer is a
     /// [`update::Change::Edits`] under the request's ticket; a result that changes nothing
     /// answers nothing.
@@ -722,7 +771,10 @@ impl Client {
                 }),
                 Some(entry.latest_ticket),
             ),
-            query @ (Query::Hover(_) | Query::Definition { .. } | Query::Format { .. }) => self.send(
+            query @ (Query::Hover(_)
+            | Query::Definition { .. }
+            | Query::Rename { .. }
+            | Query::Format { .. }) => self.send(
                 entry.doc_id,
                 entry.latest_ticket,
                 query,
@@ -737,6 +789,7 @@ impl Client {
             Query::Signature(query) => Ok(self.signed(entry, query, value)),
             Query::Hover(query) => Ok(self.hovered(entry, query, value)),
             Query::Definition { .. } => self.defined(entry, value),
+            Query::Rename { .. } => self.renamed(entry, value),
             Query::Format { .. } => self.formatted(entry, value),
         }
     }
@@ -862,7 +915,7 @@ impl Client {
             return output;
         };
         let revisions = match query.kind() {
-            Kind::Definition => self
+            Kind::Definition | Kind::Rename => self
                 .tracked
                 .iter()
                 .map(|t| (t.key.clone(), t.synced.revision()))
@@ -1011,6 +1064,62 @@ impl Client {
         )))
     }
 
+    /// The reply's workspace edit as updates, once every document it touches is checked.
+    ///
+    /// # Errors
+    /// [`Error::StaleEdit`] when a touched document is not the text the server edited;
+    /// [`Error::Unsupported`] for a file operation; [`Error::Decode`] for a malformed edit.
+    fn renamed(&self, entry: &Pending, value: Value) -> Result<Output, Error> {
+        let Some(edit) = workspace::Edit::decode(value)? else {
+            return Ok(Output::default());
+        };
+        for file in edit.files() {
+            let recorded = entry.revision_of(file.key());
+            let stale = match self.tracked.iter().find(|t| t.key == *file.key()) {
+                Some(tracked) => {
+                    recorded != Some(tracked.synced.revision())
+                        || file
+                            .version()
+                            .is_some_and(|version| Some(version) != tracked.version)
+                }
+                // Open at the request and closed since: its unsaved text is gone, and the disk
+                // holds something other than what the server edited.
+                None => recorded.is_some(),
+            };
+            if stale {
+                return Err(Error::StaleEdit {
+                    uri: file.key().clone(),
+                });
+            }
+        }
+        let mut output = Output::default();
+        for file in edit.into_files() {
+            let (key, text_edits) = file.into_parts();
+            match self.tracked.iter().find(|t| t.key == key) {
+                Some(tracked) => {
+                    let ops = edits::hygiene(
+                        edits::Text::Snapshot(&tracked.synced),
+                        self.encoding,
+                        &text_edits,
+                    );
+                    if !ops.is_empty() {
+                        output.updates.push(Update::Document(update::Document::new(
+                            tracked.doc_id,
+                            update::Stamp::Revision(tracked.synced.revision()),
+                            update::Change::Edits(ops),
+                        )));
+                    }
+                }
+                None => output.updates.push(Update::FileEdits(update::FileEdits::new(
+                    key,
+                    text_edits,
+                    self.encoding,
+                ))),
+            }
+        }
+        Ok(output)
+    }
+
     /// Answers the ticket with the reply's edits, converted against the request's text, which
     /// is still the synced text once `settled` let the reply through.
     ///
@@ -1020,7 +1129,7 @@ impl Client {
         let text_edits: Option<Vec<lsp_types::TextEdit>> =
             decode(entry.query.method(), Some(value))?;
         let ops = edits::hygiene(
-            &entry.request_snapshot,
+            edits::Text::Snapshot(&entry.request_snapshot),
             self.encoding,
             &text_edits.unwrap_or_default(),
         );
@@ -1229,7 +1338,9 @@ impl Pending {
                 Output::answer(self.doc_id, self.latest_ticket, update::Change::Hover(None))
             }
             // `settled` reports command failures as errors before they get here.
-            Query::Definition { .. } | Query::Format { .. } => Output::default(),
+            Query::Definition { .. } | Query::Rename { .. } | Query::Format { .. } => {
+                Output::default()
+            }
         }
     }
 
@@ -1247,7 +1358,7 @@ impl Kind {
     fn is_command(self) -> bool {
         match self {
             Kind::Completion | Kind::Signature | Kind::Hover => false,
-            Kind::Definition | Kind::Format => true,
+            Kind::Definition | Kind::Rename | Kind::Format => true,
         }
     }
 }
@@ -1259,6 +1370,7 @@ impl Query {
             Query::Signature(_) => Kind::Signature,
             Query::Hover(_) => Kind::Hover,
             Query::Definition { .. } => Kind::Definition,
+            Query::Rename { .. } => Kind::Rename,
             Query::Format { .. } => Kind::Format,
         }
     }
@@ -1271,6 +1383,7 @@ impl Query {
             Query::Signature(_) => lsp_types::request::SignatureHelpRequest::METHOD,
             Query::Hover(_) => lsp_types::request::HoverRequest::METHOD,
             Query::Definition { .. } => lsp_types::request::GotoDefinition::METHOD,
+            Query::Rename { .. } => lsp_types::request::Rename::METHOD,
             Query::Format { .. } => lsp_types::request::Formatting::METHOD,
         }
     }
@@ -1281,7 +1394,7 @@ impl Query {
             Query::Completion(query) => query.word.end,
             Query::Signature(query) => query.caret,
             Query::Hover(query) => query.offset,
-            Query::Definition { offset } => *offset,
+            Query::Definition { offset } | Query::Rename { offset, .. } => *offset,
             // Formatting covers the whole document and asks at no caret.
             Query::Format { .. } => 0,
         }
@@ -1341,6 +1454,19 @@ impl Query {
                         },
                         work_done_progress_params: Default::default(),
                         partial_result_params: Default::default(),
+                    },
+                )
+            }
+            Query::Rename { offset, new_name } => {
+                message::Request::new::<lsp_types::request::Rename>(
+                    id,
+                    RenameParams {
+                        text_document_position: TextDocumentPositionParams {
+                            text_document: TextDocumentIdentifier { uri: uri.clone() },
+                            position: encoding.position(snapshot, *offset),
+                        },
+                        new_name: new_name.clone(),
+                        work_done_progress_params: Default::default(),
                     },
                 )
             }

@@ -2,11 +2,12 @@
 
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
-    DocumentFormattingClientCapabilities, GeneralClientCapabilities, GotoCapability, HoverClientCapabilities, HoverProviderCapability, MarkupKind, OneOf,
-    ParameterInformationSettings, PublishDiagnosticsClientCapabilities, ServerCapabilities,
-    SignatureHelpClientCapabilities, SignatureInformationSettings, TextDocumentClientCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
-    WorkspaceClientCapabilities,
+    DocumentFormattingClientCapabilities, FailureHandlingKind, GeneralClientCapabilities,
+    GotoCapability, HoverClientCapabilities, HoverProviderCapability, MarkupKind, OneOf,
+    ParameterInformationSettings, PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
+    ServerCapabilities, SignatureHelpClientCapabilities, SignatureInformationSettings,
+    TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
+    TextDocumentSyncKind, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
 };
 
 use crate::Encoding;
@@ -26,6 +27,8 @@ pub(crate) struct Server {
     pub(crate) hover: bool,
     /// Whether the server answers `textDocument/definition`.
     pub(crate) definition: bool,
+    /// Whether the server answers `textDocument/rename`.
+    pub(crate) rename: bool,
     /// Whether the server answers `textDocument/formatting`.
     pub(crate) formatting: bool,
 }
@@ -61,6 +64,10 @@ impl Server {
                 capabilities.definition_provider,
                 Some(OneOf::Left(true) | OneOf::Right(_))
             ),
+            rename: matches!(
+                capabilities.rename_provider,
+                Some(OneOf::Left(true) | OneOf::Right(_))
+            ),
             formatting: matches!(
                 capabilities.document_formatting_provider,
                 Some(OneOf::Left(true) | OneOf::Right(_))
@@ -75,6 +82,13 @@ pub(crate) fn client() -> ClientCapabilities {
         workspace: Some(WorkspaceClientCapabilities {
             configuration: Some(true),
             workspace_folders: Some(true),
+            // Versioned edits let a rename refuse documents that moved. No resource operations:
+            // an edit that creates, renames or deletes a file is refused whole.
+            workspace_edit: Some(WorkspaceEditClientCapabilities {
+                document_changes: Some(true),
+                failure_handling: Some(FailureHandlingKind::Transactional),
+                ..WorkspaceEditClientCapabilities::default()
+            }),
             ..WorkspaceClientCapabilities::default()
         }),
         text_document: Some(TextDocumentClientCapabilities {
@@ -113,6 +127,8 @@ pub(crate) fn client() -> ClientCapabilities {
                 link_support: Some(true),
                 ..GotoCapability::default()
             }),
+            // Without `prepareSupport`: the editor asks for the new name itself.
+            rename: Some(RenameClientCapabilities::default()),
             formatting: Some(DocumentFormattingClientCapabilities::default()),
             ..TextDocumentClientCapabilities::default()
         }),

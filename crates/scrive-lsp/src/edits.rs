@@ -6,6 +6,7 @@
 //! when it replaces the whole document, trimmed to what changes on char boundaries, stripped of
 //! no-ops and sorted.
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use scrive_core::{EditOp, Point, Snapshot};
@@ -17,26 +18,60 @@ use crate::Encoding;
 /// `O((N + M) · MAX_D)`.
 const MAX_D: usize = 1000;
 
-/// `edits` as one hygienic batch against `snapshot`.
+/// The text edits convert against: an open document's snapshot, or a file's LF text.
+pub(crate) enum Text<'a> {
+    Snapshot(&'a Snapshot),
+    Str(&'a str),
+}
+
+impl Text<'_> {
+    fn span(&self, encoding: Encoding, range: lsp_types::Range) -> Range<u32> {
+        match self {
+            Text::Snapshot(snapshot) => encoding.span(snapshot, range),
+            Text::Str(text) => {
+                let span = encoding.text_span(text, range);
+                span.start as u32..span.end as u32
+            }
+        }
+    }
+
+    /// The text in `range`, which must lie on char boundaries.
+    fn slice(&self, range: Range<u32>) -> Cow<'_, str> {
+        match self {
+            Text::Snapshot(snapshot) => snapshot.slice(range),
+            Text::Str(text) => Cow::Borrowed(&text[range.start as usize..range.end as usize]),
+        }
+    }
+
+    fn last_line_start(&self) -> u32 {
+        match self {
+            Text::Snapshot(snapshot) => {
+                snapshot.point_to_offset(Point::new(snapshot.line_count() - 1, 0))
+            }
+            Text::Str(text) => text.rfind('\n').map_or(0, |at| at as u32 + 1),
+        }
+    }
+}
+
+/// `edits` as one hygienic batch against `text`.
 pub(crate) fn hygiene(
-    snapshot: &Snapshot,
+    text: Text<'_>,
     encoding: Encoding,
     edits: &[lsp_types::TextEdit],
 ) -> Vec<EditOp> {
     let mut ops: Vec<EditOp> = edits
         .iter()
-        .map(|edit| EditOp::new(encoding.span(snapshot, edit.range), lf(&edit.new_text)))
+        .map(|edit| EditOp::new(text.span(encoding, edit.range), lf(&edit.new_text)))
         .collect();
-    let last_line_start = snapshot.point_to_offset(Point::new(snapshot.line_count() - 1, 0));
     // Formatters answer with one edit over `0:0 → N:0` or `0:0 → last:len`.
     if let [op] = ops.as_slice() {
-        if op.range.start == 0 && op.range.end >= last_line_start {
-            ops = line_diff(&snapshot.slice(op.range.clone()), &op.text);
+        if op.range.start == 0 && op.range.end >= text.last_line_start() {
+            ops = line_diff(&text.slice(op.range.clone()), &op.text);
         }
     }
     let mut ops: Vec<EditOp> = ops
         .into_iter()
-        .map(|op| trim(&snapshot.slice(op.range.clone()), op))
+        .map(|op| trim(&text.slice(op.range.clone()), op))
         .filter(|op| !(op.range.is_empty() && op.text.is_empty()))
         .collect();
     // Stable, so tied inserts keep the server's order. After the trim, which moves starts.
@@ -45,7 +80,7 @@ pub(crate) fn hygiene(
 }
 
 /// `text` with `\r\n` and lone `\r` as `\n`, the buffer's only line break.
-fn lf(text: &str) -> String {
+pub(crate) fn lf(text: &str) -> String {
     if text.contains('\r') {
         text.replace("\r\n", "\n").replace('\r', "\n")
     } else {
@@ -222,13 +257,8 @@ fn hunks(rows: &[Vec<usize>], n: usize, m: usize) -> Vec<Hunk> {
 #[cfg(test)]
 mod tests {
     use lsp_types::{Position, TextEdit};
-    use scrive_core::Document;
 
     use super::*;
-
-    fn snapshot(text: &str) -> Snapshot {
-        Document::new(text).expect("fixture loads").snapshot()
-    }
 
     fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> TextEdit {
         TextEdit::new(
@@ -251,7 +281,7 @@ mod tests {
     fn format_edit_replacing_e_acute_with_e_grave_trims_to_one_char() {
         assert_eq!(
             hygiene(
-                &snapshot("café\n"),
+                Text::Str("café\n"),
                 Encoding::Utf16,
                 &[edit((0, 0), (0, 4), "cafè")]
             ),
@@ -260,7 +290,7 @@ mod tests {
         );
         assert_eq!(
             hygiene(
-                &snapshot("café\n"),
+                Text::Str("café\n"),
                 Encoding::Utf16,
                 &[edit((0, 3), (0, 4), "è")]
             ),
@@ -274,7 +304,7 @@ mod tests {
     fn descending_edit_batch_is_sorted_by_start_then_end() {
         assert_eq!(
             hygiene(
-                &snapshot("a\nb\nc\n"),
+                Text::Str("a\nb\nc\n"),
                 Encoding::Utf8,
                 &[edit((2, 0), (2, 1), "C"), edit((0, 0), (0, 1), "A")],
             ),
@@ -283,7 +313,7 @@ mod tests {
         );
         assert_eq!(
             hygiene(
-                &snapshot("ab"),
+                Text::Str("ab"),
                 Encoding::Utf8,
                 &[edit((0, 1), (0, 2), "Z"), edit((0, 1), (0, 1), "X")],
             ),
@@ -297,7 +327,7 @@ mod tests {
     fn tied_inserts_keep_the_servers_order() {
         assert_eq!(
             hygiene(
-                &snapshot("abc\n"),
+                Text::Str("abc\n"),
                 Encoding::Utf8,
                 &[edit((0, 1), (0, 1), "X"), edit((0, 1), (0, 1), "Y")],
             ),
@@ -311,7 +341,7 @@ mod tests {
     fn crlf_and_lone_cr_in_new_text_become_lf() {
         assert_eq!(
             hygiene(
-                &snapshot("x\n"),
+                Text::Str("x\n"),
                 Encoding::Utf8,
                 &[edit((0, 1), (0, 1), "\r\ny\r\n")]
             ),
@@ -320,7 +350,7 @@ mod tests {
         );
         assert_eq!(
             hygiene(
-                &snapshot("ab"),
+                Text::Str("ab"),
                 Encoding::Utf8,
                 &[edit((0, 0), (0, 2), "a\rb")]
             ),
@@ -332,21 +362,29 @@ mod tests {
     /// A formatter's whole-document replacement lands as the lines that changed, each trimmed.
     #[test]
     fn whole_document_edit_becomes_per_line_hunks() {
-        let doc = snapshot("a  \nb\nc  \n");
+        let doc = "a  \nb\nc  \n";
         let expected = vec![EditOp::new(1..3, ""), EditOp::new(7..9, "")];
         assert_eq!(
-            hygiene(&doc, Encoding::Utf8, &[edit((0, 0), (3, 0), "a\nb\nc\n")]),
+            hygiene(
+                Text::Str(doc),
+                Encoding::Utf8,
+                &[edit((0, 0), (3, 0), "a\nb\nc\n")]
+            ),
             expected,
             "only the trailing blanks go",
         );
         assert_eq!(
-            hygiene(&doc, Encoding::Utf8, &[edit((0, 0), (99, 0), "a\nb\nc\n")]),
+            hygiene(
+                Text::Str(doc),
+                Encoding::Utf8,
+                &[edit((0, 0), (99, 0), "a\nb\nc\n")]
+            ),
             expected,
             "an end past the last line clamps to the document end",
         );
         assert_eq!(
             hygiene(
-                &snapshot("a\nb\n"),
+                Text::Str("a\nb\n"),
                 Encoding::Utf8,
                 &[edit((0, 0), (0, 1), "A")]
             ),
@@ -361,7 +399,7 @@ mod tests {
         let old: String = (0..1100).map(|i| format!("o{i}\n")).collect();
         let new: String = (0..1100).map(|i| format!("n{i}\n")).collect();
         let ops = hygiene(
-            &snapshot(&old),
+            Text::Str(&old),
             Encoding::Utf8,
             &[edit((0, 0), (1100, 0), &new)],
         );
@@ -377,7 +415,7 @@ mod tests {
             })
             .collect();
         let ops = hygiene(
-            &snapshot(&old),
+            Text::Str(&old),
             Encoding::Utf8,
             &[edit((0, 0), (1100, 0), &partly)],
         );
@@ -433,7 +471,7 @@ mod tests {
     fn edit_that_changes_nothing_is_dropped() {
         assert_eq!(
             hygiene(
-                &snapshot("abc"),
+                Text::Str("abc"),
                 Encoding::Utf8,
                 &[edit((0, 0), (0, 3), "abc")]
             ),
