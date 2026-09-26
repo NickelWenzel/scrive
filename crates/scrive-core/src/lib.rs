@@ -79,9 +79,9 @@ pub use highlight::{
     TokenTheme,
 };
 pub use history::{GroupingHint, OpClass};
-pub use intel::completion::{CompletionController, CompletionState, PopupList};
-pub use intel::hover::{Hover, HoverCx, HoverInfo, HOVER_IDLE_DELAY_MS};
-pub use intel::signature::{SignatureCx, SignatureHelp, SignatureInfo};
+pub use intel::completion::{CompletionController, CompletionRequest, CompletionState, PopupList};
+pub use intel::hover::{Hover, HoverCx, HoverInfo, HoverRequest, HOVER_IDLE_DELAY_MS};
+pub use intel::signature::{SignatureCx, SignatureHelp, SignatureInfo, SignatureRequest};
 pub use intel::snippet::{CaretOutcome, Snippet, SnippetError, SnippetSession, TabOutcome, TabStop};
 pub use intel::ticket::Ticket;
 pub use intel::providers::{

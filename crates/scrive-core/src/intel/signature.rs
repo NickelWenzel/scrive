@@ -3,13 +3,13 @@
 //! (the app re-runs it on `(` / `,` / edits and shows or hides the one-line box
 //! from the reply), so unlike completion there is no sticky state machine.
 //!
-//! Synchronous by contract, same rationale as `Completions`: the query is
-//! an `enclosingCall` + active-parameter count over a few lines of lookback —
-//! microseconds — so the widget calls it and renders the reply the same frame,
-//! with no reply envelope to go stale.
+//! A provider answers synchronously, the same frame. With no provider set, the
+//! editor records a [`SignatureRequest`] instead; its reply lands only under
+//! the request's ticket, so an answer for a call the caret has left is dropped.
 
 use core::ops::Range;
 
+use crate::intel::ticket::Ticket;
 use crate::{DocId, Point};
 
 /// The signature-help seam.
@@ -55,5 +55,36 @@ impl SignatureInfo {
     #[must_use]
     pub fn active_param(&self) -> Option<Range<u32>> {
         self.params.get(self.active as usize).cloned()
+    }
+}
+
+/// A signature-help request an editor records for an async source when no
+/// synchronous [`SignatureHelp`] provider is set. Answer it through the
+/// editor's `set_signature` with [`ticket`](Self::ticket); `None` closes the
+/// box.
+#[derive(Clone, Debug)]
+pub struct SignatureRequest {
+    ticket: Ticket,
+    position: Point,
+}
+
+impl SignatureRequest {
+    /// A request for signature help at `position` (the caret), made under
+    /// `ticket`.
+    #[must_use]
+    pub fn new(ticket: Ticket, position: Point) -> Self {
+        Self { ticket, position }
+    }
+
+    /// The ticket the reply must carry.
+    #[must_use]
+    pub fn ticket(&self) -> Ticket {
+        self.ticket
+    }
+
+    /// The caret position (row, byte column) to query at.
+    #[must_use]
+    pub fn position(&self) -> Point {
+        self.position
     }
 }

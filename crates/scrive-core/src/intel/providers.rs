@@ -47,11 +47,11 @@ pub struct CompletionCx {
     pub trigger: CompletionTrigger,
 }
 
-/// The completion seam. **Synchronous by contract** (see the module docs): the
-/// widget calls `complete()` in `update()` and opens/refreshes the popup from
-/// the returned `Vec` the same frame — no async reply, no revision guard. A
-/// genuinely slow provider would motivate an async variant of the seam; the
-/// synchronous contract holds until one is needed.
+/// The synchronous completion seam: the editor calls `complete()` in
+/// `update()` and opens or refreshes the popup from the returned `Vec` the same
+/// frame. A source that can't answer that fast doesn't implement this; it
+/// answers the editor's
+/// [`CompletionRequest`](crate::intel::completion::CompletionRequest) instead.
 pub trait Completions {
     /// Produce the completion items for `cx`. Called synchronously in the
     /// widget's `update()`; an empty `Vec` closes the popup.

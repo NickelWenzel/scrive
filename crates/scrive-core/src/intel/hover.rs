@@ -1,12 +1,12 @@
-//! Hover — the [`Hover`] trait the app satisfies plus the plain data it
-//! returns. Like the other language services it is **synchronous by contract**:
-//! a hover query is an in-memory lookup keyed by the word under the pointer,
-//! so the widget calls it on the mouse-idle tick and renders the reply the same
-//! frame. Because the answer is produced synchronously there is no reply
-//! envelope and nothing in flight, so a reply can never arrive stale.
+//! Hover — the [`Hover`] trait the app satisfies, the plain data it returns,
+//! and the [`HoverRequest`] an editor records when no provider is set. A
+//! provider answers on the mouse-idle tick and the card shows the same frame.
+//! An async answer lands only under the request's ticket, so a card for a word
+//! the pointer has left, or for text that has changed, is dropped.
 
 use core::ops::Range;
 
+use crate::intel::ticket::Ticket;
 use crate::{DocId, Point};
 
 /// Mouse-idle delay before a hover query fires, in milliseconds. Tuned to the
@@ -49,4 +49,27 @@ pub struct HoverInfo {
     /// The word range the doc describes — the popup anchors here and the widget
     /// re-tests pointer containment against it for dismissal.
     pub range: Range<u32>,
+}
+
+/// A hover request an editor records for an async source when no synchronous
+/// [`Hover`] provider is set. Answer it through the editor's `set_hover` with
+/// `ticket`; `None` means no docs. A card of the diagnostics under the pointer
+/// shows until the answer replaces it.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct HoverRequest {
+    /// The ticket the reply must carry.
+    pub ticket: Ticket,
+    /// The byte offset the pointer rested over.
+    pub offset: u32,
+    /// The word under the pointer (never empty: an empty word asks nothing).
+    pub word: Range<u32>,
+}
+
+impl HoverRequest {
+    /// A request for docs on `word`, asked at `offset` under `ticket`.
+    #[must_use]
+    pub fn new(ticket: Ticket, offset: u32, word: Range<u32>) -> Self {
+        Self { ticket, offset, word }
+    }
 }

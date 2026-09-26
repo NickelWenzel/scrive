@@ -37,17 +37,23 @@ use iced::widget::{button, column, container, row, stack, text, text_input};
 use iced::time::Instant;
 use iced::{Alignment, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, Vector};
 
+use scrive_core::intel::completion::Start;
+use scrive_core::intel::ticket;
 use scrive_core::{
     default_indent_size, is_completion_word_char, CompletionController, CompletionCx, CompletionItem,
     CompletionState, CompletionTrigger, Completions, Diagnostic, DiagnosticsOutcome, Document, EditOp,
     FindQuery, Hover,
     HoverCx, HoverInfo, InsertText, Point, Revision, Selection, SelectionId, SelectionSet, Severity,
-    SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, SyntaxDef, TabOutcome,
+    SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, SyntaxDef, TabOutcome, Ticket,
     TokenTheme, LOOKBACK_LINES,
 };
 
 use crate::editor::{Action, Editor};
 use crate::highlight_pool::{HighlightPool, PARALLEL_MIN_BYTES};
+
+/// The async request types a host pulls from a [`CodeEditor`]. They live in
+/// scrive-core so a language-service client can use them without iced.
+pub use scrive_core::{CompletionRequest, HoverRequest, SignatureRequest};
 
 /// The default widget id the editor is addressable by (focus / future
 /// multi-pane). Overridable with [`CodeEditor::id`].
@@ -197,15 +203,21 @@ pub struct CodeEditor {
     /// The hover provider and the open hover popup.
     hover_provider: Option<Box<dyn Hover>>,
     hover: Option<HoverInfo>,
-    /// A pending async completion request (recorded when the drive loop would
-    /// query completions but no synchronous provider is set), for the host to
-    /// pull via [`take_completion_request`](CodeEditor::take_completion_request).
+    /// A pending async completion request (recorded, with its ticket in
+    /// `awaiting`, when the drive loop would query completions but no
+    /// synchronous provider is set), for the host to pull via
+    /// [`take_completion_request`](CodeEditor::take_completion_request).
     pending_completion_request: Option<CompletionRequest>,
     /// A pending async signature-help request (same pattern as completions).
     pending_signature_request: Option<SignatureRequest>,
     /// A pending async hover request (same pattern), recorded when the pointer
     /// rested over a word and no synchronous hover provider is set.
     pending_hover_request: Option<HoverRequest>,
+    /// Mints the ticket every async request carries. Per editor, so two
+    /// requests at one revision still differ.
+    tickets: ticket::Counter,
+    /// The ticket each async service's reply must carry to land.
+    awaiting: Awaiting,
     /// The off-thread parallel highlight sweep — `Some` for a large document
     /// (see [`uses_pool`](Self::uses_pool)), `None` otherwise (the synchronous path). Owned
     /// here so a batteries-included host gets large-document highlighting for free.
@@ -224,48 +236,24 @@ enum CompletionEvent {
     CaretOrClose,
 }
 
-/// A request for completions the host fulfills asynchronously (off-thread or via
-/// a language server). The editor emits one where it would call a synchronous
-/// provider but none is set; the host pulls it with
-/// [`CodeEditor::take_completion_request`], runs its query, and returns the
-/// result through [`CodeEditor::set_completions`] stamped with `revision`.
-#[non_exhaustive]
-#[derive(Clone, Debug)]
-pub struct CompletionRequest {
-    /// The revision the request was made at — pass it back to `set_completions`
-    /// so a result computed against a stale snapshot is dropped.
-    pub revision: Revision,
-    /// The caret position (row, col) to query completions at.
-    pub position: Point,
+/// The ticket each async service's reply must carry. A slot is set when a
+/// request is recorded and cleared when the user abandons it;
+/// [`CodeEditor::accepts`] reads it.
+#[derive(Default)]
+struct Awaiting {
+    completion: Option<Ticket>,
+    signature: Option<Ticket>,
+    /// The hover ticket, plus the pointer offset and word it asked about: the
+    /// word keeps a pointer move inside it from cancelling the request.
+    hover: Option<(Ticket, u32, Range<u32>)>,
 }
 
-/// A request for signature help the host fulfills asynchronously. Emitted where
-/// the editor would call a synchronous [`SignatureHelp`] provider but none is
-/// set; the host pulls it with
-/// [`CodeEditor::take_signature_request`], queries, and returns the result (or
-/// `None` to close the box) through [`CodeEditor::set_signature`].
-#[non_exhaustive]
-#[derive(Clone, Debug)]
-pub struct SignatureRequest {
-    /// The revision the request was made at — pass it back to `set_signature`.
-    pub revision: Revision,
-    /// The caret position (row, col) to query signature help at.
-    pub position: Point,
-}
-
-/// A request for hover documentation the host fulfills asynchronously. Emitted
-/// where the editor would call a synchronous [`Hover`] provider but none is set;
-/// the host pulls it with [`CodeEditor::take_hover_request`], queries, and
-/// returns the card (or `None`) through [`CodeEditor::set_hover`]. Diagnostics at
-/// the point are shown synchronously regardless; a host that wants them in the
-/// async card can read them from [`CodeEditor::document`] and include them.
-#[non_exhaustive]
-#[derive(Clone, Debug)]
-pub struct HoverRequest {
-    /// The revision the request was made at — pass it back to `set_hover`.
-    pub revision: Revision,
-    /// The byte offset the pointer rested over.
-    pub offset: u32,
+/// Which awaited slot an `accepts` / `abandon` call addresses.
+#[derive(Clone, Copy)]
+enum Awaited {
+    Completion,
+    Signature,
+    Hover,
 }
 
 impl CodeEditor {
@@ -312,6 +300,8 @@ impl CodeEditor {
             pending_completion_request: None,
             pending_signature_request: None,
             pending_hover_request: None,
+            tickets: ticket::Counter::new(),
+            awaiting: Awaiting::default(),
             hl_pool: None,
         }
     }
@@ -526,22 +516,24 @@ impl CodeEditor {
     /// Take the pending async completion request, if any. A host with an
     /// off-thread / language-server provider (rather than a synchronous
     /// [`completions`](CodeEditor::completions) one) polls this after `update`,
-    /// runs its query at the request's position and revision, and returns the
-    /// result through [`set_completions`](CodeEditor::set_completions).
+    /// runs its query, and returns the result through
+    /// [`set_completions`](CodeEditor::set_completions) with the request's
+    /// ticket.
     pub fn take_completion_request(&mut self) -> Option<CompletionRequest> {
         self.pending_completion_request.take()
     }
 
-    /// Ingest completion items from an async provider, stamped by `revision`.
-    /// Strict staleness: if the buffer has moved since the request the items are
-    /// dropped (the host re-requests on the next edit). On a current revision they
-    /// open/refilter the popup against the *live* word — including snippet-format
-    /// items ([`InsertText::Snippet`](scrive_core::InsertText)), which expand into
-    /// an interactive tab-stop session on accept exactly like a synchronous
-    /// provider's.
-    pub fn set_completions(&mut self, revision: Revision, items: Vec<CompletionItem>) {
-        if revision != self.doc.revision() {
-            return; // stale — the host re-requests on the next edit
+    /// Ingest completion items from an async source, stamped with the
+    /// request's `ticket`. The items land only if the editor still awaits that
+    /// ticket and the document has not moved since; otherwise they are dropped
+    /// (a newer request, or none, is in charge). Landed items open or refilter
+    /// the popup against the *live* word, and snippet-format items
+    /// ([`InsertText::Snippet`](scrive_core::InsertText)) expand into a tab-stop
+    /// session on accept exactly like a synchronous provider's. An empty list
+    /// closes the popup; an Escape dismissal keeps it closed.
+    pub fn set_completions(&mut self, ticket: Ticket, items: Vec<CompletionItem>) {
+        if !self.accepts(Awaited::Completion, ticket) {
+            return;
         }
         let word = self.completion_word_text();
         let anchor = self.completion_word().start;
@@ -550,32 +542,46 @@ impl CodeEditor {
 
     /// Take the pending async signature-help request, if any — the signature
     /// twin of [`take_completion_request`](CodeEditor::take_completion_request).
+    /// Answer it through [`set_signature`](CodeEditor::set_signature) with the
+    /// request's ticket.
     pub fn take_signature_request(&mut self) -> Option<SignatureRequest> {
         self.pending_signature_request.take()
     }
 
-    /// Ingest a signature-help result from an async provider, stamped by
-    /// `revision` (strict staleness). `None` closes the box. Current-revision
-    /// results replace the shown signature.
-    pub fn set_signature(&mut self, revision: Revision, info: Option<SignatureInfo>) {
-        if revision == self.doc.revision() {
-            self.signature = info;
+    /// Ingest a signature-help result from an async source, stamped with the
+    /// request's `ticket` (see [`set_completions`](Self::set_completions) for
+    /// when it lands). `None` closes the box and stops re-querying.
+    pub fn set_signature(&mut self, ticket: Ticket, info: Option<SignatureInfo>) {
+        if !self.accepts(Awaited::Signature, ticket) {
+            return;
         }
+        if info.is_none() {
+            self.abandon(Awaited::Signature);
+        }
+        self.signature = info;
     }
 
     /// Take the pending async hover request, if any — the hover twin of
     /// [`take_completion_request`](CodeEditor::take_completion_request).
+    /// Answer it through [`set_hover`](CodeEditor::set_hover) with the
+    /// request's ticket.
     pub fn take_hover_request(&mut self) -> Option<HoverRequest> {
         self.pending_hover_request.take()
     }
 
-    /// Ingest a hover card from an async provider, stamped by `revision` (strict
-    /// staleness). Replaces the shown card (the host builds it, and may fold in
-    /// diagnostics read from [`document`](CodeEditor::document)); `None` clears it.
-    pub fn set_hover(&mut self, revision: Revision, info: Option<HoverInfo>) {
-        if revision == self.doc.revision() {
-            self.hover = info;
+    /// Ingest a hover card from an async source, stamped with the request's
+    /// `ticket` (see [`set_completions`](Self::set_completions) for when it
+    /// lands). Replaces the shown card (the host builds it, and may fold in
+    /// diagnostics read from [`document`](CodeEditor::document)); `None` clears
+    /// it.
+    pub fn set_hover(&mut self, ticket: Ticket, info: Option<HoverInfo>) {
+        if !self.accepts(Awaited::Hover, ticket) {
+            return;
         }
+        if info.is_none() {
+            self.abandon(Awaited::Hover);
+        }
+        self.hover = info;
     }
 
     /// Enable or disable the per-commit change log, for a host mirroring
@@ -629,7 +635,8 @@ impl CodeEditor {
                 } else {
                     self.doc.tokenize_highlight(rows.end);
                 }
-                self.hover = None; // scroll closes the hover
+                self.hover = None; // scroll closes the hover…
+                self.abandon(Awaited::Hover); // …and retires a pending one
                 Task::none()
             }
             // Escape with the bar open closes the BAR and keeps the selections
@@ -637,6 +644,15 @@ impl CodeEditor {
             // press; the input-focused one arrives as `CloseFind` via the chord.
             Event::Editor(Action::Collapse) if self.find_open => {
                 self.close_find();
+                Task::none()
+            }
+            // Escape with no popup or box showing (the widget sends those as
+            // PopupDismiss / SignatureClose) still retires an in-flight
+            // signature request, before the post-edit tail would re-query it.
+            Event::Editor(Action::Collapse) => {
+                self.signature = None;
+                self.abandon(Awaited::Signature);
+                self.apply(Action::Collapse);
                 Task::none()
             }
             // Folds are view state (no text change, no undo step, no rehighlight);
@@ -661,6 +677,7 @@ impl CodeEditor {
             }
             Event::Editor(Action::PopupDismiss) => {
                 self.completion.escape();
+                self.abandon(Awaited::Completion);
                 Task::none()
             }
             Event::Editor(Action::PopupAccept) => {
@@ -689,6 +706,7 @@ impl CodeEditor {
             }
             Event::Editor(Action::SignatureClose) => {
                 self.signature = None;
+                self.abandon(Awaited::Signature);
                 Task::none()
             }
             // Hover: the pointer rested over `offset` — diagnostics first (their
@@ -718,13 +736,19 @@ impl CodeEditor {
                 // host can supply docs; the diagnostics-only card (if any) shows
                 // meanwhile and `set_hover` replaces it when the docs arrive.
                 if self.hover_provider.is_none() && cx.word.start != cx.word.end {
-                    self.pending_hover_request =
-                        Some(HoverRequest { revision: self.doc.revision(), offset });
+                    let ticket = self.tickets.issue(self.doc.revision());
+                    self.awaiting.hover = Some((ticket, offset, cx.word.clone()));
+                    self.pending_hover_request = Some(HoverRequest::new(ticket, offset, cx.word.clone()));
+                } else {
+                    // Nothing asked here, so a late reply to an earlier query
+                    // would be for a spot the pointer has left.
+                    self.abandon(Awaited::Hover);
                 }
                 Task::none()
             }
             Event::Editor(Action::HoverDismiss) => {
                 self.hover = None;
+                self.abandon(Awaited::Hover);
                 Task::none()
             }
             Event::Editor(action) => {
@@ -926,6 +950,15 @@ impl CodeEditor {
             .snippet_active(self.snippet.is_some())
             .signature(self.signature.as_ref())
             .hover(self.hover.as_ref())
+            // A request the document has moved past can no longer land, so it
+            // must not stop the pointer from re-arming a fresh one.
+            .hover_pending(
+                self.awaiting
+                    .hover
+                    .as_ref()
+                    .filter(|(ticket, ..)| ticket.revision() == self.doc.revision())
+                    .map(|(_, _, word)| word.clone()),
+            )
             .font(self.font)
             .text_size(self.text_size)
             .id(self.id.clone());
@@ -1344,6 +1377,11 @@ impl CodeEditor {
         self.drive_signature(comp_event);
         self.reconcile_snippet();
         self.hover = None;
+        // A caret jump abandons a pending hover. Typing keeps it: its reply is
+        // then dropped by revision, and the pointer re-arm asks again.
+        if matches!(comp_event, CompletionEvent::CaretOrClose) {
+            self.abandon(Awaited::Hover);
+        }
         // `dirty` is set by the callers on an actual text change (a bare caret
         // move runs the tail but must not dirty the document — see `apply`).
     }
@@ -1361,51 +1399,70 @@ impl CodeEditor {
                     CompletionTrigger::TriggerChar(c)
                 } else {
                     self.completion.on_boundary();
-                    self.pending_completion_request = None;
+                    self.abandon(Awaited::Completion);
                     return;
                 };
                 self.request_completions(trigger);
             }
+            // A deletion re-asks while a list is showing or on its way, so the
+            // answer tracks the shorter word; emptying the word ends it.
             CompletionEvent::Deleting => {
-                if self.completion.is_open() {
+                if self.completion.is_open() || self.awaiting.completion.is_some() {
                     let word = self.completion_word_text();
                     match word.chars().last() {
                         Some(c) => self.request_completions(CompletionTrigger::Typed(c)),
                         None => {
                             self.completion.close();
-                            self.pending_completion_request = None;
+                            self.abandon(Awaited::Completion);
                         }
                     }
                 }
             }
             CompletionEvent::CaretOrClose => {
                 self.completion.close();
-                self.pending_completion_request = None;
+                self.abandon(Awaited::Completion);
             }
         }
     }
 
     /// Query completions for `trigger`: a synchronous provider fills the popup
-    /// inline; with none set, record an async [`CompletionRequest`] the host
-    /// fulfills via [`take_completion_request`](Self::take_completion_request) +
-    /// [`set_completions`](Self::set_completions). No-op if neither is wired (the
-    /// request is recorded regardless, but a host that never polls it just drops
-    /// it — cheap).
+    /// inline; with none set, record an async [`CompletionRequest`] under a
+    /// fresh ticket for the host to pull via
+    /// [`take_completion_request`](Self::take_completion_request) and answer
+    /// through [`set_completions`](Self::set_completions). The async path keeps
+    /// the provider path's behavior: an Escape-dismissed word asks for nothing,
+    /// an open popup narrows immediately, and a trigger char or manual invoke
+    /// overrides the dismissal.
     fn request_completions(&mut self, trigger: CompletionTrigger) {
         // Take the provider out so `self` is free for `build_cx`, then restore it
         // (avoids an is_some/unwrap dance and the whole-self borrow conflict).
         let Some(mut provider) = self.comp_provider.take() else {
-            // No synchronous provider: record an async request for the host. A
-            // trigger char or manual invoke overrides an Escape dismissal, as it
-            // does for a provider, so its reply may open the popup.
-            if !matches!(trigger, CompletionTrigger::Typed(_)) {
-                self.completion.on_boundary();
+            // Sampled before the refilter below can close the popup.
+            let start = if self.completion.is_open() || self.awaiting.completion.is_some() {
+                Start::Continuing
+            } else {
+                Start::Fresh
+            };
+            match trigger {
+                CompletionTrigger::Typed(_) => {
+                    if matches!(self.completion.state(), CompletionState::DismissedUntilBoundary) {
+                        return;
+                    }
+                    // Narrow the open popup from the items it has instead of
+                    // lagging a round trip behind the typing.
+                    let word = self.completion_word_text();
+                    self.completion.refilter(&word);
+                }
+                // A trigger char starts a new word; the open list described the
+                // one it just ended. Closing also clears a dismissal.
+                CompletionTrigger::TriggerChar(_) => self.completion.close(),
+                // An open popup stays until the fresh list replaces it.
+                CompletionTrigger::Manual => self.completion.on_boundary(),
             }
-            let head = self.doc.selections().newest().head();
-            self.pending_completion_request = Some(CompletionRequest {
-                revision: self.doc.revision(),
-                position: self.doc.buffer().offset_to_point(head),
-            });
+            let ticket = self.tickets.issue(self.doc.revision());
+            self.awaiting.completion = Some(ticket);
+            self.pending_completion_request =
+                Some(CompletionRequest::new(ticket, self.completion_word(), trigger, start));
             return;
         };
         let cx = self.build_cx(trigger);
@@ -1414,10 +1471,15 @@ impl CodeEditor {
         self.comp_provider = Some(provider);
     }
 
-    /// Drive the signature-help box: `(` opens it; while open, every relevant
-    /// edit/move re-queries and a `None` reply closes it. No-op without a provider.
+    /// Drive the signature-help box: `(` opens it; while it shows, or while a
+    /// request for it is in flight, every edit or move re-queries, and a `None`
+    /// reply closes it. Re-querying while awaited is what lets `foo(a` typed
+    /// faster than the reply still open the box: the reply to the `(` request
+    /// is stale by then, and only the newest request can land.
     fn drive_signature(&mut self, event: CompletionEvent) {
-        let query = matches!(event, CompletionEvent::Typed('(')) || self.signature.is_some();
+        let query = matches!(event, CompletionEvent::Typed('('))
+            || self.signature.is_some()
+            || self.awaiting.signature.is_some();
         if !query {
             return;
         }
@@ -1428,10 +1490,10 @@ impl CodeEditor {
         } else {
             // No synchronous provider: record an async request for the host.
             let head = self.doc.selections().newest().head();
-            self.pending_signature_request = Some(SignatureRequest {
-                revision: self.doc.revision(),
-                position: self.doc.buffer().offset_to_point(head),
-            });
+            let ticket = self.tickets.issue(self.doc.revision());
+            self.awaiting.signature = Some(ticket);
+            self.pending_signature_request =
+                Some(SignatureRequest::new(ticket, self.doc.buffer().offset_to_point(head)));
         }
     }
 
@@ -1441,6 +1503,9 @@ impl CodeEditor {
     /// if requested.
     fn accept_completion(&mut self) {
         let Some(item) = self.completion.accept() else { return };
+        // The accept retires the in-flight request; a retrigger below asks
+        // afresh, so this must come first.
+        self.abandon(Awaited::Completion);
         let replace = item.replace.clone().unwrap_or_else(|| self.completion_word());
         self.set_selection_range(replace.clone());
 
@@ -1488,6 +1553,37 @@ impl CodeEditor {
             let word = self.completion_word_text();
             if let Some(provider) = self.comp_provider.as_mut() {
                 self.completion.on_input(&cx, &word, &mut **provider);
+            }
+        }
+    }
+
+    /// Whether a reply stamped `ticket` may land: it must be the request this
+    /// editor still awaits for `kind`, and the document must not have moved
+    /// since it was made. The one gate every async `set_*` goes through.
+    fn accepts(&self, kind: Awaited, ticket: Ticket) -> bool {
+        let awaited = match kind {
+            Awaited::Completion => self.awaiting.completion,
+            Awaited::Signature => self.awaiting.signature,
+            Awaited::Hover => self.awaiting.hover.as_ref().map(|(t, ..)| *t),
+        };
+        awaited == Some(ticket) && ticket.revision() == self.doc.revision()
+    }
+
+    /// Stop waiting for `kind`: drop the request the host hasn't pulled yet and
+    /// the ticket a late reply would carry.
+    fn abandon(&mut self, kind: Awaited) {
+        match kind {
+            Awaited::Completion => {
+                self.awaiting.completion = None;
+                self.pending_completion_request = None;
+            }
+            Awaited::Signature => {
+                self.awaiting.signature = None;
+                self.pending_signature_request = None;
+            }
+            Awaited::Hover => {
+                self.awaiting.hover = None;
+                self.pending_hover_request = None;
             }
         }
     }
@@ -1906,7 +2002,7 @@ mod tests {
         let _ = ed.update(Event::Editor(Action::Type('h')), Instant::now());
         let req = ed.take_completion_request().expect("a word char records an async request");
         ed.set_completions(
-            req.revision,
+            req.ticket(),
             vec![CompletionItem::plain("hello", scrive_core::CompletionKind::Keyword)],
         );
         assert!(
@@ -1917,8 +2013,8 @@ mod tests {
         assert_eq!(ed.document().text().into_owned(), "hello");
     }
 
-    /// Strict staleness: a result computed against a revision the buffer has moved
-    /// past is dropped (the host re-requests on the next edit).
+    /// A reply is dropped once a newer request has superseded it and the
+    /// buffer has moved past the revision it was computed for.
     #[test]
     fn stale_set_completions_is_dropped() {
         let mut ed = CodeEditor::new("");
@@ -1927,7 +2023,7 @@ mod tests {
         // The buffer moves on before the async result arrives.
         let _ = ed.update(Event::Editor(Action::Type('i')), Instant::now());
         ed.set_completions(
-            req.revision,
+            req.ticket(),
             vec![CompletionItem::plain("hello", scrive_core::CompletionKind::Keyword)],
         );
         assert!(
@@ -1948,7 +2044,7 @@ mod tests {
             scrive_core::CompletionKind::Keyword,
             InsertText::Snippet("if ${1:cond} {\n\t$0\n}".into()),
         );
-        ed.set_completions(req.revision, vec![snippet]);
+        ed.set_completions(req.ticket(), vec![snippet]);
         assert!(matches!(ed.completion.state(), CompletionState::Open(_)));
         let _ = ed.update(Event::Editor(Action::PopupAccept), Instant::now());
         assert!(
@@ -2025,5 +2121,180 @@ mod tests {
         assert_eq!(entry.ops()[0].text, "X", "the entry carries the typed text");
         assert_eq!(entry.before().text(), "hello\n", "the entry carries the pre-edit text");
         assert!(ed.drain_changes().is_empty(), "draining clears the log");
+    }
+
+    /// Feed one widget action through the real `update` path.
+    fn act(ed: &mut CodeEditor, action: Action) {
+        let _ = ed.update(Event::Editor(action), Instant::now());
+    }
+
+    /// A keyword item with `label` as its insertion.
+    fn item(label: &str) -> CompletionItem {
+        CompletionItem::plain(label, scrive_core::CompletionKind::Keyword)
+    }
+
+    /// The labels the open popup shows, in order (empty when closed).
+    fn shown(ed: &CodeEditor) -> Vec<String> {
+        match ed.completion.state() {
+            CompletionState::Open(list) => {
+                list.filtered.iter().map(|&i| list.items[i as usize].label.clone()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// A one-parameter signature for the async signature tests.
+    fn sig() -> SignatureInfo {
+        SignatureInfo { label: "foo(a)".into(), params: vec![Range { start: 4, end: 5 }], active: 0, doc: None }
+    }
+
+    /// A hover card over `hello`.
+    fn card() -> HoverInfo {
+        HoverInfo { markdown: "doc".into(), range: 0..5 }
+    }
+
+    /// A click after a trigger char abandons its request, so the reply is
+    /// dropped even though the revision never moved.
+    #[test]
+    fn a_click_after_a_trigger_char_drops_the_stale_completion() {
+        let mut ed = CodeEditor::new("a\n");
+        act(&mut ed, Action::PlaceCaret(1));
+        act(&mut ed, Action::Type('.'));
+        let req = ed.take_completion_request().expect("'.' is a trigger char");
+        act(&mut ed, Action::PlaceCaret(0));
+        ed.set_completions(req.ticket(), vec![item("len")]);
+        assert!(matches!(ed.completion.state(), CompletionState::Closed), "a click abandons the '.' request");
+    }
+
+    /// The awaited ticket alone is not enough: a reply computed before the text
+    /// moved is dropped.
+    #[test]
+    fn a_reply_whose_revision_moved_is_dropped_even_with_the_awaited_ticket() {
+        let mut ed = CodeEditor::new("hello world\n");
+        act(&mut ed, Action::HoverQuery(2));
+        let req = ed.take_hover_request().expect("a word with no provider asks");
+        act(&mut ed, Action::Type('x'));
+        ed.set_hover(req.ticket, Some(card()));
+        assert!(ed.hover.is_none(), "typing moved the revision past the request");
+
+        act(&mut ed, Action::HoverQuery(2));
+        let req = ed.take_hover_request().expect("the word asks again");
+        ed.set_hover(req.ticket, Some(card()));
+        assert!(ed.hover.is_some(), "an answer at the request's revision lands");
+    }
+
+    /// `HoverDismiss` retires the in-flight hover request.
+    #[test]
+    fn hover_dismiss_abandons_the_pending_hover() {
+        let mut ed = CodeEditor::new("hello world\n");
+        act(&mut ed, Action::HoverQuery(2));
+        let req = ed.take_hover_request().expect("a word with no provider asks");
+        act(&mut ed, Action::HoverDismiss);
+        ed.set_hover(req.ticket, Some(card()));
+        assert!(ed.hover.is_none(), "a dismissed hover's answer is dropped");
+    }
+
+    /// Emptying the word ends the session, so the next word starts fresh.
+    #[test]
+    fn deleting_back_to_an_empty_word_starts_the_next_request_fresh() {
+        let mut ed = CodeEditor::new("");
+        act(&mut ed, Action::Type('f'));
+        let req = ed.take_completion_request().expect("a word char asks");
+        assert_eq!(req.start(), Start::Fresh, "nothing was open or awaited");
+        act(&mut ed, Action::Backspace);
+        assert!(ed.take_completion_request().is_none(), "an emptied word asks nothing");
+        act(&mut ed, Action::Type('g'));
+        let req = ed.take_completion_request().expect("a word char asks");
+        assert_eq!(req.start(), Start::Fresh, "the emptied word cleared the awaited slot");
+    }
+
+    /// A deletion while a completion is awaited (popup not yet open) asks
+    /// again for the shorter word.
+    #[test]
+    fn a_deletion_while_awaited_re_requests_completion() {
+        let mut ed = CodeEditor::new("");
+        act(&mut ed, Action::Type('f'));
+        act(&mut ed, Action::Type('o'));
+        let _ = ed.take_completion_request().expect("a word char asks");
+        act(&mut ed, Action::Backspace);
+        let req = ed.take_completion_request().expect("the deletion re-asks while awaited");
+        assert_eq!(req.trigger(), CompletionTrigger::Typed('f'), "keyed by the new last char");
+        assert_eq!(req.start(), Start::Continuing, "a completion was awaited");
+        assert_eq!(req.word(), 0..1, "the shorter word");
+    }
+
+    /// A click away while signature help is awaited re-queries, so the reply
+    /// to the `(` request no longer lands.
+    #[test]
+    fn a_signature_reply_after_a_click_away_is_dropped() {
+        let mut ed = CodeEditor::new("x\n");
+        act(&mut ed, Action::Type('('));
+        let paren = ed.take_signature_request().expect("'(' asks");
+        act(&mut ed, Action::PlaceCaret(0));
+        assert!(ed.take_signature_request().is_some(), "a move re-queries while awaited");
+        ed.set_signature(paren.ticket(), Some(sig()));
+        assert!(ed.signature.is_none(), "the reply for the old caret is dropped");
+    }
+
+    /// Typing on after `(` before its reply keeps re-querying, and the newest
+    /// request's reply opens the box.
+    #[test]
+    fn typing_through_a_call_before_the_reply_still_opens_the_signature_box() {
+        let mut ed = CodeEditor::new("");
+        for c in ['f', 'o', 'o', '('] {
+            act(&mut ed, Action::Type(c));
+        }
+        let paren = ed.take_signature_request().expect("'(' asks");
+        act(&mut ed, Action::Type('a'));
+        let latest = ed.take_signature_request().expect("typing re-queries while awaited");
+        ed.set_signature(paren.ticket(), Some(sig()));
+        assert!(ed.signature.is_none(), "the '(' reply is stale");
+        ed.set_signature(latest.ticket(), Some(sig()));
+        assert!(ed.signature.is_some(), "the newest reply opens the box");
+    }
+
+    /// Escape with no box showing retires an awaited signature request instead
+    /// of re-querying it.
+    #[test]
+    fn escape_retires_an_awaited_signature_without_re_querying() {
+        let mut ed = CodeEditor::new("");
+        act(&mut ed, Action::Type('('));
+        let paren = ed.take_signature_request().expect("'(' asks");
+        act(&mut ed, Action::Collapse);
+        assert!(ed.take_signature_request().is_none(), "Escape does not re-query");
+        ed.set_signature(paren.ticket(), Some(sig()));
+        assert!(ed.signature.is_none(), "the retired request's reply is dropped");
+    }
+
+    /// Word chars narrow an open async popup from the items it has, before any
+    /// new reply lands, and the next request continues the list.
+    #[test]
+    fn typing_while_the_popup_is_open_refilters_before_the_reply_lands() {
+        let mut ed = CodeEditor::new("");
+        act(&mut ed, Action::Type('s'));
+        let req = ed.take_completion_request().expect("a word char asks");
+        ed.set_completions(req.ticket(), vec![item("send"), item("set")]);
+        act(&mut ed, Action::Type('e'));
+        act(&mut ed, Action::Type('t'));
+        assert_eq!(shown(&ed), ["set"], "the popup narrows locally");
+        let req = ed.take_completion_request().expect("typing still asks");
+        assert_eq!(req.start(), Start::Continuing, "the popup was open");
+    }
+
+    /// An Escape-dismissed popup asks for nothing while the word grows; a
+    /// trigger char clears the dismissal and its reply opens the popup.
+    #[test]
+    fn a_dismissed_popup_asks_for_nothing_until_a_trigger() {
+        let mut ed = CodeEditor::new("");
+        act(&mut ed, Action::Type('s'));
+        let req = ed.take_completion_request().expect("a word char asks");
+        ed.set_completions(req.ticket(), vec![item("send")]);
+        act(&mut ed, Action::PopupDismiss);
+        act(&mut ed, Action::Type('e'));
+        assert!(ed.take_completion_request().is_none(), "a dismissed word asks nothing");
+        act(&mut ed, Action::Type('.'));
+        let req = ed.take_completion_request().expect("a trigger char asks");
+        ed.set_completions(req.ticket(), vec![item("send")]);
+        assert_eq!(shown(&ed), ["send"], "the trigger's reply opens the popup");
     }
 }

@@ -510,6 +510,10 @@ struct State {
     hover_pos: Option<Point>,
     hover_rearm: bool,
     hover_at: Option<Instant>,
+    /// Whether a `HoverQuery` went out that no `HoverDismiss` has cancelled
+    /// yet. The host may be awaiting an async answer with no card on screen, so
+    /// leaving the spot must still publish `HoverDismiss` to retire it.
+    hover_queried: bool,
     /// Vertical scroll offset (px) of the open hover popup's content, for hovers
     /// taller than `HOVER_MAX_VISIBLE`. Reset to 0 when the hovered word changes.
     hover_scroll: f32,
@@ -558,6 +562,7 @@ impl Default for State {
             hover_pos: None,
             hover_rearm: false,
             hover_at: None,
+            hover_queried: false,
             hover_scroll: 0.0,
             gutter_hover: false,
             paste_pending: false,
@@ -635,6 +640,9 @@ pub struct Editor<'a, Message> {
     /// The open hover popup, if any (app-supplied) — a markdown box anchored
     /// at the hovered word.
     hover: Option<&'a HoverInfo>,
+    /// The word an in-flight async hover request is about, if any
+    /// (app-supplied). A pointer move that stays inside it keeps the request.
+    hover_pending: Option<Range<u32>>,
     font: Font,
     size: f32,
     line_height: f32,
@@ -652,6 +660,7 @@ impl<'a, Message> Editor<'a, Message> {
             snippet_active: false,
             signature: None,
             hover: None,
+            hover_pending: None,
             font: crate::DEFAULT_FONT,
             size: DEFAULT_SIZE,
             line_height: default_line_height(DEFAULT_SIZE),
@@ -686,6 +695,14 @@ impl<'a, Message> Editor<'a, Message> {
     #[must_use]
     pub fn hover(mut self, hover: Option<&'a HoverInfo>) -> Self {
         self.hover = hover;
+        self
+    }
+
+    /// Supply the word an in-flight async hover request is about, so moving
+    /// the pointer within it doesn't cancel the request.
+    #[must_use]
+    pub fn hover_pending(mut self, word: Option<Range<u32>>) -> Self {
+        self.hover_pending = word;
         self
     }
 
@@ -2201,13 +2218,16 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     // on the next RedrawRequested).
                     let off = self.hit_test(&geo, pos);
                     // Keep the hover open while the pointer is over its word OR over
-                    // the hover box itself — so it can be moved into and scrolled.
+                    // the hover box itself — so it can be moved into and scrolled —
+                    // and keep an unanswered request while the pointer stays on
+                    // the word it asked about.
                     let still_in = self.hover.is_some_and(|h| {
                         (off >= h.range.start && off < h.range.end)
                             || self.hover_layout(h, &geo).rect.contains(pos)
-                    });
+                    }) || self.hover_pending.as_ref().is_some_and(|w| w.contains(&off));
                     if !still_in {
-                        if self.hover.is_some() {
+                        if self.hover.is_some() || state.hover_queried {
+                            state.hover_queried = false;
                             shell.publish((self.on_action)(Action::HoverDismiss));
                         }
                         state.hover_pos = Some(pos);
@@ -2221,7 +2241,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     state.hover_pos = None;
                     state.hover_at = None;
                     state.hover_scroll = 0.0;
-                    if self.hover.is_some() {
+                    if self.hover.is_some() || state.hover_queried {
+                        state.hover_queried = false;
                         shell.publish((self.on_action)(Action::HoverDismiss));
                     }
                 }
@@ -2512,11 +2533,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                                     state.fold_preview = Some(opener);
                                     shell.request_redraw();
                                 }
-                                if self.hover.is_some() {
+                                if self.hover.is_some() || state.hover_queried {
+                                    state.hover_queried = false;
                                     shell.publish((self.on_action)(Action::HoverDismiss));
                                 }
                             } else {
                                 let off = self.hit_test(&geo, pos);
+                                state.hover_queried = true;
                                 shell.publish((self.on_action)(Action::HoverQuery(off)));
                             }
                         }
@@ -4538,5 +4561,99 @@ mod tests {
         assert_eq!(ed.max_line_px(10.0, 20.0, two_rows, 0.0), 2.0 * 10.0, "only visible rows count");
         // Scrolled down 2 rows to the wide line, the range adapts up.
         assert_eq!(ed.max_line_px(10.0, 20.0, two_rows, 2.0), 200.0 * 10.0);
+    }
+
+    /// A headless tiny-skia renderer with the icon font loaded, as the
+    /// draw-budget test sets it up.
+    fn headless_renderer() -> iced::Renderer {
+        use iced::advanced::renderer;
+        iced_tiny_skia::graphics::text::font_system()
+            .write()
+            .expect("font system lock")
+            .load_font(std::borrow::Cow::Borrowed(crate::CODICON_FONT));
+        iced_renderer::fallback::Renderer::Secondary(iced_tiny_skia::Renderer::new(renderer::Settings {
+            font: Font::default(),
+            text_size: Pixels(14.0),
+            ..renderer::Settings::default()
+        }))
+    }
+
+    /// Run `events` through a one-editor UI over `doc` with the pointer at `at`
+    /// and `pending` as the in-flight hover word, keeping the widget state in
+    /// `cache` across calls. Returns the published actions and the cache.
+    fn pump(
+        doc: &Document,
+        pending: Option<Range<u32>>,
+        cache: iced_runtime::user_interface::Cache,
+        renderer: &mut iced::Renderer,
+        at: Point,
+        events: &[iced::Event],
+    ) -> (Vec<Action>, iced_runtime::user_interface::Cache) {
+        use iced::advanced::shell;
+        use iced_runtime::user_interface::UserInterface;
+        let element: iced::Element<'_, Action, iced::Theme, iced::Renderer> =
+            Editor::new(doc, |a| a).hover_pending(pending).into();
+        let mut ui = UserInterface::build(element, Size::new(500.0, 320.0), cache, renderer);
+        let mut bus = shell::Bus::new();
+        let _ = ui.update(
+            &iced::window::Headless,
+            &shell::Waker::noop(),
+            events,
+            mouse::Cursor::Available(at),
+            renderer,
+            &mut bus,
+        );
+        (bus.into_iter().collect(), ui.into_cache())
+    }
+
+    /// A document whose first row is one 240-char word, so any x in the code
+    /// area of row 0 is over it.
+    fn one_word_doc() -> Document {
+        Document::new(&format!("{}\n", "word".repeat(60))).expect("doc fits")
+    }
+
+    /// The events that rest the pointer on `over` long enough to fire a query.
+    fn rest_on(over: Point) -> [iced::Event; 3] {
+        let t0 = Instant::now();
+        [
+            iced::Event::Mouse(mouse::Event::CursorMoved { position: over }),
+            iced::Event::Window(window::Event::RedrawRequested(t0)),
+            iced::Event::Window(window::Event::RedrawRequested(t0 + Duration::from_millis(HOVER_IDLE_DELAY_MS))),
+        ]
+    }
+
+    /// Leaving a word whose hover query has no card yet still publishes
+    /// `HoverDismiss`, so the host stops waiting for its answer.
+    #[test]
+    fn moving_off_an_unanswered_hover_publishes_hover_dismiss() {
+        let doc = one_word_doc();
+        let mut r = headless_renderer();
+        let (over, gutter) = (Point::new(200.0, 5.0), Point::new(1.0, 5.0));
+        let cache = iced_runtime::user_interface::Cache::new();
+        let (actions, cache) = pump(&doc, None, cache, &mut r, over, &rest_on(over));
+        assert!(actions.iter().any(|a| matches!(a, Action::HoverQuery(_))), "resting on the word queries it");
+        let moved = [iced::Event::Mouse(mouse::Event::CursorMoved { position: gutter })];
+        let (actions, _) = pump(&doc, None, cache, &mut r, gutter, &moved);
+        assert!(actions.contains(&Action::HoverDismiss), "leaving an unanswered query retires it");
+    }
+
+    /// A pointer move that stays inside the word an in-flight hover request is
+    /// about keeps the request; without that word the same move cancels it.
+    #[test]
+    fn a_rearm_inside_the_pending_word_keeps_the_hover_request() {
+        let doc = one_word_doc();
+        let mut r = headless_renderer();
+        let (over, inside) = (Point::new(200.0, 5.0), Point::new(300.0, 5.0));
+        let moved = [iced::Event::Mouse(mouse::Event::CursorMoved { position: inside })];
+
+        let cache = iced_runtime::user_interface::Cache::new();
+        let (_, cache) = pump(&doc, None, cache, &mut r, over, &rest_on(over));
+        let (actions, _) = pump(&doc, Some(0..240), cache, &mut r, inside, &moved);
+        assert!(!actions.contains(&Action::HoverDismiss), "a move inside the pending word keeps the request");
+
+        let cache = iced_runtime::user_interface::Cache::new();
+        let (_, cache) = pump(&doc, None, cache, &mut r, over, &rest_on(over));
+        let (actions, _) = pump(&doc, None, cache, &mut r, inside, &moved);
+        assert!(actions.contains(&Action::HoverDismiss), "without a pending word the same move cancels");
     }
 }

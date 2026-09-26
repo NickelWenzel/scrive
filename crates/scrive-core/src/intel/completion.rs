@@ -3,9 +3,13 @@
 //! list, local prefix filtering, Escape-stickiness, and the provider-call budget
 //! (at most one `complete()` per input event); it never touches the document.
 //! Accepting returns the chosen item for the caller to apply as one sealed
-//! transaction.
+//! transaction. It also defines the [`CompletionRequest`] an editor records
+//! when no provider is set.
+
+use core::ops::Range;
 
 use super::providers::{CompletionCx, CompletionItem, CompletionTrigger, Completions};
+use super::ticket::Ticket;
 
 /// The popup's open/closed/dismissed state.
 pub enum CompletionState {
@@ -17,6 +21,65 @@ pub enum CompletionState {
     /// extending the same word do NOT reopen the popup; a word boundary (or any
     /// non-word input) restores normal rules.
     DismissedUntilBoundary,
+}
+
+/// Whether a completion request continues the list already on screen (or on
+/// its way) or starts a new one. The editor samples it before it refilters, so
+/// a list reuse knows the popup was live when the request was made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Start {
+    /// No popup was open and none was awaited: ask from scratch.
+    Fresh,
+    /// A popup was open, or a completion was awaited: this request extends it.
+    Continuing,
+}
+
+/// A completion request an editor records for an async source (a background
+/// thread, a language server) when no synchronous [`Completions`] provider is
+/// set. The host pulls it with the editor's `take_completion_request`, answers
+/// it, and hands the items back through the editor's `set_completions` with
+/// [`ticket`](Self::ticket); a reply whose ticket the editor no longer awaits
+/// is dropped.
+#[derive(Clone, Debug)]
+pub struct CompletionRequest {
+    ticket: Ticket,
+    word: Range<u32>,
+    trigger: CompletionTrigger,
+    start: Start,
+}
+
+impl CompletionRequest {
+    /// A request for the completion word `word` (whose end is the caret), made
+    /// under `ticket` because of `trigger`.
+    #[must_use]
+    pub fn new(ticket: Ticket, word: Range<u32>, trigger: CompletionTrigger, start: Start) -> Self {
+        Self { ticket, word, trigger, start }
+    }
+
+    /// The ticket the reply must carry.
+    #[must_use]
+    pub fn ticket(&self) -> Ticket {
+        self.ticket
+    }
+
+    /// The completion word under the caret (empty at a boundary). Its end is
+    /// the caret; its start is where an item's insertion begins by default.
+    #[must_use]
+    pub fn word(&self) -> Range<u32> {
+        self.word.clone()
+    }
+
+    /// What caused the request.
+    #[must_use]
+    pub fn trigger(&self) -> CompletionTrigger {
+        self.trigger
+    }
+
+    /// Whether the request continues the current list.
+    #[must_use]
+    pub fn start(&self) -> Start {
+        self.start
+    }
 }
 
 /// The live popup: the provider's items plus the local filter/selection over
