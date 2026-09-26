@@ -6,6 +6,7 @@
 //!
 //! - the JSON-RPC envelope → [`message`]
 //! - LSP positions ↔ scrive byte offsets → [`encoding`]
+//! - URI identity → [`uri`]
 //!
 //! Payloads are [`lsp_types`], re-exported so a host and this crate always agree on one version.
 
@@ -14,6 +15,7 @@
 
 pub mod encoding;
 pub mod message;
+pub mod uri;
 
 pub use encoding::Encoding;
 pub use lsp_types;
