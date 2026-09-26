@@ -50,5 +50,11 @@ test = true
 [[example]]
 name = "record_showcase"
 
+[[example]]
+name = "lsp"
+path = "examples/lsp/main.rs"
+required-features = ["lsp"]
+test = true
+
 [package.metadata.docs.rs]
 all-features = true
