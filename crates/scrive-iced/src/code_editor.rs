@@ -38,6 +38,7 @@ use iced::time::Instant;
 use iced::{Alignment, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, Vector};
 
 use scrive_core::intel::completion::Start;
+use scrive_core::intel::hover::escape_markdown;
 use scrive_core::intel::ticket;
 use scrive_core::{
     default_indent_size, is_completion_word_char, Bias, CompletionController, CompletionCx, CompletionItem,
@@ -640,19 +641,21 @@ impl CodeEditor {
         self.pending_hover_request.take()
     }
 
-    /// Ingest a hover card from an async source, stamped with the request's
+    /// Ingest hover docs from an async source, stamped with the request's
     /// `ticket` (see [`set_completions`](Self::set_completions) for when it
-    /// lands). Replaces the shown card (the host builds it, and may fold in
-    /// diagnostics read from [`document`](CodeEditor::document)); `None` clears
-    /// it.
+    /// lands). The card shows the diagnostics under the hovered offset first,
+    /// then these docs; `None` leaves just the diagnostics, or no card.
     pub fn set_hover(&mut self, ticket: Ticket, info: Option<HoverInfo>) {
         if !self.accepts(Awaited::Hover, ticket) {
             return;
         }
+        let Some(offset) = self.awaiting.hover.as_ref().map(|(_, offset, _)| *offset) else {
+            return;
+        };
         if info.is_none() {
             self.abandon(Awaited::Hover);
         }
-        self.hover = info;
+        self.hover = self.hover_card(offset, info);
     }
 
     /// Take the pending goto-definition request, if any. Answer a target in
@@ -830,33 +833,17 @@ impl CodeEditor {
                 self.abandon(Awaited::Signature);
                 Task::none()
             }
-            // Hover: the pointer rested over `offset` — diagnostics first (their
-            // messages ride the decoration store), then the provider's docs.
             Event::Editor(Action::HoverQuery(offset)) => {
-                let diags: Vec<(Range<u32>, String)> = self
-                    .doc
-                    .diagnostics_in(offset..offset + 1)
-                    .map(|(r, sev, msg)| (r, format!("**{}:** {msg}", severity_label(sev))))
-                    .collect();
                 let cx = self.build_hover_cx(offset);
-                let word = (cx.word.start != cx.word.end)
+                let has_word = cx.word.start != cx.word.end;
+                let docs = has_word
                     .then(|| self.hover_provider.as_mut().and_then(|p| p.hover(&cx)))
                     .flatten();
-                self.hover = if diags.is_empty() {
-                    word
-                } else {
-                    let range = diags[0].0.clone();
-                    let mut md: Vec<String> = diags.into_iter().map(|(_, m)| m).collect();
-                    if let Some(w) = word {
-                        md.push(String::new());
-                        md.push(w.markdown);
-                    }
-                    Some(HoverInfo { markdown: md.join("\n"), range })
-                };
+                self.hover = self.hover_card(offset, docs);
                 // With no synchronous provider, record an async request so the
-                // host can supply docs; the diagnostics-only card (if any) shows
-                // meanwhile and `set_hover` replaces it when the docs arrive.
-                if self.hover_provider.is_none() && cx.word.start != cx.word.end {
+                // host can supply docs; the diagnostics show meanwhile and the
+                // docs join them when they land.
+                if self.hover_provider.is_none() && has_word {
                     let ticket = self.tickets.issue(self.doc.revision());
                     self.awaiting.hover = Some((ticket, offset, cx.word.clone()));
                     self.pending_hover_request = Some(HoverRequest::new(ticket, offset, cx.word.clone()));
@@ -1942,6 +1929,27 @@ impl CodeEditor {
         (line_start + start as u32)..(line_start + end as u32)
     }
 
+    /// The hover card for `offset`: the diagnostics under it, escaped so a
+    /// message's own `*` or backtick renders literally, then the docs after a
+    /// blank line. The diagnostics never depend on the docs, so a `None` reply
+    /// still leaves them showing.
+    fn hover_card(&self, offset: u32, docs: Option<HoverInfo>) -> Option<HoverInfo> {
+        let diags: Vec<(Range<u32>, String)> = self
+            .doc
+            .diagnostics_in(offset..offset + 1)
+            .map(|(r, sev, msg)| (r, format!("**{}:** {}", severity_label(sev), escape_markdown(&msg))))
+            .collect();
+        let Some(range) = diags.first().map(|(r, _)| r.clone()) else {
+            return docs;
+        };
+        let mut md: Vec<String> = diags.into_iter().map(|(_, m)| m).collect();
+        if let Some(docs) = docs {
+            md.push(String::new());
+            md.push(docs.markdown);
+        }
+        Some(HoverInfo { markdown: md.join("\n"), range })
+    }
+
     /// Build a hover request for the word under `offset`. The lookback runs
     /// through the word's END, so the provider reads the full word from its tail.
     fn build_hover_cx(&self, offset: u32) -> HoverCx {
@@ -2847,5 +2855,36 @@ mod tests {
         let _ = ed.update(Event::OpenFind, Instant::now());
         assert!(ed.rename.is_none(), "one bar at a time");
         assert!(ed.find_open, "find opened");
+    }
+
+    /// An async hover that answers `None` keeps the diagnostics card, and one
+    /// that answers docs puts them after the diagnostics.
+    #[test]
+    fn the_hover_card_keeps_its_diagnostics_when_the_docs_are_none() {
+        let mut ed = CodeEditor::new("hello world\n");
+        let rev = ed.document().revision();
+        let _ = ed.set_diagnostics(rev, vec![Diagnostic::new(0..5, Severity::Error, "unknown name")]);
+        act(&mut ed, Action::HoverQuery(2));
+        let req = ed.take_hover_request().expect("a word with no provider asks");
+        ed.set_hover(req.ticket, None);
+        let shown = ed.hover.as_ref().expect("the diagnostics stay");
+        assert_eq!(shown.markdown, "**error:** unknown name", "only the diagnostics show");
+
+        act(&mut ed, Action::HoverQuery(2));
+        let req = ed.take_hover_request().expect("the word asks again");
+        ed.set_hover(req.ticket, Some(card()));
+        let shown = ed.hover.as_ref().expect("a card shows");
+        assert_eq!(shown.markdown, "**error:** unknown name\n\ndoc", "the docs follow the diagnostics");
+    }
+
+    /// A diagnostic's own markup characters are escaped in the card.
+    #[test]
+    fn diagnostic_messages_are_escaped_in_the_hover_card() {
+        let mut ed = CodeEditor::new("hello world\n");
+        let rev = ed.document().revision();
+        let _ = ed.set_diagnostics(rev, vec![Diagnostic::new(0..5, Severity::Error, "expected *mut T")]);
+        act(&mut ed, Action::HoverQuery(2));
+        let card = ed.hover.as_ref().expect("the diagnostic shows at once");
+        assert!(card.markdown.contains("expected \\*mut T"), "{}", card.markdown);
     }
 }

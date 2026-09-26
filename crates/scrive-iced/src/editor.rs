@@ -3709,9 +3709,9 @@ enum MdStyle {
     Code,
 }
 
-/// Split one markdown line into styled runs, consuming the `**bold**` and
-/// `` `code` `` markers. A minimal inline subset (no nesting) — enough for the
-/// hover's spec-derived docs; unmatched markers just toggle back at line end.
+/// Split one markdown line into styled runs: the decoding side of the grammar
+/// documented on `HoverInfo::markdown`, which `escape_markdown` encodes. No
+/// nesting; unmatched markers just toggle back at line end.
 fn parse_md_runs(line: &str) -> Vec<(String, MdStyle)> {
     let mut runs = Vec::new();
     let mut cur = String::new();
@@ -3724,7 +3724,11 @@ fn parse_md_runs(line: &str) -> Vec<(String, MdStyle)> {
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            '*' if chars.peek() == Some(&'*') => {
+            '\\' => match chars.next_if(|&n| matches!(n, '\\' | '*' | '`')) {
+                Some(escaped) => cur.push(escaped),
+                None => cur.push('\\'),
+            },
+            '*' if style != MdStyle::Code && chars.peek() == Some(&'*') => {
                 chars.next(); // second '*'
                 push(&mut cur, style);
                 style = if style == MdStyle::Bold { MdStyle::Plain } else { MdStyle::Bold };
@@ -4802,5 +4806,40 @@ mod tests {
         assert_eq!(st.last_reveal_seq, 0, "a document that revealed takes the jump path");
         assert!(!st.is_focused(), "focus belongs to the widget and survives");
         assert_eq!(st.doc, Some(b.doc_id()), "the state now describes the new document");
+    }
+
+    /// Escapes are literal characters in every style, and code never turns
+    /// bold.
+    #[test]
+    fn parse_md_runs_honors_escapes_and_literal_code() {
+        use MdStyle::*;
+        for (line, runs) in [
+            ("a \\*\\* b", vec![("a ** b", Plain)]),
+            ("\\`x\\`", vec![("`x`", Plain)]),
+            ("a\\\\b", vec![("a\\b", Plain)]),
+            ("\\q", vec![("\\q", Plain)]),
+            ("a\\", vec![("a\\", Plain)]),
+            ("`a**b`", vec![("a**b", Code)]),
+            ("`a\\`b`", vec![("a`b", Code)]),
+            ("**x** \\*", vec![("x", Bold), (" *", Plain)]),
+        ] {
+            let want: Vec<(String, MdStyle)> = runs.into_iter().map(|(t, s)| (t.to_string(), s)).collect();
+            assert_eq!(parse_md_runs(line), want, "{line:?}");
+        }
+    }
+
+    /// The parser inverts `escape_markdown`: escaped text renders exactly as
+    /// written, as plain text or inside a code span.
+    #[test]
+    fn escaped_text_renders_verbatim() {
+        use scrive_core::intel::hover::escape_markdown;
+        for raw in ["a*b", "**x**", "`c`", "a\\b", "\\*", "mixed * ` \\ **"] {
+            assert_eq!(parse_md_runs(&escape_markdown(raw)), vec![(raw.to_string(), MdStyle::Plain)], "{raw:?}");
+        }
+        assert_eq!(
+            parse_md_runs(&format!("`{}`", escape_markdown("a`b**c"))),
+            vec![("a`b**c".to_string(), MdStyle::Code)],
+            "an escaped code line stays one code run"
+        );
     }
 }

@@ -43,8 +43,15 @@ pub struct HoverCx {
 /// A resolved hover: the markdown to render and the word it describes.
 #[derive(Clone, Debug)]
 pub struct HoverInfo {
-    /// Markdown body (a minimal block/inline subset; richer degrades to plain
-    /// text at render).
+    /// The card's text, in the small markdown grammar the hover card renders:
+    /// - `**` toggles bold, outside code; a single `*` is literal;
+    /// - `` ` `` toggles inline code; inside code `**` is literal;
+    /// - `\*`, `` \` `` and `\\` are the literal characters in every style,
+    ///   code included; any other `\` is literal;
+    /// - each line renders as one line; nothing else is markup.
+    ///
+    /// Build text that must show verbatim (a diagnostic message, plain-text
+    /// docs, a code line's content) with [`escape_markdown`].
     pub markdown: String,
     /// The word range the doc describes — the popup anchors here and the widget
     /// re-tests pointer containment against it for dismissal.
@@ -54,7 +61,7 @@ pub struct HoverInfo {
 /// A hover request an editor records for an async source when no synchronous
 /// [`Hover`] provider is set. Answer it through the editor's `set_hover` with
 /// `ticket`; `None` means no docs. A card of the diagnostics under the pointer
-/// shows until the answer replaces it.
+/// shows meanwhile, and the answer's docs join it.
 #[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct HoverRequest {
@@ -71,5 +78,42 @@ impl HoverRequest {
     #[must_use]
     pub fn new(ticket: Ticket, offset: u32, word: Range<u32>) -> Self {
         Self { ticket, offset, word }
+    }
+}
+
+/// Escape `text` so the hover card shows it verbatim: every `\`, `*` and `` ` ``
+/// gets a backslash (the grammar is on [`HoverInfo::markdown`]). A message like
+/// `expected *mut T` then never switches the card to bold.
+#[must_use]
+pub fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\\' | '*' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exactly the three markup characters are escaped, each with one
+    /// backslash.
+    #[test]
+    fn escape_markdown_backslashes_exactly_the_markup_chars() {
+        for (raw, escaped) in [
+            ("plain", "plain"),
+            ("a*b", "a\\*b"),
+            ("**x**", "\\*\\*x\\*\\*"),
+            ("`c`", "\\`c\\`"),
+            ("a\\b", "a\\\\b"),
+            ("expected *mut T, found `&T`", "expected \\*mut T, found \\`&T\\`"),
+            ("", ""),
+        ] {
+            assert_eq!(escape_markdown(raw), escaped, "{raw:?}");
+        }
     }
 }
