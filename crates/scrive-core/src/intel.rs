@@ -17,3 +17,4 @@ pub mod hover;
 pub mod providers;
 pub mod signature;
 pub mod snippet;
+pub mod ticket;

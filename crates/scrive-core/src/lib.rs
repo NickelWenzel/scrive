@@ -83,6 +83,7 @@ pub use intel::completion::{CompletionController, CompletionState, PopupList};
 pub use intel::hover::{Hover, HoverCx, HoverInfo, HOVER_IDLE_DELAY_MS};
 pub use intel::signature::{SignatureCx, SignatureHelp, SignatureInfo};
 pub use intel::snippet::{CaretOutcome, Snippet, SnippetError, SnippetSession, TabOutcome, TabStop};
+pub use intel::ticket::Ticket;
 pub use intel::providers::{
     is_completion_word_char, CompletionCx, CompletionItem, CompletionKind, CompletionTrigger,
     Completions, InsertText, LOOKBACK_LINES,
