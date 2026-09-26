@@ -589,6 +589,16 @@ impl CodeEditor {
         self.hover = info;
     }
 
+    /// Select `range` and reveal it centered, unfolding whatever hides it: the
+    /// programmatic jump for host navigation such as goto-definition. The range
+    /// is clamped to the document and snapped to char boundaries. Like a caret
+    /// move, it closes the completion popup and retires requests tied to the old
+    /// caret.
+    pub fn select(&mut self, range: Range<u32>) {
+        self.doc.select_and_reveal(range);
+        self.after_edit(CompletionEvent::CaretOrClose);
+    }
+
     /// Enable or disable the per-commit change log, for a host mirroring
     /// edits to a language server (`textDocument/didChange`). Off by default
     /// (zero overhead); turning it on starts a fresh chain at the current
@@ -2459,5 +2469,20 @@ mod tests {
         act(&mut ed, Action::PlaceCaret(end));
         let req = ed.take_signature_request().expect("a move re-queries while awaited");
         assert_eq!(req.call(), Some(call), "the paren inside the string is skipped");
+    }
+
+    /// `select` selects the range, requests a reveal and closes an open popup.
+    #[test]
+    fn select_selects_reveals_and_closes_the_popup() {
+        let mut ed = CodeEditor::new("hello\n");
+        act(&mut ed, Action::Type('h'));
+        let req = ed.take_completion_request().expect("a word char asks");
+        ed.set_completions(req.ticket(), vec![item("hello")]);
+        assert!(ed.completion.is_open(), "the reply opens the popup");
+        let seq = ed.document().reveal_seq();
+        ed.select(0..1);
+        assert!(matches!(ed.completion.state(), CompletionState::Closed), "selecting closes the popup");
+        assert_eq!(ed.selection(), 0..1, "the range is selected");
+        assert!(ed.document().reveal_seq() > seq, "the selection is revealed");
     }
 }
