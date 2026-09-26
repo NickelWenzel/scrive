@@ -84,6 +84,51 @@ fn whole(text: &str) -> Value {
     json!({"text": text})
 }
 
+/// The one place tests read a `Change`, so a new variant changes only this helper.
+fn diagnostics(update: &Update) -> (DocId, update::Stamp, Vec<scrive_core::Diagnostic>) {
+    let Update::Document(document) = update else {
+        panic!("expected a document update, got {update:?}")
+    };
+    match document.change() {
+        update::Change::Diagnostics(set) => (document.doc_id(), document.stamp(), set.clone()),
+    }
+}
+
+/// A `publishDiagnostics` with one error over `start..end` on line 0.
+fn publish(uri: &str, version: Option<i32>, span: Option<(u32, u32)>) -> Message {
+    let diagnostics: Vec<Value> = span
+        .into_iter()
+        .map(|(start, end)| {
+            json!({"range": {
+                "start": {"line": 0, "character": start},
+                "end": {"line": 0, "character": end},
+            }, "severity": 1, "message": "bad"})
+        })
+        .collect();
+    let mut params = json!({"uri": uri, "diagnostics": diagnostics});
+    if let Some(version) = version {
+        params["version"] = json!(version);
+    }
+    from_server(
+        json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": params}),
+    )
+}
+
+/// The byte spans (start, end) of the one diagnostic set in `output`, with its document and stamp.
+fn landed(output: &Output) -> (DocId, update::Stamp, Vec<(u32, u32)>) {
+    let [update] = output.updates.as_slice() else {
+        panic!("expected one update, got {:?}", output.updates)
+    };
+    let (doc_id, stamp, set) = diagnostics(update);
+    (
+        doc_id,
+        stamp,
+        set.into_iter()
+            .map(|d| (d.span.start, d.span.end))
+            .collect(),
+    )
+}
+
 /// The `initialize` request advertises what the client handles, and carries the builder's
 /// inputs.
 #[test]
@@ -374,6 +419,180 @@ fn version_high_water_mark_survives_reopen() {
         wire(&reopened.messages),
         vec![did_open("file:///a.rs", 3, "b")],
         "the reopen takes version 3, after didOpen 1 and didChange 2",
+    );
+}
+
+/// A NONE server is told nothing about edits, but its diagnostics still convert against the
+/// edited text.
+#[test]
+fn none_sync_sends_nothing_but_advances_the_synced_snapshot() {
+    let mut doc = document("abc");
+    let (mut client, _) = running(Client::builder(), json!({"textDocumentSync": 0}));
+    let opened = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    assert_eq!(
+        wire(&opened.messages),
+        vec![did_open("file:///a.rs", 1, "abc")],
+        "a bare NONE kind still wants didOpen",
+    );
+    doc.edit(vec![EditOp::insert(0, "xyz")]).expect("edits");
+    let synced = client.sync(&doc.snapshot(), doc.drain_changes());
+    assert!(
+        synced.messages.is_empty(),
+        "a NONE server gets no didChange"
+    );
+    let output = client
+        .receive(publish("file:///a.rs", None, Some((4, 5))))
+        .expect("the publish is accepted");
+    assert_eq!(
+        landed(&output),
+        (
+            doc.doc_id(),
+            update::Stamp::Revision(doc.snapshot().revision()),
+            vec![(4, 5)]
+        ),
+        "the diagnostic lands on the edited text at the edited revision",
+    );
+}
+
+/// A publish for a version the server has already been sent past is dropped; one for the
+/// current version applies.
+#[test]
+fn diagnostics_with_a_stale_version_are_dropped() {
+    let mut doc = document("abc");
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    doc.edit(vec![EditOp::insert(3, "d")]).expect("edits");
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+    let stale = client
+        .receive(publish("file:///a.rs", Some(1), Some((0, 1))))
+        .expect("the publish is accepted");
+    assert!(
+        stale.updates.is_empty(),
+        "version 1 is stale after didChange 2"
+    );
+    let current = client
+        .receive(publish("file:///a.rs", Some(2), Some((0, 1))))
+        .expect("the publish is accepted");
+    assert_eq!(
+        landed(&current).2,
+        vec![(0, 1)],
+        "version 2 is the current version and applies",
+    );
+}
+
+/// An unversioned publish is taken to be for the last synced text, and converts against it.
+#[test]
+fn diagnostics_without_a_version_apply_at_the_synced_revision() {
+    let mut doc = document("😀b");
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    doc.edit(vec![EditOp::insert(0, "a")]).expect("edits");
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+    let output = client
+        .receive(publish("file:///a.rs", None, Some((3, 4))))
+        .expect("the publish is accepted");
+    assert_eq!(
+        landed(&output),
+        (
+            doc.doc_id(),
+            update::Stamp::Revision(doc.snapshot().revision()),
+            vec![(5, 6)]
+        ),
+        "utf-16 columns 3..4 of `a😀b` are bytes 5..6, at the synced revision",
+    );
+}
+
+/// Diagnostics for a file that is not open wait for its `open`, under any spelling of its URI,
+/// and are handed out once.
+#[test]
+fn unopened_diagnostics_are_cached_and_applied_at_open() {
+    let (first, second) = (document("abc"), document("abc"));
+    let (mut client, _) = running(Client::builder(), incremental());
+    let published = client
+        .receive(publish("file:///C%3A/b.rs", None, Some((1, 2))))
+        .expect("the publish is accepted");
+    assert!(
+        published.updates.is_empty(),
+        "nothing is open to apply it to"
+    );
+    let opened = client
+        .open(&first.snapshot(), &uri("file:///c:/b.rs"), "rust")
+        .expect("opens");
+    assert_eq!(
+        landed(&opened),
+        (
+            first.doc_id(),
+            update::Stamp::Revision(first.snapshot().revision()),
+            vec![(1, 2)]
+        ),
+        "open hands out the cached set against the opened snapshot",
+    );
+    let _ = client.close(first.doc_id());
+    let reopened = client
+        .open(&second.snapshot(), &uri("file:///c:/b.rs"), "rust")
+        .expect("reopens");
+    assert!(
+        reopened.updates.is_empty(),
+        "the cache was consumed by the first open"
+    );
+}
+
+/// An empty publish for a closed file means it has no diagnostics any more.
+#[test]
+fn empty_publish_clears_the_cache() {
+    let doc = document("abc");
+    let (mut client, _) = running(Client::builder(), incremental());
+    for message in [
+        publish("file:///b.rs", None, Some((0, 1))),
+        publish("file:///b.rs", None, None),
+    ] {
+        let _ = client.receive(message).expect("the publish is accepted");
+    }
+    let opened = client
+        .open(&doc.snapshot(), &uri("file:///b.rs"), "rust")
+        .expect("opens");
+    assert!(
+        opened.updates.is_empty(),
+        "the empty publish removed the cached set"
+    );
+}
+
+/// A versioned publish for a closed file supersedes the unversioned set cached for it.
+#[test]
+fn versioned_publish_for_an_unopened_uri_clears_the_cache() {
+    let doc = document("abc");
+    let (mut client, _) = running(Client::builder(), incremental());
+    for message in [
+        publish("file:///b.rs", None, Some((0, 1))),
+        publish("file:///b.rs", Some(4), Some((1, 2))),
+    ] {
+        let _ = client.receive(message).expect("the publish is accepted");
+    }
+    let opened = client
+        .open(&doc.snapshot(), &uri("file:///b.rs"), "rust")
+        .expect("opens");
+    assert!(
+        opened.updates.is_empty(),
+        "the versioned publish removed the cached set"
+    );
+}
+
+/// A `publishDiagnostics` whose params do not decode is an error: there is nothing to answer.
+#[test]
+fn undecodable_publish_is_a_decode_error() {
+    let (mut client, _) = running(Client::builder(), incremental());
+    let failed = client.receive(from_server(
+        json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {"uri": 3}}),
+    ));
+    assert!(
+        matches!(&failed, Err(Error::Decode { method, .. }) if method == "textDocument/publishDiagnostics"),
+        "an undecodable publish is a decode error, got {failed:?}",
     );
 }
 

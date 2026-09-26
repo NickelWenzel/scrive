@@ -38,6 +38,14 @@ pub enum Change {
 }
 
 impl Document {
+    pub(crate) fn new(doc_id: DocId, stamp: Stamp, change: Change) -> Self {
+        Self {
+            doc_id,
+            stamp,
+            change,
+        }
+    }
+
     /// The document this change is for.
     #[must_use]
     pub fn doc_id(&self) -> DocId {

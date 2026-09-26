@@ -11,16 +11,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use lsp_types::{
     ApplyWorkspaceEditResponse, ClientInfo, ConfigurationParams, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, InitializeResult, InitializedParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind, Uri,
-    VersionedTextDocumentIdentifier, WorkspaceFolder,
+    InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind,
+    Uri, VersionedTextDocumentIdentifier, WorkspaceFolder,
 };
 use scrive_core::{document, DocId, Revision, Snapshot};
 use serde_json::Value;
 
 use crate::message::{self, Message};
-use crate::update::Update;
-use crate::{uri, Encoding};
+use crate::update::{self, Update};
+use crate::{diagnostics, uri, Encoding};
 
 /// JSON-RPC's "method not found": a server request this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -48,6 +48,8 @@ pub struct Client {
     /// Version high-water marks. They survive `close`, so a reopened document continues its
     /// count and a late publish for the old incarnation never matches the new one.
     versions: HashMap<uri::Key, i32>,
+    /// The latest unversioned diagnostics for URIs that are not open, applied at `open`.
+    cached: HashMap<uri::Key, Vec<lsp_types::Diagnostic>>,
     next_request: i64,
 }
 
@@ -151,6 +153,9 @@ impl Client {
     /// initialized. Opening a document that is already registered re-registers it, closing it
     /// first. After [`shutdown`](Self::shutdown) nothing is registered.
     ///
+    /// Diagnostics the server published for `uri` while it was not open arrive in the output's
+    /// updates, stamped with the snapshot's revision.
+    ///
     /// # Errors
     /// [`Error::DuplicateUri`] when another document is registered under the same normalized URI.
     pub fn open(
@@ -172,6 +177,13 @@ impl Client {
             return Err(Error::DuplicateUri { uri: key });
         }
         let mut output = self.close(doc_id);
+        if let Some(cached) = self.cached.remove(&key) {
+            output.updates.push(Update::Document(update::Document::new(
+                doc_id,
+                update::Stamp::Revision(snapshot.revision()),
+                update::Change::Diagnostics(diagnostics::convert(self.encoding, snapshot, &cached)),
+            )));
+        }
         self.tracked.push(Tracked {
             doc_id,
             key,
@@ -302,18 +314,54 @@ impl Client {
     /// Folds one message from the server into the client. Server requests are always answered.
     ///
     /// # Errors
-    /// [`Error::Decode`] for a payload that does not decode, and [`Error::Server`] when
-    /// `initialize` fails. A failed `initialize` leaves the client exited, with its registered
-    /// documents dropped.
+    /// [`Error::Decode`] for a payload that does not decode (a `publishDiagnostics`, or the
+    /// `initialize` result), and [`Error::Server`] when `initialize` fails. A failed or
+    /// undecodable `initialize` leaves the client exited, with its registered documents dropped.
     pub fn receive(&mut self, message: Message) -> Result<Output, Error> {
         match message {
             Message::Request(request) => Ok(self.answer(request)),
-            Message::Notification(notification) => Ok(Output {
-                messages: Vec::new(),
-                updates: vec![Update::Notification(notification)],
-            }),
+            Message::Notification(notification) => self.notified(notification),
             Message::Response(response) => self.responded(response),
         }
+    }
+
+    /// `publishDiagnostics` for an open document applies only if its version, when present, is
+    /// the last one sent. A missing version is read as the last one sent, since servers that
+    /// ignore `versionSupport` would otherwise never land a diagnostic.
+    fn notified(&mut self, notification: message::Notification) -> Result<Output, Error> {
+        if notification.method != "textDocument/publishDiagnostics" {
+            return Ok(Output {
+                messages: Vec::new(),
+                updates: vec![Update::Notification(notification)],
+            });
+        }
+        let params: PublishDiagnosticsParams = decode(&notification.method, notification.params)?;
+        let key = uri::normalize(&params.uri);
+        let Some(tracked) = self.tracked.iter().find(|t| t.key == key) else {
+            // A versioned publish cannot apply to a closed URI, but it does supersede the
+            // unversioned set cached for it.
+            if params.version.is_some() || params.diagnostics.is_empty() {
+                self.cached.remove(&key);
+            } else {
+                self.cached.insert(key, params.diagnostics);
+            }
+            return Ok(Output::default());
+        };
+        if params.version.is_some() && params.version != tracked.version {
+            return Ok(Output::default());
+        }
+        Ok(Output {
+            messages: Vec::new(),
+            updates: vec![Update::Document(update::Document::new(
+                tracked.doc_id,
+                update::Stamp::Revision(tracked.synced.revision()),
+                update::Change::Diagnostics(diagnostics::convert(
+                    self.encoding,
+                    &tracked.synced,
+                    &params.diagnostics,
+                )),
+            ))],
+        })
     }
 
     fn responded(&mut self, response: message::Response) -> Result<Output, Error> {
@@ -545,6 +593,7 @@ impl Builder {
             configuration: self.configuration,
             tracked: Vec::new(),
             versions: HashMap::new(),
+            cached: HashMap::new(),
             next_request: 2,
         };
         (client, Message::Request(initialize))

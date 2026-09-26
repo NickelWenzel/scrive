@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+mod diagnostics;
 pub mod encoding;
 pub mod message;
 pub mod update;
