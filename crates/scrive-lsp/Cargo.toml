@@ -1,0 +1,37 @@
+[package]
+name = "scrive-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+description = "A headless, I/O-free Language Server Protocol client for scrive: a pure state machine over JSON-RPC messages that syncs scrive-core documents and turns server replies into editor updates."
+keywords = ["lsp", "language-server", "editor", "headless"]
+categories = ["text-editors", "development-tools"]
+
+# HARD STRUCTURAL RULE: scrive-lsp does no I/O and depends on no GUI crate. The
+# host owns the transport and hands this crate one JSON-RPC message at a time;
+# every entry point returns the messages to send and the updates to apply. It
+# builds for wasm32, and CI runs `cargo tree -p scrive-lsp` and fails if
+# `iced`/`winit`/`wgpu` appears in its normal dependency graph.
+#
+# Dependency budget — each entry earns its place with a consumer:
+#   scrive-core — the document model the client syncs; its `Snapshot` is what
+#                 LSP positions convert against.
+#   lsp-types   — the LSP payload types, re-exported as `scrive_lsp::lsp_types`
+#                 so hosts and the client agree on one version. Pure data plus
+#                 serde; wasm-safe.
+#   serde       — the envelope's hand-written (De)Serialize impls, and derives on
+#                 the envelope's error object.
+#   serde_json  — `Value` for params and results that are decoded lazily, one
+#                 payload at a time.
+#   thiserror   — the crate's error enums.
+[dependencies]
+scrive-core.workspace = true
+lsp-types = "0.97"   # LSP payloads (re-exported; never wrapped)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"     # envelope params/results as `Value`
+thiserror = "2"      # library error enums
+
+[package.metadata.docs.rs]
+all-features = true
