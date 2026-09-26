@@ -14,7 +14,7 @@ use core::ops::Range;
 use std::borrow::Cow;
 
 use crate::bracket::Brackets;
-use crate::buffer::{Buffer, EolFlavor, LoadError, Revision, Snapshot};
+use crate::buffer::{Buffer, DocId, EolFlavor, LoadError, Revision, Snapshot};
 use crate::coords::{Bias, Point};
 use crate::decorations::{
     DecorationKind, DecorationStore, Diagnostic, DiagnosticsOutcome, Severity, Stickiness,
@@ -933,6 +933,14 @@ impl Document {
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         self.buffer.snapshot()
+    }
+
+    /// This document's identity, the same [`DocId`] its buffer and snapshots
+    /// carry. Stable for the document's lifetime: replacing the whole text is
+    /// an edit, not a reload.
+    #[must_use]
+    pub fn doc_id(&self) -> DocId {
+        self.buffer.doc_id()
     }
 
     /// Apply a batch of edits as one discrete transaction (its own undo step).
@@ -2115,15 +2123,7 @@ impl Document {
             self.find.find_prev(head, extent, &self.decorations)
         };
         if let Some(range) = &found {
-            // Set the selection to the match, head at its end.
-            self.selections
-                .set_single(Selection::from_anchor(SelectionId(0), range.start, range.end));
-            self.reset_transient(); // clears gesture state + seals (a jump is a boundary)
-            // A match inside a collapsed fold unfolds its chain first — the
-            // reveal below must land on a VISIBLE position.
-            self.unfold_to_reveal(range.start);
-            self.unfold_to_reveal(range.end);
-            self.request_reveal(RevealMode::Center); // find navigation centers
+            self.jump_to(range.clone());
         }
         found
     }
@@ -2148,13 +2148,32 @@ impl Document {
             all.iter().rev().find(|r| (r.start, r.end) < anchor).or_else(|| all.last())
         }?
         .clone();
-        self.selections
-            .set_single(Selection::from_anchor(SelectionId(0), target.start, target.end));
-        self.reset_transient(); // a jump is an undo-group boundary
-        self.unfold_to_reveal(target.start);
-        self.unfold_to_reveal(target.end);
-        self.request_reveal(RevealMode::Center); // diagnostic jumps center
+        self.jump_to(target.clone());
         Some(target)
+    }
+
+    /// Select `range` and reveal it centered, from any document state: the
+    /// jump a host performs for goto-definition. The range is clamped to the
+    /// document and snapped outward to char boundaries, and an inverted range
+    /// is normalized. The head lands at the end, and any fold hiding either
+    /// end unfolds.
+    pub fn select_and_reveal(&mut self, range: Range<u32>) {
+        let (a, b) = (range.start.min(range.end), range.start.max(range.end));
+        let start = self.buffer.clip_offset(a, Bias::Left);
+        let end = self.buffer.clip_offset(b, Bias::Right);
+        self.jump_to(start..end);
+    }
+
+    /// Select a valid `range` (head at its end) and reveal it centered. A jump
+    /// is a gesture and undo-group boundary, and its target must render, so
+    /// folds hiding either end unfold before the reveal.
+    fn jump_to(&mut self, range: Range<u32>) {
+        self.selections
+            .set_single(Selection::from_anchor(SelectionId(0), range.start, range.end));
+        self.reset_transient();
+        self.unfold_to_reveal(range.start);
+        self.unfold_to_reveal(range.end);
+        self.request_reveal(RevealMode::Center);
     }
 
     /// Unfold every collapsed fold hiding `offset`, innermost-first, until the
@@ -2796,6 +2815,52 @@ mod tests {
         d.next_diagnostic(true);
         assert!(d.reveal_seq() > seq1);
         assert_eq!(d.reveal_mode(), RevealMode::Center, "a diagnostic jump centers");
+    }
+
+    /// A document's identity is its buffer's, shared by its snapshots, and a
+    /// whole-text replacement keeps it.
+    #[test]
+    fn doc_id_is_the_buffer_identity() {
+        let mut d = doc("hello\n");
+        let id = d.doc_id();
+        assert_eq!(id, d.buffer().doc_id(), "the document names its buffer");
+        assert_eq!(id, d.snapshot().doc_id(), "snapshots carry the same identity");
+        let len = d.buffer().len();
+        d.edit(vec![EditOp::new(0..len, "x")]).unwrap();
+        assert_eq!(d.doc_id(), id, "replacing the whole text is an edit, not a new document");
+    }
+
+    /// A jump into a collapsed fold unfolds it, selects the target head-last,
+    /// and requests a centered reveal.
+    #[test]
+    fn select_and_reveal_unfolds_the_target_and_requests_a_centered_reveal() {
+        let text = "x\na {\nb\nc\n}\nword\n";
+        let mut d = doc(text);
+        assert!(d.toggle_fold_opener(text.find('{').unwrap() as u32), "the block folds");
+        let seq0 = d.reveal_seq();
+        let b = text.find("b\n").unwrap() as u32;
+        d.select_and_reveal(b..b + 1);
+        assert!(d.folds().is_empty(), "a reveal into a fold unfolds it");
+        assert!(d.reveal_seq() > seq0, "the jump requests a reveal");
+        assert_eq!(d.reveal_mode(), RevealMode::Center, "the jump centers");
+        let sel = d.selections().newest();
+        assert_eq!((sel.start(), sel.end(), sel.head()), (b, b + 1, b + 1), "the target is selected, head last");
+    }
+
+    /// The jump clamps to the document, snaps outward to char boundaries, and
+    /// normalizes an inverted range.
+    #[test]
+    fn select_and_reveal_clamps_and_snaps_to_char_boundaries() {
+        let mut d = doc("aé");
+        let span = |d: &Document| (d.selections().newest().start(), d.selections().newest().end());
+        d.select_and_reveal(2..99);
+        assert_eq!(span(&d), (1, 3), "start snaps left out of the char, end clamps to the length");
+        #[allow(clippy::reversed_empty_ranges)] // the inverted range is the input under test
+        let inverted = 3..1;
+        d.select_and_reveal(inverted);
+        assert_eq!(span(&d), (1, 3), "an inverted range is normalized");
+        d.select_and_reveal(0..0);
+        assert_eq!(span(&d), (0, 0), "an empty range is a caret");
     }
 
     #[test]
