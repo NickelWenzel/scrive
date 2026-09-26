@@ -34,7 +34,7 @@ use std::cell::Ref;
 use std::ops::Range;
 
 use scrive_core::{
-    display_map, BufferRow, ColumnDir, CompletionKind, Document, FoldMap, Granularity,
+    display_map, BufferRow, ColumnDir, CompletionKind, DocId, Document, FoldMap, Granularity,
     HighlightSpan, HoverInfo, Motion, Point as BufPoint, PopupList, RevealMode, RowLayout, Severity,
     SignatureInfo, HOVER_IDLE_DELAY_MS,
 };
@@ -552,6 +552,10 @@ struct State {
     /// drives the immediate plain-hover expand highlight. Tracked so a move
     /// on/off a chip repaints exactly once; `None` when off any chip or Ctrl is held.
     hover_chip: Option<u32>,
+    /// The document this state describes. The widget tree keeps state by
+    /// position, so a host that renders another document here (a tab switch)
+    /// would otherwise hand it the old document's scroll, drags and hover.
+    doc: Option<DocId>,
 }
 
 impl Default for State {
@@ -582,6 +586,7 @@ impl Default for State {
             gutter_hover_row: None,
             fold_preview: None,
             hover_chip: None,
+            doc: None,
         }
     }
 }
@@ -1206,7 +1211,28 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
     }
 
     fn state(&self) -> widget::tree::State {
-        widget::tree::State::new(State::default())
+        widget::tree::State::new(State { doc: Some(self.doc.doc_id()), ..State::default() })
+    }
+
+    fn diff(&mut self, tree: &mut widget::Tree) {
+        let state = tree.state.downcast_mut::<State>();
+        let doc = self.doc.doc_id();
+        if state.doc == Some(doc) {
+            return;
+        }
+        // Scroll, drags, hover and fold previews describe the old document's
+        // text; focus, the measured metrics and the held modifiers describe the
+        // widget. The fresh `last_reveal_seq` of 0 sends a document that ever
+        // requested a reveal down the jump path, to its recorded reveal mode.
+        *state = State {
+            focus: state.focus,
+            metrics: state.metrics,
+            measured_font: state.measured_font,
+            modifiers: state.modifiers,
+            doc: Some(doc),
+            autoscroll: true,
+            ..State::default()
+        };
     }
 
     fn operate(
@@ -4746,5 +4772,35 @@ mod tests {
         let (actions, _) = pump(&doc, None, cache, &mut r, Point::new(200.0, 5.0), &[press]);
         assert!(actions.contains(&Action::Format), "Shift+Alt+F formats: {actions:?}");
         assert!(!actions.iter().any(|a| matches!(a, Action::Type(_))), "the layout's character is not typed");
+    }
+
+    /// Rendering a different document in the same tree position starts the
+    /// view state over (and reveals once) while keeping the widget's focus;
+    /// the same document keeps it all.
+    #[test]
+    fn rendering_another_document_resets_the_view_state_and_reveals() {
+        use iced::advanced::widget::Tree;
+        let a = Document::new("one\n").expect("doc fits");
+        let mut b = Document::new(&"line\n".repeat(400)).expect("doc fits");
+        b.select_and_reveal(1000..1004);
+        let mut on_a = Editor::new(&a, |x: Action| x);
+        let mut tree = Tree::new(&on_a as &dyn Widget<Action, iced::Theme, iced::Renderer>);
+        {
+            let st = tree.state.downcast_mut::<State>();
+            st.scroll = ScrollAnchor::from_rows(120.0, 19.0);
+            st.hover_scroll = 38.0;
+            st.unfocus();
+        }
+        Widget::<Action, iced::Theme, iced::Renderer>::diff(&mut on_a, &mut tree);
+        assert_eq!(tree.state.downcast_ref::<State>().hover_scroll, 38.0, "the same document keeps its view state");
+        let mut on_b = Editor::new(&b, |x: Action| x);
+        Widget::<Action, iced::Theme, iced::Renderer>::diff(&mut on_b, &mut tree);
+        let st = tree.state.downcast_ref::<State>();
+        assert_eq!(st.scroll, ScrollAnchor::TOP, "a new document starts unscrolled");
+        assert_eq!(st.hover_scroll, 0.0, "hover state belongs to the old document");
+        assert!(st.autoscroll, "the new document is revealed once");
+        assert_eq!(st.last_reveal_seq, 0, "a document that revealed takes the jump path");
+        assert!(!st.is_focused(), "focus belongs to the widget and survives");
+        assert_eq!(st.doc, Some(b.doc_id()), "the state now describes the new document");
     }
 }
