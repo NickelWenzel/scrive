@@ -6,7 +6,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use lsp_types::{
-    CompletionContext, CompletionItemKind, CompletionTextEdit, Documentation, InsertTextFormat,
+    CompletionContext, CompletionItemKind, CompletionTextEdit, CompletionTriggerKind,
+    Documentation, InsertTextFormat,
 };
 use scrive_core::intel::completion::Start;
 use scrive_core::{
@@ -72,6 +73,21 @@ struct Conversion<'a> {
     line_start: u32,
     line: Cow<'a, str>,
     memo: HashMap<u32, u32>,
+}
+
+impl Query {
+    /// The context for sending this query again with the caret at `caret`. A trigger character
+    /// describes the original keystroke, so a moved caret asks as invoked.
+    pub(crate) fn at(&self, caret: u32) -> CompletionContext {
+        if caret == self.word.end {
+            self.context.clone()
+        } else {
+            CompletionContext {
+                trigger_kind: CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            }
+        }
+    }
 }
 
 impl Reply {

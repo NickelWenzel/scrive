@@ -9,7 +9,7 @@ use core::ops::Range;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use lsp_types::error_codes::REQUEST_CANCELLED;
+use lsp_types::error_codes::{CONTENT_MODIFIED, REQUEST_CANCELLED, SERVER_CANCELLED};
 use lsp_types::{
     ApplyWorkspaceEditResponse, ClientInfo, CompletionContext, CompletionParams,
     CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
@@ -154,6 +154,9 @@ struct Pending {
     /// The caret that goes with `latest_ticket`.
     latest_caret: u32,
     query: Query,
+    /// The ticket this request was re-issued for after `ContentModified`. Requests that follow
+    /// from it inherit it, so each ticket is re-issued at most once.
+    reissued_for: Option<Ticket>,
 }
 
 /// The kind of a pending request; with the document, it keys the pending table.
@@ -341,7 +344,7 @@ impl Client {
                 context = for_incomplete();
             }
         }
-        self.request_completion(doc_id, ticket, word, context)
+        self.request_completion(doc_id, ticket, word, context, None)
     }
 
     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
@@ -513,7 +516,8 @@ impl Client {
 
     /// Routes the reply to a pending request. Replies to requests the client no longer waits
     /// for, and cancellations, are silent. A failed or undecodable reply settles the editor's
-    /// slot with the request's empty answer.
+    /// slot with the request's empty answer. A request the server dropped as content-modified is
+    /// sent again, at most once per ticket.
     fn settled(&mut self, id: &message::Id, result: Result<Value, message::Error>) -> Output {
         let Some(index) = self.pending.iter().position(|p| p.id == *id) else {
             return Output::default();
@@ -531,9 +535,30 @@ impl Client {
             return Output::default();
         }
         match result {
-            Err(error) if error.code == REQUEST_CANCELLED => Output::default(),
+            Err(error) if error.code == REQUEST_CANCELLED || error.code == SERVER_CANCELLED => {
+                Output::default()
+            }
+            // The drop above guarantees the ticket is still current, so the server's text has
+            // caught up with the editor's and asking again can succeed.
+            Err(error) if error.code == CONTENT_MODIFIED => self.reissue(entry),
             Err(_) => entry.failed(),
             Ok(value) => self.resolved(&entry, value),
+        }
+    }
+
+    /// Sends `entry`'s query again at its latest caret, unless it already was for that ticket.
+    fn reissue(&mut self, entry: Pending) -> Output {
+        if entry.reissued_for == Some(entry.latest_ticket) {
+            return Output::default();
+        }
+        match entry.query {
+            Query::Completion(query) => self.request_completion(
+                entry.doc_id,
+                entry.latest_ticket,
+                query.word.start..entry.latest_caret,
+                query.at(entry.latest_caret),
+                Some(entry.latest_ticket),
+            ),
         }
     }
 
@@ -627,6 +652,7 @@ impl Client {
         ticket: Ticket,
         word: Range<u32>,
         context: CompletionContext,
+        reissued_for: Option<Ticket>,
     ) -> Output {
         let Some(tracked) = self.tracked.iter_mut().find(|t| t.doc_id == doc_id) else {
             return Output::default();
@@ -636,12 +662,19 @@ impl Client {
             doc_id,
             ticket,
             Query::Completion(completion::Query { word, context }),
+            reissued_for,
         )
     }
 
     /// Sends `query` for `doc_id` at its synced snapshot, cancelling the request of the same
     /// kind it supersedes.
-    fn send(&mut self, doc_id: DocId, ticket: Ticket, query: Query) -> Output {
+    fn send(
+        &mut self,
+        doc_id: DocId,
+        ticket: Ticket,
+        query: Query,
+        reissued_for: Option<Ticket>,
+    ) -> Output {
         let mut output = Output::default();
         if let Some(index) = self
             .pending
@@ -670,6 +703,7 @@ impl Client {
             latest_ticket: ticket,
             latest_caret: query.caret(),
             query,
+            reissued_for,
         });
         output
     }
@@ -706,6 +740,7 @@ impl Client {
                 entry.latest_ticket,
                 query.word.start..entry.latest_caret,
                 for_incomplete(),
+                entry.reissued_for,
             ));
         }
         output

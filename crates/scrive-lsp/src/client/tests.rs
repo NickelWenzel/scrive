@@ -1125,23 +1125,101 @@ fn reply_to_a_superseded_request_is_silent() {
     assert_silent(&output, "a superseded reply is dropped");
 }
 
-/// A request the server confirms as cancelled was superseded; nothing waits for it.
+/// A cancellation, the client's or the server's own, leaves nothing waiting for the reply.
 #[test]
-fn request_cancelled_reply_is_silent() {
+fn request_cancelled_and_server_cancelled_replies_are_silent() {
+    for code in [-32800, -32802] {
+        let mut tickets = Counter::new();
+        let (mut client, doc) = completing("let v = pr");
+        let first = request(
+            &mut tickets,
+            &doc,
+            8..10,
+            CompletionTrigger::Manual,
+            Start::Fresh,
+        );
+        let _ = client.complete(&doc.snapshot(), &first);
+        let output = client
+            .receive(failure(2, code))
+            .expect("a cancellation is not an error");
+        assert_silent(&output, &format!("a {code} reply answers nothing"));
+    }
+}
+
+/// A content-modified request whose ticket is still current is sent again, but only once.
+#[test]
+fn content_modified_is_reissued_once_per_ticket() {
     let mut tickets = Counter::new();
-    let (mut client, doc) = completing("let v = pr");
+    let (mut client, doc) = completing("std::");
+    let first = request(
+        &mut tickets,
+        &doc,
+        5..5,
+        CompletionTrigger::TriggerChar(':'),
+        Start::Fresh,
+    );
+    let _ = client.complete(&doc.snapshot(), &first);
+    let context = json!({"triggerKind": 2, "triggerCharacter": "::"});
+    let reissued = client
+        .receive(failure(2, -32801))
+        .expect("content modified is not an error");
+    assert_eq!(
+        wire(&reissued.messages),
+        vec![completion_request(3, (0, 5), context)],
+        "the request goes out again with its position and context",
+    );
+    assert!(reissued.updates.is_empty(), "nothing is answered yet");
+    let output = client
+        .receive(failure(3, -32801))
+        .expect("content modified is not an error");
+    assert_silent(
+        &output,
+        "a second content-modified reply for one ticket is final",
+    );
+}
+
+/// A re-issue follows the continued caret; the trigger character belonged to the original
+/// keystroke, so it asks as invoked.
+#[test]
+fn content_modified_after_a_continuation_reissues_at_the_latest_caret() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = completing("let v = pr");
     let first = request(
         &mut tickets,
         &doc,
         8..10,
-        CompletionTrigger::Manual,
+        CompletionTrigger::Typed('r'),
         Start::Fresh,
     );
     let _ = client.complete(&doc.snapshot(), &first);
-    let output = client
-        .receive(failure(2, -32800))
-        .expect("a cancellation is not an error");
-    assert_silent(&output, "a cancelled request answers nothing");
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(10, "i")]);
+    let second = request(
+        &mut tickets,
+        &doc,
+        8..11,
+        CompletionTrigger::Typed('i'),
+        Start::Continuing,
+    );
+    let _ = client.complete(&doc.snapshot(), &second);
+    let reissued = client
+        .receive(failure(2, -32801))
+        .expect("content modified is not an error");
+    assert_eq!(
+        wire(&reissued.messages),
+        vec![completion_request(3, (0, 11), json!({"triggerKind": 1}))],
+        "the re-issue asks at the latest caret",
+    );
+    let (stamp, items) = answered(
+        &client
+            .receive(list(3, false))
+            .expect("the reply is accepted"),
+    );
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(second.ticket()),
+        "the re-issue answers the latest ticket"
+    );
+    assert!(!items.is_empty(), "the re-issued reply lands");
 }
 
 /// A failed completion request still settles the editor's slot.
