@@ -56,5 +56,11 @@ path = "examples/lsp/main.rs"
 required-features = ["lsp"]
 test = true
 
+# Native only: spawns rust-analyzer from PATH. Its wasm32 build is a stub `main`.
+[[example]]
+name = "rust_analyzer"
+required-features = ["lsp"]
+test = true
+
 [package.metadata.docs.rs]
 all-features = true
