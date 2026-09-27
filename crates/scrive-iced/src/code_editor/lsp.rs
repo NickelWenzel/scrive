@@ -2,8 +2,9 @@
 //!
 //! A host calls [`open_lsp`](CodeEditor::open_lsp) once per document,
 //! [`sync_lsp`](CodeEditor::sync_lsp) after every [`update`](CodeEditor::update), and
-//! [`apply_lsp`](CodeEditor::apply_lsp) for each `Update::Document` the client returns. Each call
-//! returns the messages to send; the transport stays the host's.
+//! [`apply_lsp`](CodeEditor::apply_lsp) for each `Update::Document` the client returns, and
+//! [`save_lsp`](CodeEditor::save_lsp) after writing the document to disk. Each call returns the
+//! messages to send; the transport stays the host's.
 
 use scrive_core::DiagnosticsOutcome;
 use scrive_lsp::lsp_types::Uri;
@@ -93,6 +94,22 @@ impl CodeEditor {
         for output in outputs {
             messages.extend(self.route(output));
         }
+        messages
+    }
+
+    /// Tell `client` that the document was saved, syncing first so the server holds the saved
+    /// text. Call it after writing the document to disk. Returns the messages to send: the
+    /// sync's, then a `didSave` when the server asks for saves.
+    ///
+    /// On an editor that is not registered it does nothing and returns no messages.
+    #[must_use = "the didChange and didSave must be sent to the server"]
+    pub fn save_lsp(&mut self, client: &mut Client) -> Vec<Message> {
+        if self.lsp_client.is_none() {
+            return Vec::new();
+        }
+        let mut messages = self.sync_lsp(client);
+        let output = client.save(&self.doc.snapshot());
+        messages.extend(self.route(output));
         messages
     }
 
@@ -370,7 +387,7 @@ mod tests {
         let (mut client, initialize) = Client::builder().root(uri("file:///w/")).build();
         let result = json!({ "capabilities": {
             "positionEncoding": "utf-8",
-            "textDocumentSync": { "openClose": true, "change": 2 },
+            "textDocumentSync": { "openClose": true, "change": 2, "save": {} },
             "completionProvider": { "triggerCharacters": ["."] },
             "signatureHelpProvider": { "triggerCharacters": ["("] },
             "hoverProvider": true,
@@ -943,6 +960,42 @@ mod tests {
             ed.take_signature_request().is_none() && ed.awaiting.signature.is_none(),
             "typing inside the call asks for no signature help",
         );
+    }
+
+    /// `save_lsp` mirrors the unsynced edit, then saves: the `didSave` follows the `didChange`
+    /// in one batch, without the text.
+    #[test]
+    fn save_lsp_syncs_then_sends_did_save() {
+        let mut client = ready();
+        let (mut ed, messages) = opened(&mut client, A, "\n");
+        let opened_at = version(&sent(&messages, "textDocument/didOpen"));
+        let _ = ed.update(Event::Editor(Action::Type(';')), Instant::now());
+        let messages: Vec<Value> = ed.save_lsp(&mut client).iter().map(wire).collect();
+        let methods: Vec<&Value> = messages.iter().map(|message| &message["method"]).collect();
+        assert_eq!(
+            methods,
+            ["textDocument/didChange", "textDocument/didSave"],
+            "the edit syncs before the save",
+        );
+        assert_eq!(
+            version(&messages[0]),
+            json!(opened_at.as_i64().expect("versions are numbers") + 1),
+            "the didChange carries the next version",
+        );
+        assert_eq!(
+            messages[1]["params"],
+            json!({ "textDocument": { "uri": A } }),
+            "the didSave names A and carries no text",
+        );
+    }
+
+    /// `save_lsp` on an editor that was never opened sends nothing.
+    #[test]
+    fn save_lsp_on_an_unregistered_editor_does_nothing() {
+        let mut client = ready();
+        let mut ed = CodeEditor::new("\n");
+        let _ = ed.update(Event::Editor(Action::Type(';')), Instant::now());
+        assert!(ed.save_lsp(&mut client).is_empty(), "nothing is sent");
     }
 
     /// `sync_lsp` on an editor that was never opened sends nothing and keeps its requests.

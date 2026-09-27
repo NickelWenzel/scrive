@@ -20,6 +20,8 @@ Payload types come from `lsp-types`, re-exported as `scrive_lsp::lsp_types`.
 
 - **Diagnostics**, gated on the document version they were computed for. A publish for a file
   that is not open yet is cached and lands when it opens.
+- **Saves**: `didSave` once the host has written the synced text to disk, with the text when the
+  server asks for it. rust-analyzer re-runs `cargo check` on it.
 - **Completion**, reusing a complete list while the user keeps typing the same word, and
   re-asking when the server marks the list incomplete.
 - **Signature help** and **hover**.
@@ -37,12 +39,13 @@ Payload types come from `lsp-types`, re-exported as `scrive_lsp::lsp_types`.
 ## With scrive-iced
 
 Enable `scrive-iced`'s `lsp` feature: it re-exports this crate as `scrive_iced::lsp` and gives
-`CodeEditor` five methods.
+`CodeEditor` six methods.
 
 - `open_lsp` registers the editor's document with a client.
 - `sync_lsp`, called after every `update`, mirrors edits and sends the requests the editor
   recorded.
 - `apply_lsp` applies one `Update::Document` to the editor it is for.
+- `save_lsp`, called after writing the document to disk, syncs and sends `didSave`.
 - `jump` selects a definition that another editor's `apply_lsp` returned.
 - `close_lsp` unregisters the document.
 
