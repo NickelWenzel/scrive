@@ -7,7 +7,8 @@ use lsp_types::{
     ParameterInformationSettings, PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
     ServerCapabilities, SignatureHelpClientCapabilities, SignatureInformationSettings,
     TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
-    TextDocumentSyncKind, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
+    TextDocumentSyncKind, TextDocumentSyncSaveOptions, WorkspaceClientCapabilities,
+    WorkspaceEditClientCapabilities,
 };
 
 use crate::Encoding;
@@ -19,6 +20,8 @@ pub(crate) struct Server {
     pub(crate) open_close: bool,
     /// How `didChange` is sent; anything but FULL or INCREMENTAL means not at all.
     pub(crate) change: TextDocumentSyncKind,
+    /// Whether and how `didSave` is sent.
+    pub(crate) save: Save,
     /// The completion trigger strings; `None` when the server has no completion provider.
     pub(crate) completion: Option<Vec<String>>,
     /// Whether the server answers `textDocument/signatureHelp`.
@@ -33,19 +36,41 @@ pub(crate) struct Server {
     pub(crate) formatting: bool,
 }
 
+/// What the server asks to be sent when a document is saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Save {
+    /// No `didSave`.
+    Never,
+    /// `didSave` without the text.
+    Notify,
+    /// `didSave` with the saved text.
+    WithText,
+}
+
 impl Server {
-    /// An absent `textDocumentSync`, and an options object without `openClose` or `change`,
-    /// mean the spec's defaults: no open/close notifications and no changes.
+    /// An absent `textDocumentSync`, and an options object without `openClose`, `change` or
+    /// `save`, mean the spec's defaults: no open/close notifications, no changes and no saves.
     pub(crate) fn new(capabilities: &ServerCapabilities) -> Self {
-        let (open_close, change) = match &capabilities.text_document_sync {
+        let (open_close, change, save) = match &capabilities.text_document_sync {
             // LSP §textDocument_synchronization: a bare kind is the shorthand for
-            // `{ openClose: true, change: kind }`.
-            Some(TextDocumentSyncCapability::Kind(kind)) => (true, *kind),
+            // `{ openClose: true, change: kind }`, which asks for no saves.
+            Some(TextDocumentSyncCapability::Kind(kind)) => (true, *kind, Save::Never),
             Some(TextDocumentSyncCapability::Options(options)) => (
                 options.open_close.unwrap_or(false),
                 options.change.unwrap_or(TextDocumentSyncKind::NONE),
+                match &options.save {
+                    None | Some(TextDocumentSyncSaveOptions::Supported(false)) => Save::Never,
+                    Some(TextDocumentSyncSaveOptions::Supported(true)) => Save::Notify,
+                    Some(TextDocumentSyncSaveOptions::SaveOptions(options)) => {
+                        if options.include_text == Some(true) {
+                            Save::WithText
+                        } else {
+                            Save::Notify
+                        }
+                    }
+                },
             ),
-            None => (false, TextDocumentSyncKind::NONE),
+            None => (false, TextDocumentSyncKind::NONE, Save::Never),
         };
         let completion = capabilities
             .completion_provider
@@ -54,6 +79,7 @@ impl Server {
         Self {
             open_close,
             change,
+            save,
             completion,
             signature: capabilities.signature_help_provider.is_some(),
             hover: matches!(
@@ -92,7 +118,10 @@ pub(crate) fn client() -> ClientCapabilities {
             ..WorkspaceClientCapabilities::default()
         }),
         text_document: Some(TextDocumentClientCapabilities {
-            synchronization: Some(TextDocumentSyncClientCapabilities::default()),
+            synchronization: Some(TextDocumentSyncClientCapabilities {
+                did_save: Some(true),
+                ..TextDocumentSyncClientCapabilities::default()
+            }),
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities {
                 version_support: Some(true),
                 ..PublishDiagnosticsClientCapabilities::default()

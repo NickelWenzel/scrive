@@ -216,6 +216,10 @@ fn initialize_advertises_encodings_versions_and_workspace_capabilities() {
             "/params/capabilities/textDocument/publishDiagnostics/versionSupport",
             json!(true),
         ),
+        (
+            "/params/capabilities/textDocument/synchronization/didSave",
+            json!(true),
+        ),
         ("/params/capabilities/workspace/configuration", json!(true)),
         (
             "/params/capabilities/workspace/workspaceFolders",
@@ -692,6 +696,144 @@ fn close_sends_did_close() {
         vec![json!({"jsonrpc": "2.0", "method": "textDocument/didClose",
             "params": {"textDocument": {"uri": "file:///c:/a.rs"}}})],
         "close sends didClose for the normalized URI",
+    );
+}
+
+/// Incremental sync with open/close notifications and `save` set to `save`.
+fn saving(save: Value) -> Value {
+    json!({"positionEncoding": "utf-16",
+        "textDocumentSync": {"openClose": true, "change": 2, "save": save}})
+}
+
+fn did_save(uri: &str, text: Option<&str>) -> Value {
+    let mut params = json!({"textDocument": {"uri": uri}});
+    if let Some(text) = text {
+        params["text"] = json!(text);
+    }
+    json!({"jsonrpc": "2.0", "method": "textDocument/didSave", "params": params})
+}
+
+/// A server that asks for saves without text, as rust-analyzer does, gets a bare `didSave`.
+#[test]
+fn save_notifies_when_the_server_asks() {
+    let doc = document("a");
+    let (mut client, _) = running(Client::builder(), saving(json!({})));
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    let saved = client.save(&doc.snapshot());
+    assert_eq!(
+        wire(&saved.messages),
+        vec![did_save("file:///a.rs", None)],
+        "save sends didSave without the text",
+    );
+    assert!(saved.updates.is_empty(), "save updates nothing");
+}
+
+/// `includeText: true` sends the synced text with the save, and `includeText: false` does not.
+#[test]
+fn save_includes_text_only_when_asked() {
+    for (include, text) in [(true, Some("ab")), (false, None)] {
+        let mut doc = document("a");
+        let (mut client, _) = running(Client::builder(), saving(json!({"includeText": include})));
+        let _ = client
+            .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+            .expect("opens");
+        doc.edit(vec![EditOp::insert(1, "b")]).expect("edits");
+        let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+        assert_eq!(
+            wire(&client.save(&doc.snapshot()).messages),
+            vec![did_save("file:///a.rs", text)],
+            "includeText {include} decides whether the synced text goes out",
+        );
+    }
+}
+
+/// Only `save: true` among the other shapes asks for saves: a missing `save`, `save: false`
+/// and a bare sync kind send nothing.
+#[test]
+fn save_follows_every_save_option_shape() {
+    for (capabilities, sends) in [
+        (incremental(), false),
+        (saving(json!(false)), false),
+        (saving(json!(true)), true),
+        (json!({"positionEncoding": "utf-16", "textDocumentSync": 2}), false),
+    ] {
+        let doc = document("a");
+        let (mut client, _) = running(Client::builder(), capabilities.clone());
+        let _ = client
+            .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+            .expect("opens");
+        let expected = if sends {
+            vec![did_save("file:///a.rs", None)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            wire(&client.save(&doc.snapshot()).messages),
+            expected,
+            "save under {capabilities}",
+        );
+    }
+}
+
+/// A snapshot the server has not been synced to is not saved: the saved text would not be the
+/// text the server holds.
+#[test]
+fn save_of_an_unsynced_snapshot_sends_nothing() {
+    let mut doc = document("a");
+    let (mut client, _) = running(Client::builder(), saving(json!({})));
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    doc.edit(vec![EditOp::insert(1, "b")]).expect("edits");
+    let _ = doc.drain_changes();
+    let saved = client.save(&doc.snapshot());
+    assert!(
+        saved.messages.is_empty() && saved.updates.is_empty(),
+        "an unsynced snapshot sends nothing",
+    );
+}
+
+/// Before the handshake, for an unregistered document, and after shutdown, save sends nothing;
+/// a save before the handshake is not replayed after it.
+#[test]
+fn save_before_open_or_after_shutdown_sends_nothing() {
+    let doc = document("a");
+    let (mut client, _) = running(Client::builder(), saving(json!({})));
+    assert!(
+        client.save(&doc.snapshot()).messages.is_empty(),
+        "save of an unregistered document sends nothing",
+    );
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    let _ = client.shutdown();
+    assert!(
+        client.save(&doc.snapshot()).messages.is_empty(),
+        "save after shutdown sends nothing",
+    );
+
+    let (mut client, _) = Client::builder().build();
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    assert!(
+        client.save(&doc.snapshot()).messages.is_empty(),
+        "save before initialize sends nothing",
+    );
+    let output = client
+        .receive(from_server(
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities": saving(json!({}))}}),
+        ))
+        .expect("initialize answer is accepted");
+    assert_eq!(
+        wire(&output.messages),
+        vec![
+            json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}),
+            did_open("file:///a.rs", 1, "a"),
+        ],
+        "only the deferred didOpen follows initialized",
     );
 }
 

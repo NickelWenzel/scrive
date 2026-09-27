@@ -14,6 +14,7 @@ use lsp_types::{
     ApplyWorkspaceEditResponse, ClientInfo, CompletionContext, CompletionParams,
     CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams,
     DocumentFormattingParams, FormattingOptions, GotoDefinitionParams, HoverParams,
     InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams, RenameParams,
     SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
@@ -42,7 +43,8 @@ static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
 /// The host builds it with [`Client::builder`], sends the `initialize` request that
 /// [`Builder::build`] returns, then passes every server message to [`receive`](Self::receive).
 /// Documents are registered with [`open`](Self::open) and kept current with
-/// [`sync`](Self::sync) after every round of edits. Every entry point returns what to send
+/// [`sync`](Self::sync) after every round of edits; [`save`](Self::save) reports that the synced
+/// text was written to disk. Every entry point returns what to send
 /// and what to apply; the client itself never does I/O.
 #[derive(Debug)]
 pub struct Client {
@@ -600,6 +602,42 @@ impl Client {
                     content_changes,
                 },
             ))],
+            updates: Vec::new(),
+        }
+    }
+
+    /// Tells the server that the document of `snapshot` was written to disk, with the text when
+    /// the server asks for it. The host writes the file and calls [`sync`](Self::sync) first:
+    /// `snapshot` must be the synced one, so the saved text is the text the server has.
+    ///
+    /// Nothing is sent for a snapshot other than the synced one, a document that is not
+    /// registered or not yet open on the server, a server that asks for no saves, or while the
+    /// server is not running. A save before initialization needs no replay: the server reads the
+    /// file from disk when it starts.
+    pub fn save(&self, snapshot: &Snapshot) -> Output {
+        let State::Running(server) = &self.state else {
+            return Output::default();
+        };
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == snapshot.doc_id()) else {
+            return Output::default();
+        };
+        if tracked.version.is_none() || snapshot.revision() != tracked.synced.revision() {
+            return Output::default();
+        }
+        let text = match server.save {
+            capabilities::Save::Never => return Output::default(),
+            capabilities::Save::Notify => None,
+            capabilities::Save::WithText => Some(tracked.synced.text().into_owned()),
+        };
+        Output {
+            messages: vec![Message::Notification(message::Notification::new::<
+                lsp_types::notification::DidSaveTextDocument,
+            >(DidSaveTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: tracked.key.uri().clone(),
+                },
+                text,
+            }))],
             updates: Vec::new(),
         }
     }
