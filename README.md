@@ -158,7 +158,8 @@ cargo run -p scrive-iced --features lsp --example rust_analyzer -- path/to/file.
 (Ctrl+F), fold, and undo/redo. `lsp` shows the traffic panel next to the
 editor. Press F12 on `greet`, F2 to rename it across both files, or Shift+Alt+F
 to format. `rust_analyzer` is native only and needs rust-analyzer on `PATH`; it
-talks to the server over stdio, and the status bar shows its messages.
+talks to the server over stdio, and the status bar shows its messages. Its
+`cargo check` diagnostics refresh when you save with Ctrl+S (Cmd+S on macOS).
 
 ## Web (wasm32)
 

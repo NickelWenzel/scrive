@@ -9,7 +9,8 @@
 //! With a path, the workspace root is the nearest directory above it holding a `Cargo.toml`.
 //! Without one, a scratch crate is written to the system temp directory and its `src/main.rs`
 //! opened: it has a type error, a function to hover and F12 to, and a call to retype for
-//! signature help.
+//! signature help. Ctrl+S (Cmd+S on macOS) writes the file and tells the server, which re-runs
+//! `cargo check`: the type error's squiggle updates only then.
 //!
 //! The update loop is the one `examples/lsp` uses, cut down to one editor. What that example
 //! fakes with an in-process server is real here: a child process, a reader thread that decodes
@@ -317,6 +318,7 @@ mod app {
 
     use iced::futures::channel::mpsc;
     use iced::futures::{SinkExt, Stream, StreamExt};
+    use iced::keyboard::{self, Key};
     use iced::time::Instant;
     use iced::widget::{column, container, text};
     use iced::{Element, Fill, Subscription, Task, Theme};
@@ -359,6 +361,8 @@ fn main() {
         editor: CodeEditor,
         client: lsp::Client,
         link: Link,
+        /// Where Ctrl+S writes the document.
+        file: PathBuf,
         /// The one-line status bar.
         status: String,
     }
@@ -367,6 +371,8 @@ fn main() {
     enum Message {
         /// A message from the editor.
         Editor(Event),
+        /// Ctrl+S: write the document to its file and tell the server.
+        Save,
         /// A JSON-RPC message from the server.
         Lsp(lsp::Message),
         /// The server process is running, and this reaches its stdin.
@@ -455,6 +461,7 @@ fn main() {
                 editor,
                 client,
                 link: Link::Connecting(queued),
+                file: workspace.file.clone(),
                 status: format!("starting {}…", transport::SERVER),
             }
         }
@@ -465,6 +472,7 @@ fn main() {
                 editor,
                 client,
                 link,
+                file,
                 status,
             } = self;
             match message {
@@ -472,6 +480,26 @@ fn main() {
                     let task = editor.update(event, now).map(Message::Editor);
                     link.send(editor.sync_lsp(client));
                     task
+                }
+                Message::Save => {
+                    let doc = editor.document();
+                    // The buffer holds LF; a CRLF file is written back as CRLF.
+                    match std::fs::write(&*file, doc.serialize(doc.buffer().eol_flavor())) {
+                        Ok(()) => {
+                            link.send(editor.save_lsp(client));
+                            let name = file.file_name().unwrap_or(file.as_os_str()).display();
+                            *status = match link {
+                                Link::Connected(_) => {
+                                    format!("saved {name} — cargo check running…")
+                                }
+                                Link::Connecting(_) | Link::Closed => format!("saved {name}"),
+                            };
+                        }
+                        Err(error) => {
+                            *status = format!("could not save {}: {error}", file.display());
+                        }
+                    }
+                    Task::none()
                 }
                 Message::Connected(sender) => {
                     if let Link::Connecting(queued) = std::mem::replace(link, Link::Closed) {
@@ -551,6 +579,7 @@ fn main() {
         fn subscription(&self) -> Subscription<Message> {
             Subscription::batch([
                 self.editor.subscription().map(Message::Editor),
+                keyboard::listen().filter_map(save_chord),
                 Subscription::run(connect),
             ])
         }
@@ -607,6 +636,22 @@ fn main() {
                 }
             }
         })
+    }
+
+    /// Ctrl+S, or Cmd+S on macOS, without Shift or Alt and not repeated. The editor ignores it,
+    /// so it reaches `keyboard::listen`.
+    fn save_chord(event: keyboard::Event) -> Option<Message> {
+        match event {
+            keyboard::Event::KeyPressed {
+                key: Key::Character(c),
+                modifiers,
+                repeat: false,
+                ..
+            } if c == "s" && modifiers.command() && !modifiers.shift() && !modifiers.alt() => {
+                Some(Message::Save)
+            }
+            _ => None,
+        }
     }
 
     /// The status line a server notification earns: `window/showMessage` text, and the title of
@@ -666,6 +711,9 @@ fn main() {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
+        use iced::keyboard::key::{Code, Physical};
+        use iced::keyboard::{Location, Modifiers};
+        use scrive_core::{Diagnostic, EditOp};
         use serde_json::Value;
 
         use super::*;
@@ -722,12 +770,96 @@ fn main() {
             assert_eq!(headline(&logged), None, "log messages stay off the bar");
         }
 
+        /// Only a plain Ctrl+S (Cmd+S on macOS) saves.
+        #[test]
+        fn save_chord_matches_only_plain_ctrl_s() {
+            let press = |modifiers: Modifiers, repeat: bool| keyboard::Event::KeyPressed {
+                key: Key::Character("s".into()),
+                modified_key: Key::Character("s".into()),
+                physical_key: Physical::Code(Code::KeyS),
+                location: Location::Standard,
+                modifiers,
+                text: None,
+                repeat,
+            };
+            assert!(
+                matches!(save_chord(press(Modifiers::COMMAND, false)), Some(Message::Save)),
+                "Ctrl+S saves",
+            );
+            for (modifiers, repeat, chord) in [
+                (Modifiers::COMMAND | Modifiers::SHIFT, false, "Ctrl+Shift+S"),
+                (Modifiers::COMMAND | Modifiers::ALT, false, "Ctrl+Alt+S"),
+                (Modifiers::COMMAND, true, "a repeated Ctrl+S"),
+                (Modifiers::empty(), false, "a plain s"),
+            ] {
+                assert!(
+                    save_chord(press(modifiers, repeat)).is_none(),
+                    "{chord} does not save",
+                );
+            }
+        }
+
+        /// The next message from the server, folded into `client`, with its answers sent back.
+        /// `None` once `deadline` passes.
+        fn pump(
+            client: &mut lsp::Client,
+            incoming: &mpsc::Receiver<transport::Incoming>,
+            sender: &transport::Sender,
+            deadline: Instant,
+        ) -> Option<lsp::Output> {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let message = match incoming.recv_timeout(timeout) {
+                Ok(transport::Incoming::Message(message)) => message,
+                Ok(transport::Incoming::Closed(reason)) => panic!("the server left: {reason}"),
+                Err(_) => return None,
+            };
+            let output = client.receive(message).expect("server messages decode");
+            sender.send(output.messages.clone());
+            Some(output)
+        }
+
+        /// The diagnostic sets in `output`, with their stamps, logged as they arrive.
+        fn published(
+            output: &lsp::Output,
+            editor: &CodeEditor,
+            started: Instant,
+        ) -> Vec<(lsp::update::Stamp, Vec<Diagnostic>)> {
+            let mut sets = Vec::new();
+            for update in &output.updates {
+                let lsp::Update::Document(document) = update else {
+                    continue;
+                };
+                assert_eq!(
+                    document.doc_id(),
+                    editor.document().doc_id(),
+                    "the update is for the opened file",
+                );
+                if let lsp::update::Change::Diagnostics(list) = document.change() {
+                    eprintln!(
+                        "{:?}: publishDiagnostics at {:?} with {} entries: {:?}",
+                        started.elapsed(),
+                        document.stamp(),
+                        list.len(),
+                        list.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+                    );
+                    sets.push((document.stamp(), list.clone()));
+                }
+            }
+            sets
+        }
+
+        /// Whether `list` holds the scratch crate's type error.
+        fn mismatched(list: &[Diagnostic]) -> bool {
+            list.iter().any(|d| d.message.contains("mismatched"))
+        }
+
         /// Against a real rust-analyzer: the handshake completes, the scratch file's didOpen
         /// goes out, and a `publishDiagnostics` for it comes back through `Client::receive` as
-        /// the type error. Then an orderly shutdown ends the process.
+        /// the type error. Once the error is fixed, written to disk and saved, a publish for the
+        /// fixed text clears it, and it stays cleared. Then an orderly shutdown ends the process.
         #[test]
         #[ignore = "needs rust-analyzer on PATH and a Rust toolchain; run with --ignored"]
-        fn rust_analyzer_reports_the_scratch_crates_type_error() {
+        fn rust_analyzer_reports_the_scratch_crates_type_error_and_clears_it_on_save() {
             let root = std::env::temp_dir().join(format!("{SCRATCH}-test-{}", std::process::id()));
             let workspace = Workspace::scratch(&root).expect("the scratch crate is written");
             let (deliver, incoming) = mpsc::channel();
@@ -754,37 +886,16 @@ fn main() {
             let mut did_open = false;
             let mut diagnostics = None;
             while diagnostics.is_none() {
-                let timeout = deadline.saturating_duration_since(Instant::now());
-                let message = match incoming.recv_timeout(timeout) {
-                    Ok(transport::Incoming::Message(message)) => message,
-                    Ok(transport::Incoming::Closed(reason)) => panic!("the server left: {reason}"),
-                    Err(_) => break,
+                let Some(output) = pump(&mut client, &incoming, &sender, deadline) else {
+                    break;
                 };
-                let output = client.receive(message).expect("server messages decode");
                 did_open |= output.messages.iter().any(|message| {
                     matches!(message, lsp::Message::Notification(n) if n.method == "textDocument/didOpen")
                 });
-                for update in output.updates {
-                    if let lsp::Update::Document(document) = update {
-                        assert_eq!(
-                            document.doc_id(),
-                            editor.document().doc_id(),
-                            "the update is for the opened file",
-                        );
-                        if let lsp::update::Change::Diagnostics(list) = document.change() {
-                            eprintln!(
-                                "{:?}: publishDiagnostics with {} entries: {:?}",
-                                started.elapsed(),
-                                list.len(),
-                                list.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
-                            );
-                            if !list.is_empty() {
-                                diagnostics = Some(list.clone());
-                            }
-                        }
-                    }
-                }
-                sender.send(output.messages);
+                diagnostics = published(&output, &editor, started)
+                    .into_iter()
+                    .map(|(_, list)| list)
+                    .find(|list| !list.is_empty());
             }
             assert!(did_open, "the handshake completed and the didOpen went out");
             let diagnostics = diagnostics.expect("diagnostics arrived within the timeout");
@@ -797,6 +908,43 @@ fn main() {
                     .any(|d| d.span.start as usize >= label && d.message.contains("mismatched")),
                 "the type error is reported: {diagnostics:?}",
             );
+
+            let fix = "let label: String = doubled;";
+            let at = SCRATCH_MAIN.find(fix).expect("the scratch has the error") + fix.len() - 1;
+            editor
+                .try_edit(vec![EditOp::insert(u32::try_from(at).expect("small"), ".to_string()")])
+                .expect("the fix applies");
+            let doc = editor.document();
+            std::fs::write(&workspace.file, doc.serialize(doc.buffer().eol_flavor()))
+                .expect("the fixed file is written");
+            let fixed = lsp::update::Stamp::Revision(doc.revision());
+            let saved = editor.save_lsp(&mut client);
+            assert!(
+                saved.iter().any(|message| {
+                    matches!(message, lsp::Message::Notification(n) if n.method == "textDocument/didSave")
+                }),
+                "rust-analyzer asks for saves, so the didSave goes out",
+            );
+            eprintln!("{:?}: saved", started.elapsed());
+            sender.send(saved);
+
+            let deadline = Instant::now() + Duration::from_secs(120);
+            let mut cleared = false;
+            while !cleared {
+                let Some(output) = pump(&mut client, &incoming, &sender, deadline) else {
+                    break;
+                };
+                cleared = published(&output, &editor, started)
+                    .iter()
+                    .any(|(stamp, list)| *stamp == fixed && !mismatched(list));
+            }
+            assert!(cleared, "a publish for the fixed text drops the type error");
+            let quiet = Instant::now() + Duration::from_secs(2);
+            while let Some(output) = pump(&mut client, &incoming, &sender, quiet) {
+                for (_, list) in published(&output, &editor, started) {
+                    assert!(!mismatched(&list), "the type error stays cleared: {list:?}");
+                }
+            }
 
             sender.send(client.shutdown().messages);
             let deadline = Instant::now() + Duration::from_secs(10);
