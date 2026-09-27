@@ -150,17 +150,20 @@ against a scripted in-process server and shows the traffic.
 cargo run -p scrive-iced --example minimal   # the CodeEditor quick start above
 cargo run -p scrive-iced --example scratch   # the low-level Editor widget, full control
 cargo run -p scrive-iced --features lsp --example lsp   # two tabs on a scripted language server
+cargo run -p scrive-iced --features lsp --example rust_analyzer   # a real rust-analyzer, on a scratch crate
+cargo run -p scrive-iced --features lsp --example rust_analyzer -- path/to/file.rs   # …or on your file
 ```
 
 `scratch` opens a real editor over a sample Rust document — type, select, find
 (Ctrl+F), fold, and undo/redo. `lsp` shows the traffic panel next to the
 editor. Press F12 on `greet`, F2 to rename it across both files, or Shift+Alt+F
-to format.
+to format. `rust_analyzer` is native only and needs rust-analyzer on `PATH`; it
+talks to the server over stdio, and the status bar shows its messages.
 
 ## Web (wasm32)
 
-All three crates build for `wasm32-unknown-unknown`, and the examples run in the
-browser. The web has no system fonts, so on wasm32 the editor's default font is
+All three crates build for `wasm32-unknown-unknown`, and every example but
+`rust_analyzer` runs in the browser. The web has no system fonts, so on wasm32 the editor's default font is
 the bundled Fira Code ([`FIRA_CODE_FONT`](https://docs.rs/scrive-iced/latest/scrive_iced/constant.FIRA_CODE_FONT.html)), with its ligatures,
 which `required_fonts()` includes there. Enable iced's `fira-sans` feature for
 UI text such as the find bar, and `webgl` for browsers without WebGPU. There
