@@ -193,13 +193,14 @@ fn skip_fold_right(buffer: &Buffer, folds: &FoldMap, off: u32) -> u32 {
 /// Vertical motion by a signed row `delta` (±1 for Up/Down, ±page for the Page
 /// moves), honoring a *visual* goal column — a display cell, not a byte column:
 /// the caret keeps its on-screen column through tab stops, collapsed
-/// inline folds, and a collapsed block's one-line placeholder. Stepping happens
+/// inline folds, inlay hints, and a collapsed block's one-line placeholder. Stepping happens
 /// in DISPLAY rows (a folded interior is not a display row, so the caret can
 /// never land inside a fold), and the landing resolves through the standard
 /// inverse projection ([`Rows::hit`]) — exactly like a click at the goal
 /// cell: a goal in a collapsed header's gap clamps to the header's end, one
 /// over the tail lands on the tail's real offset, one on a chip snaps to its
-/// landable left edge, one mid-tab snaps by bias, and past-EOL clamps.
+/// landable left edge, one on an inlay hint lands on the hint's offset, one
+/// mid-tab snaps by bias, and past-EOL clamps.
 /// Overshooting the top lands at the document start, the bottom at the
 /// document end — so a single-row move at an edge lands on the nearest document
 /// end, and page moves that overshoot collapse to those same ends.
@@ -699,5 +700,53 @@ mod tests {
         // Home collapses every caret to column 0 → they merge into one.
         mv(&mut set, &b, Motion::LineStart, false);
         assert_eq!(set.len(), 1);
+    }
+
+    /// `let ab: i32 = f(n: cd); end` over `let abcdefghijklmnopqrstuvwxyz0123`.
+    fn hinted_doc() -> crate::document::Document {
+        use crate::intel::inlay;
+        let mut doc = crate::document::Document::new("let ab = f(cd);\nlet abcdefghijklmnopqrstuvwxyz0123\n").unwrap();
+        let hint = |kind, label, key| {
+            inlay::Hint::new(kind, vec![inlay::Part::new(label, inlay::Link::None)], inlay::Key::new(key)).unwrap()
+        };
+        let placed = vec![
+            inlay::Placed::new(6, hint(inlay::Kind::Type, ": i32", 1)),
+            inlay::Placed::new(11, hint(inlay::Kind::Parameter, "n:", 2).padding(inlay::Padding { left: false, right: true })),
+            inlay::Placed::new(15, hint(inlay::Kind::Other, "end", 3).padding(inlay::Padding { left: true, right: false })),
+        ];
+        assert_eq!(doc.set_inlays(doc.revision(), placed), inlay::Outcome::Applied { count: 3 });
+        doc
+    }
+
+    /// Up and Down keep the caret's on-screen column across hints: a goal on
+    /// a hint lands on its offset and survives the next move.
+    #[test]
+    fn vertical_motion_keeps_the_visual_column_across_hints() {
+        let mut doc = hinted_doc();
+        let caret_cell = |doc: &crate::document::Document| {
+            let head = doc.selections().newest().head();
+            doc.rows().position(head, Edge::Caret).expect("visible").x
+        };
+        let cases = [(28, Motion::Up, 7, 12.0), (24, Motion::Up, 6, 6.0), (7, Motion::Down, 28, 12.0), (34, Motion::Up, 11, 19.0)];
+        for (from, motion, lands, drawn) in cases {
+            doc.set_selections(SelectionSet::new(from));
+            doc.move_carets(motion, false);
+            assert_eq!(doc.selections().newest().head(), lands, "{motion:?} from {from}");
+            assert_eq!(caret_cell(&doc).cells(), drawn, "{motion:?} from {from}: drawn cell");
+            if motion == Motion::Up {
+                doc.move_carets(Motion::Down, false);
+                assert_eq!(doc.selections().newest().head(), from, "Down from {lands} returns to {from}: the goal survived");
+            }
+        }
+    }
+
+    /// Adding a caret above lands on the visual column, not the byte column.
+    #[test]
+    fn add_caret_vertical_lands_on_the_visual_column_across_hints() {
+        let mut doc = hinted_doc();
+        doc.set_selections(SelectionSet::new(28));
+        doc.add_caret_vertical(false);
+        let heads: Vec<u32> = doc.selections().all().iter().map(crate::Selection::head).collect();
+        assert_eq!(heads, vec![7, 28], "the new caret sits under cell 12");
     }
 }

@@ -140,6 +140,34 @@ pub struct Shown {
     hint: Arc<Hint>,
 }
 
+/// What a display cell on an inlay hint holds.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum At {
+    /// A label part.
+    Label {
+        /// The hint's key.
+        key: Key,
+        /// Index of the part in the hint's label.
+        part: u32,
+        /// The buffer offset the hint renders at.
+        offset: u32,
+        /// Whether the part leads somewhere.
+        link: Link,
+        /// Whether the host can insert the hint as text.
+        insert: Insert,
+        /// The part's display cells on the row.
+        cells: Range<u32>,
+    },
+    /// A padding cell: editor background, so neither a hover or link target
+    /// nor the word beneath it.
+    Padding {
+        /// The hint's key.
+        key: Key,
+        /// The buffer offset the hint renders at.
+        offset: u32,
+    },
+}
+
 /// The result of installing a hint set.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
@@ -365,6 +393,14 @@ impl Anchor {
 
     pub(crate) fn hint(&self) -> &Hint {
         &self.hint
+    }
+
+    pub(crate) fn side(&self) -> Side {
+        self.side
+    }
+
+    pub(crate) fn index(&self) -> u32 {
+        self.index
     }
 
     pub(crate) fn is_anchored(&self) -> bool {

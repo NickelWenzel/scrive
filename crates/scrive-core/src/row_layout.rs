@@ -10,6 +10,10 @@
 //! facts has exactly one definition, a change to the chip layout or a boundary
 //! rule is a one-site edit and every site stays in agreement by construction.
 //!
+//! Inlay hints are part of the row: they take cells but no bytes, so the text
+//! after one shifts right and an offset with hints spans several cells (see
+//! [`Edge`]).
+//!
 //! Everything here is in **cells and columns** — GUI-free. The widget's only
 //! remaining job is `x = origin + cell × advance` (and its inverse).
 
@@ -20,9 +24,10 @@ use std::rc::Rc;
 
 use crate::buffer::Buffer;
 use crate::coords::{Bias, Point};
-use crate::decorations::DecorationStore;
+use crate::decorations::{DecorationKind, DecorationStore};
 use crate::display_map::{self, BufferRow, DisplayRow};
 use crate::fold_map::{FoldMap, InlineFold};
+use crate::intel::inlay;
 
 // Op-count canary: counts `FoldMap::renders` and `Rows::position` probes on
 // this thread so a test can assert `expand_folds_touched` probes O(edit points)
@@ -120,6 +125,23 @@ pub struct TailGlyph {
     pub ch: char,
 }
 
+/// One inlay hint as it lays out on a row: what [`RowLayout::inlays`] yields.
+#[derive(Clone, Copy, Debug)]
+pub struct Inlay<'a> {
+    /// The hint's key.
+    pub key: inlay::Key,
+    /// The buffer offset the hint renders at.
+    pub offset: u32,
+    /// The hint's first display cell, its left padding included.
+    pub cell: u32,
+    /// Cells the hint takes, padding included.
+    pub width: u32,
+    /// The blank cells around its label.
+    pub padding: inlay::Padding,
+    /// The hint itself, for its label parts.
+    pub hint: &'a inlay::Hint,
+}
+
 /// Which region of a collapsed block header's display line a cell falls in.
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum HeaderHit {
@@ -192,13 +214,35 @@ struct InlineSpan {
     fold: InlineFold,
 }
 
+/// One inlay hint laid out on a row.
+#[derive(Copy, Clone, Debug)]
+struct HintSpan<'a> {
+    /// Byte column of the hint's render offset.
+    col: u32,
+    /// Tab-expanded, pre-collapse cell of `col`.
+    raw_cell: u32,
+    anchor: &'a inlay::Anchor,
+    inlay: Inlay<'a>,
+}
+
+impl HintSpan<'_> {
+    fn width(&self) -> u32 {
+        self.inlay.width
+    }
+
+    fn side(&self) -> inlay::Side {
+        self.anchor.side()
+    }
+}
+
 /// A visible buffer row's horizontal projection: byte column ↔ display cell,
 /// with tab expansion *and* the horizontal collapse of every root inline fold
-/// on the row. Built by [`Rows::layout`], which shares it for the view's
-/// lifetime; holds only the row's text (a [`Cow`] — borrowed straight off the
-/// backing when the row is stored contiguously, owned only when it spans a
-/// chunk boundary) and copies of the row's folds, so it carries no derived
-/// state that could drift out of sync with the document.
+/// on the row, and the row's inlay hints. Built by [`Rows::layout`], which
+/// shares it for the view's lifetime; holds only the row's text (a [`Cow`] —
+/// borrowed straight off the backing when the row is stored contiguously,
+/// owned only when it spans a chunk boundary), copies of the row's folds and
+/// the row's hints borrowed from the document, so it carries no derived state
+/// that could drift out of sync with the document.
 pub struct RowLayout<'a> {
     line: Cow<'a, str>,
     /// Byte offset of the row's first character (column 0), for offset-space
@@ -207,10 +251,14 @@ pub struct RowLayout<'a> {
     tab: u32,
     /// This row's root inline folds, sorted by opening cell.
     spans: Vec<InlineSpan>,
+    /// This row's laid-out inlay hints, in render order.
+    hints: Vec<HintSpan<'a>>,
 }
 
 impl<'a> RowLayout<'a> {
-    fn new(fold_map: &FoldMap, buffer: &'a Buffer, row: BufferRow, tab: u32) -> Self {
+    /// The layout of `row`, with the hints `inlays` holds for it; `None` lays
+    /// the row out without hints.
+    fn new(fold_map: &FoldMap, buffer: &'a Buffer, inlays: Option<&'a DecorationStore>, row: BufferRow, tab: u32) -> Self {
         let line = buffer.line(row.0);
         let row_start = buffer.point_to_offset(Point::new(row.0, 0));
         // This row's inline folds — an O(log n + hits) windowed descent into the
@@ -225,13 +273,25 @@ impl<'a> RowLayout<'a> {
             })
             .collect();
         spans.sort_by_key(|s| s.open_cell);
-        Self { line, row_start, tab, spans }
+        let hints = match inlays {
+            Some(store) if !fold_map.is_folded(row) => hints_on_row(store, &line, row_start, &spans, tab),
+            _ => Vec::new(),
+        };
+        let mut layout = Self { line, row_start, tab, spans, hints };
+        let mut prior = 0;
+        for i in 0..layout.hints.len() {
+            let cell = layout.cell_of(layout.hints[i].raw_cell) + prior;
+            layout.hints[i].inlay.cell = cell;
+            prior += layout.hints[i].width();
+        }
+        layout
     }
 
-    /// Whether the row has no collapsed inline folds (the identity projection).
+    /// Whether the row has no collapsed inline folds and no inlay hints (the
+    /// identity projection).
     #[must_use]
     pub fn is_plain(&self) -> bool {
-        self.spans.is_empty()
+        self.spans.is_empty() && self.hints.is_empty()
     }
 
     /// Byte offset of the row's column 0 — for turning a chip's byte columns back
@@ -257,26 +317,49 @@ impl<'a> RowLayout<'a> {
         (raw_cell as i32 - self.shift_at(raw_cell)).max(0) as u32
     }
 
-    /// Byte column → display cell (tab-expanded, inline-collapsed), on the
-    /// `edge` side of any hints at `col`. Total and monotone; a column hidden
-    /// inside a chip maps into the chip's span (use [`Self::caret_cell`] for
-    /// caret placement, which clips to the center).
-    #[must_use]
-    pub fn display_cell(&self, col: u32, _edge: Edge) -> u32 {
-        self.cell_of(display_map::expand(&self.line, col, self.tab))
+    /// Total width of the hints left of byte column `col` under `edge`.
+    fn hint_cells(&self, col: u32, edge: Edge) -> u32 {
+        self.hints
+            .iter()
+            .take_while(|h| h.col <= col)
+            .filter(|h| h.col < col || edge.passes(h.side()))
+            .map(HintSpan::width)
+            .sum()
     }
 
-    /// Caret placement for a byte column: its display cell, or the chip center
-    /// when the column is hidden inside a collapsed inline fold's gap.
+    /// Display cell of the chip for inline span `s`, one past its opening
+    /// bracket.
+    fn chip_cell(&self, s: &InlineSpan) -> u32 {
+        self.cell_of(s.open_cell + 1) + self.hint_cells(s.fold.left_edge() - self.row_start, Edge::End)
+    }
+
+    /// Byte column → display cell (tab-expanded, inline-collapsed, inlay
+    /// hints counted), on the `edge` side of any hints at `col`. Total and
+    /// monotone for each edge, and `End <= Caret <= Start` at every column; a
+    /// column hidden inside a chip maps into the chip's span (use
+    /// [`Self::caret_cell`] for caret placement, which clips to the center).
     #[must_use]
-    pub fn caret_cell(&self, col: u32) -> CaretCell {
+    pub fn display_cell(&self, col: u32, edge: Edge) -> u32 {
+        self.cell_of(display_map::expand(&self.line, col, self.tab)) + self.hint_cells(col, edge)
+    }
+
+    /// Where a byte column renders on the `edge` side of any hints there: its
+    /// display cell, or the chip center when the column is hidden inside a
+    /// collapsed inline fold's gap.
+    #[must_use]
+    pub fn edge_cell(&self, col: u32, edge: Edge) -> CaretCell {
         let off = self.row_start + col;
         match self.spans.iter().find(|s| s.fold.hides_caret_at(off)) {
-            Some(s) => CaretCell::ChipCenter(
-                self.cell_of(s.open_cell + 1) as f32 + INLINE_CHIP_CELLS as f32 / 2.0,
-            ),
-            None => CaretCell::Cell(self.display_cell(col, Edge::Caret)),
+            Some(s) => CaretCell::ChipCenter(self.chip_cell(s) as f32 + INLINE_CHIP_CELLS as f32 / 2.0),
+            None => CaretCell::Cell(self.display_cell(col, edge)),
         }
+    }
+
+    /// Caret placement for a byte column: [`Self::edge_cell`] on the
+    /// [`Edge::Caret`] side.
+    #[must_use]
+    pub fn caret_cell(&self, col: u32) -> CaretCell {
+        self.edge_cell(col, Edge::Caret)
     }
 
     /// Whether the glyph at byte column `col` is hidden inside a collapsed
@@ -290,11 +373,30 @@ impl<'a> RowLayout<'a> {
 
     /// Inverse projection: a (fractional, unrounded) display cell → the byte
     /// column a click there lands on. Rounding policy lives HERE, not at call
-    /// sites. A cell on a chip resolves to just after the opening bracket;
+    /// sites. A cell on an inlay hint, label or padding, resolves to the
+    /// hint's offset; a cell on a chip to just after the opening bracket;
     /// past-EOL clamps; mid-tab snaps by `bias`.
     #[must_use]
     pub fn hit(&self, cell: f32, bias: Bias) -> u32 {
         let dc = cell.round().max(0.0) as u32;
+        let mut passed = 0;
+        for group in self.hints.chunk_by(|a, b| a.col == b.col) {
+            let left = self.cell_of(group[0].raw_cell) + passed;
+            if dc < left {
+                break;
+            }
+            let width: u32 = group.iter().map(HintSpan::width).sum();
+            if dc <= left + width {
+                return group[0].col;
+            }
+            passed += width;
+        }
+        self.hit_unhinted(dc - passed, bias)
+    }
+
+    /// [`Self::hit`] on the row without its hints: `dc` is a whole display
+    /// cell with every hint left of it taken out.
+    fn hit_unhinted(&self, dc: u32, bias: Bias) -> u32 {
         let mut extra = 0i32;
         for s in &self.spans {
             // Compare in DISPLAY space: prior collapsed folds shift this
@@ -311,8 +413,8 @@ impl<'a> RowLayout<'a> {
         display_map::collapse(&self.line, raw_cell, self.tab, bias)
     }
 
-    /// The row's rendered display width in cells (tab-expanded, collapsed).
-    /// A collapsed block's inline tail begins [`FOLD_PLACEHOLDER_CELLS`] past
+    /// The row's rendered display width in cells (tab-expanded, collapsed),
+    /// including the inlay hints at the line end. A collapsed block's inline tail begins [`FOLD_PLACEHOLDER_CELLS`] past
     /// this — see [`HeaderLayout::tail_cell`].
     #[must_use]
     pub fn width(&self) -> u32 {
@@ -322,7 +424,7 @@ impl<'a> RowLayout<'a> {
     /// The row's collapsed chips, in display order.
     pub fn chips(&self) -> impl Iterator<Item = Chip> + '_ {
         self.spans.iter().map(|s| {
-            let cell = self.cell_of(s.open_cell + 1);
+            let cell = self.chip_cell(s);
             Chip {
                 cell,
                 center: cell as f32 + INLINE_CHIP_CELLS as f32 / 2.0,
@@ -330,6 +432,42 @@ impl<'a> RowLayout<'a> {
                 close_col: s.fold.close - self.row_start,
             }
         })
+    }
+
+    /// This row's laid-out inlay hints, in render order.
+    pub fn inlays(&self) -> impl Iterator<Item = &Inlay<'a>> + '_ {
+        self.hints.iter().map(|h| &h.inlay)
+    }
+
+    /// What the inlay hint under fractional display cell `cell` holds there:
+    /// a label part, or its padding. `None` off every hint.
+    #[must_use]
+    pub fn inlay_at(&self, cell: f32) -> Option<inlay::At> {
+        if cell < 0.0 {
+            return None;
+        }
+        let k = cell.floor() as u32;
+        let h = self.hints.iter().map(|h| h.inlay).find(|h| k < h.cell + h.width)?;
+        if k < h.cell {
+            return None;
+        }
+        let mut at = h.cell + u32::from(h.padding.left);
+        for (part, p) in h.hint.parts().iter().enumerate() {
+            let n = p.text().chars().count() as u32;
+            if (at..at + n).contains(&k) {
+                let insert = if h.hint.insertable() { inlay::Insert::Available } else { inlay::Insert::Unavailable };
+                return Some(inlay::At::Label {
+                    key: h.key,
+                    part: part as u32,
+                    offset: h.offset,
+                    link: p.link(),
+                    insert,
+                    cells: at..at + n,
+                });
+            }
+            at += n;
+        }
+        Some(inlay::At::Padding { key: h.key, offset: h.offset })
     }
 }
 
@@ -365,7 +503,7 @@ impl<'a> HeaderLayout<'a> {
 
     /// Rendered display width of the header text — where the placeholder gap
     /// begins. Inline-fold aware: a collapsed inline fold before the block's
-    /// opener shrinks it.
+    /// opener shrinks it, and inlay hints on the header widen it.
     #[must_use]
     pub fn head_cells(&self) -> u32 {
         self.head.width()
@@ -457,7 +595,7 @@ impl FoldMap {
     /// shares one per row for a view's lifetime.
     #[must_use]
     pub(crate) fn row_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> RowLayout<'a> {
-        RowLayout::new(self, buffer, row, tab)
+        RowLayout::new(self, buffer, None, row, tab)
     }
 
     /// The `head … tail` one-line layout of `row`, iff it is a collapsed block
@@ -487,23 +625,6 @@ impl FoldMap {
             .is_some_and(|layout| layout.tail_col_cell(p.col).is_some())
     }
 
-    /// Inverse of [`Rows::position`] on one visible row: a (fractional,
-    /// unrounded) display cell → the byte offset a click there lands on,
-    /// resolving a collapsed header's gap (→ header line end) and tail
-    /// (→ the last row's column) before the plain row projection.
-    #[must_use]
-    pub(crate) fn hit_row(&self, buffer: &Buffer, row: BufferRow, cell: f32, bias: Bias, tab: u32) -> u32 {
-        if let Some(layout) = self.header_layout(buffer, row, tab) {
-            match layout.hit(cell, bias) {
-                HeaderHit::Tail(col) => return buffer.point_to_offset(Point::new(layout.last_row().0, col)),
-                HeaderHit::Gap => return buffer.point_to_offset(Point::new(row.0, buffer.line_len(row.0))),
-                HeaderHit::Head => {}
-            }
-        }
-        let layout = self.row_layout(buffer, row, tab);
-        buffer.point_to_offset(Point::new(row.0, layout.hit(cell, bias)))
-    }
-
     /// THE pixel-y inversion policy, in row units: a (fractional) count of
     /// display rows from the content top → the display row it falls on,
     /// floored and clamped to the valid range. Every y-driven hit (clicks,
@@ -530,14 +651,14 @@ impl FoldMap {
 pub struct Rows<'a> {
     folds: Ref<'a, FoldMap>,
     buffer: &'a Buffer,
-    _inlays: &'a DecorationStore,
+    inlays: &'a DecorationStore,
     tab: u32,
     built: RefCell<HashMap<BufferRow, Rc<RowLayout<'a>>>>,
 }
 
 impl<'a> Rows<'a> {
     pub(crate) fn new(folds: Ref<'a, FoldMap>, buffer: &'a Buffer, inlays: &'a DecorationStore, tab: u32) -> Self {
-        Self { folds, buffer, _inlays: inlays, tab, built: RefCell::new(HashMap::new()) }
+        Self { folds, buffer, inlays, tab, built: RefCell::new(HashMap::new()) }
     }
 
     /// The fold projection: buffer ↔ display rows, visible rows, fold lookups.
@@ -562,7 +683,7 @@ impl<'a> Rows<'a> {
         if let Some(layout) = cached {
             return layout;
         }
-        let layout = Rc::new(self.folds.row_layout(self.buffer, row, self.tab));
+        let layout = Rc::new(RowLayout::new(&self.folds, self.buffer, Some(self.inlays), row, self.tab));
         self.built.borrow_mut().insert(row, Rc::clone(&layout));
         layout
     }
@@ -581,14 +702,14 @@ impl<'a> Rows<'a> {
     /// center. `None` iff the offset is hidden: inside a block fold's gap, or
     /// on the last row before the visible tail.
     #[must_use]
-    pub fn position(&self, offset: u32, _edge: Edge) -> Option<DisplayPosition> {
+    pub fn position(&self, offset: u32, edge: Edge) -> Option<DisplayPosition> {
         #[cfg(any(test, debug_assertions))]
         DISPLAY_POSITION_PROBES.with(|c| c.set(c.get() + 1));
         crate::perf::charge(1); // complexity gate: one display-map probe
         let p = self.buffer.offset_to_point(offset);
         let row = BufferRow(p.row);
         if !self.folds.is_folded(row) {
-            return Some(DisplayPosition { row: self.folds.to_display_row(row), x: self.layout(row).caret_cell(p.col) });
+            return Some(DisplayPosition { row: self.folds.to_display_row(row), x: self.layout(row).edge_cell(p.col, edge) });
         }
         // A hidden row renders only a collapsed fold's closing tail, on the
         // header's display line.
@@ -603,7 +724,75 @@ impl<'a> Rows<'a> {
     /// row's column.
     #[must_use]
     pub fn hit(&self, row: BufferRow, cell: f32, bias: Bias) -> u32 {
-        self.folds.hit_row(self.buffer, row, cell, bias, self.tab)
+        if let Some(header) = self.header(row) {
+            match header.hit(cell, bias) {
+                HeaderHit::Tail(col) => return self.buffer.point_to_offset(Point::new(header.last_row().0, col)),
+                HeaderHit::Gap => return self.buffer.point_to_offset(Point::new(row.0, self.buffer.line_len(row.0))),
+                HeaderHit::Head => {}
+            }
+        }
+        self.buffer.point_to_offset(Point::new(row.0, self.layout(row).hit(cell, bias)))
+    }
+
+    /// What the inlay hint under `cell` on visible `row` holds there; `None`
+    /// over text, or over a collapsed header's gap and tail.
+    #[must_use]
+    pub fn inlay_at(&self, row: BufferRow, cell: f32) -> Option<inlay::At> {
+        if let Some(header) = self.header(row) {
+            if header.hit(cell, Bias::Left) != HeaderHit::Head {
+                return None;
+            }
+        }
+        self.layout(row).inlay_at(cell)
+    }
+}
+
+impl Edge {
+    /// Whether a hint of `side` at the projected offset lies left of this edge.
+    fn passes(self, side: inlay::Side) -> bool {
+        match (self, side) {
+            (Self::Start, inlay::Side::Prefix | inlay::Side::Suffix) | (Self::Caret, inlay::Side::Prefix) => true,
+            (Self::End, inlay::Side::Prefix | inlay::Side::Suffix) | (Self::Caret, inlay::Side::Suffix) => false,
+        }
+    }
+}
+
+/// The hints that render on the row at `row_start` with text `line`, outside
+/// its collapsed inline folds, in `(column, Prefix before Suffix, server
+/// index)` order.
+fn hints_on_row<'a>(
+    inlays: &'a DecorationStore,
+    line: &str,
+    row_start: u32,
+    spans: &[InlineSpan],
+    tab: u32,
+) -> Vec<HintSpan<'a>> {
+    let row_end = row_start + line.len() as u32;
+    let mut out = Vec::new();
+    inlays.visit_in(row_start..row_end, |range, kind| {
+        let DecorationKind::InlayHint(anchor) = kind else {
+            debug_assert!(false, "the inlay store holds only inlay hints");
+            return;
+        };
+        let Some(offset) = anchor.render_offset(range, row_start, row_end, line) else { return };
+        let col = offset - row_start;
+        debug_assert!(line.is_char_boundary(col as usize), "a hint renders on a char boundary");
+        if spans.iter().any(|s| s.fold.open < offset && offset <= s.fold.close) {
+            return;
+        }
+        let hint = anchor.hint();
+        let inlay = Inlay { key: hint.key(), offset, cell: 0, width: hint.width(), padding: hint.padded(), hint };
+        out.push(HintSpan { col, raw_cell: display_map::expand(line, col, tab), anchor, inlay });
+    });
+    out.sort_by_key(|h| (h.col, side_rank(h.side()), h.anchor.index()));
+    out
+}
+
+/// Render order of the sides at one offset: prefixes, then suffixes.
+fn side_rank(side: inlay::Side) -> u8 {
+    match side {
+        inlay::Side::Prefix => 0,
+        inlay::Side::Suffix => 1,
     }
 }
 
@@ -745,21 +934,21 @@ mod tests {
     }
 
     #[test]
-    fn hit_row_resolves_head_gap_and_tail() {
+    fn rows_hit_resolves_head_gap_and_tail() {
         let text = "ab {\nhidden\n}\n";
         let block_open = text.find('{').unwrap() as u32;
         let doc = doc_with_folds(text, &[block_open]);
-        let fm = fold_map(&doc);
+        let rows = doc.rows();
         let buffer = doc.buffer();
-        let hl = fm.header_layout(buffer, BufferRow(0), 4).unwrap();
+        let hl = rows.header(BufferRow(0)).unwrap();
         // Head: cell 0 → offset 0.
-        assert_eq!(fm.hit_row(buffer, BufferRow(0), 0.0, Bias::Left, 4), 0);
+        assert_eq!(rows.hit(BufferRow(0), 0.0, Bias::Left), 0);
         // Gap: between head end and tail → clamps to the header line's end.
         let gap_cell = hl.head_cells() as f32 + FOLD_PLACEHOLDER_CELLS as f32 / 2.0;
-        assert_eq!(fm.hit_row(buffer, BufferRow(0), gap_cell, Bias::Left, 4), buffer.line_len(0));
+        assert_eq!(rows.hit(BufferRow(0), gap_cell, Bias::Left), buffer.line_len(0));
         // Tail: the tail cell → the `}` on the last row.
         let tail_off = buffer.point_to_offset(Point::new(2, 0));
-        assert_eq!(fm.hit_row(buffer, BufferRow(0), hl.tail_cell() as f32, Bias::Left, 4), tail_off);
+        assert_eq!(rows.hit(BufferRow(0), hl.tail_cell() as f32, Bias::Left), tail_off);
     }
 
     #[test]
@@ -842,6 +1031,426 @@ mod tests {
             let row = rows.folds().to_buffer_row(p.row);
             assert_eq!(rows.hit(row, p.x.cells(), Bias::Left), offset, "offset {offset} round-trips");
         }
+    }
+
+    // ── Inlay hints ──
+
+    fn hint(kind: inlay::Kind, parts: &[(&str, inlay::Link)], key: u64) -> inlay::Hint {
+        let parts = parts.iter().map(|&(text, link)| inlay::Part::new(text, link)).collect();
+        inlay::Hint::new(kind, parts, inlay::Key::new(key)).expect("a visible label")
+    }
+
+    fn plain(kind: inlay::Kind, label: &str, key: u64) -> inlay::Hint {
+        hint(kind, &[(label, inlay::Link::None)], key)
+    }
+
+    fn pad(left: bool, right: bool) -> inlay::Padding {
+        inlay::Padding { left, right }
+    }
+
+    /// Install `hints` at the current revision.
+    fn install(doc: &mut Document, hints: Vec<(u32, inlay::Hint)>) {
+        let count = hints.len();
+        let placed = hints.into_iter().map(|(offset, hint)| inlay::Placed::new(offset, hint)).collect();
+        let outcome = doc.set_inlays(doc.revision(), placed);
+        assert_eq!(outcome, inlay::Outcome::Applied { count }, "a current set installs");
+    }
+
+    /// `let ab: i32 = f(n: cd); end` over two rows; the second has no hints.
+    fn main_doc() -> Document {
+        let mut doc = doc_with_folds("let ab = f(cd);\nlet abcdefghijklmnopqrstuvwxyz0123\n", &[]);
+        install(
+            &mut doc,
+            vec![
+                (6, hint(inlay::Kind::Type, &[(": ", inlay::Link::None), ("i32", inlay::Link::Jumps)], 1)),
+                (11, plain(inlay::Kind::Parameter, "n:", 2).padding(pad(false, true))),
+                (15, plain(inlay::Kind::Other, "end", 3).padding(pad(true, false))),
+            ],
+        );
+        doc
+    }
+
+    /// `g(x)(a)` with a suffix `ss` and a prefix `ppp` both at offset 4, moved
+    /// there by deleting the space between their fetch offsets.
+    fn mixed_doc() -> Document {
+        let mut doc = doc_with_folds("g(x) (a)", &[]);
+        install(&mut doc, vec![(4, plain(inlay::Kind::Type, "ss", 1)), (5, plain(inlay::Kind::Parameter, "ppp", 2))]);
+        doc.edit(vec![crate::EditOp::new(4..5, "")]).expect("delete the space");
+        doc
+    }
+
+    /// `x[abcd]y` with the pair collapsed: hints at both brackets' outer sides
+    /// show, the two inside the pair don't.
+    fn chip_doc() -> Document {
+        let mut doc = doc_with_folds("x[abcd]y", &[1]);
+        install(
+            &mut doc,
+            vec![
+                (1, plain(inlay::Kind::Type, "aa", 1)),
+                (7, plain(inlay::Kind::Parameter, "bb", 2)),
+                (2, plain(inlay::Kind::Parameter, "cc", 3)),
+                (6, plain(inlay::Kind::Type, "dd", 4)),
+            ],
+        );
+        doc
+    }
+
+    /// `fn f(a) {` collapsed over `    body` and `}`, with a hint on each row.
+    fn header_doc() -> Document {
+        let mut doc = doc_with_folds("fn f(a) {\n    body\n}\n", &[8]);
+        install(
+            &mut doc,
+            vec![
+                (5, plain(inlay::Kind::Parameter, "x:", 1).padding(pad(false, true))),
+                (18, plain(inlay::Kind::Type, ": T", 2)),
+                (20, plain(inlay::Kind::Other, "fn f", 3).padding(pad(true, false))),
+            ],
+        );
+        doc
+    }
+
+    fn keys(layout: &RowLayout<'_>) -> Vec<inlay::Key> {
+        layout.inlays().map(|i| i.key).collect()
+    }
+
+    fn key_list(raw: &[u64]) -> Vec<inlay::Key> {
+        raw.iter().copied().map(inlay::Key::new).collect()
+    }
+
+    /// Byte columns a caret can land on: char boundaries outside a chip's gap.
+    fn landable(layout: &RowLayout<'_>, line: &str) -> Vec<u32> {
+        line.char_indices()
+            .map(|(i, _)| i as u32)
+            .chain([line.len() as u32])
+            .filter(|&col| matches!(layout.caret_cell(col), CaretCell::Cell(_)))
+            .collect()
+    }
+
+    const EDGES: [Edge; 3] = [Edge::Start, Edge::End, Edge::Caret];
+
+    /// At one column prefixes render before suffixes whatever the server
+    /// order; otherwise hints render by column, then in server order.
+    #[test]
+    fn hints_sort_by_column_then_prefix_then_server_index() {
+        let doc = mixed_doc();
+        assert_eq!(keys(&doc.rows().layout(BufferRow(0))), key_list(&[2, 1]), "the prefix P renders before the suffix S");
+        let doc = main_doc();
+        assert_eq!(keys(&doc.rows().layout(BufferRow(0))), key_list(&[1, 2, 3]), "by column");
+    }
+
+    /// Each edge counts the hints at a column it passes; every edge is
+    /// monotone and `End <= Caret <= Start` everywhere.
+    #[test]
+    fn each_edge_places_the_hints_at_an_offset() {
+        let doc = main_doc();
+        let rows = doc.rows();
+        let layout = rows.layout(BufferRow(0));
+        let mut expected: Vec<(u32, u32, u32)> = (0..=5).map(|c| (c, c, c)).collect();
+        expected.extend([(6, 6, 11), (12, 12, 12), (13, 13, 13), (14, 14, 14), (15, 15, 15)]);
+        expected.extend([(16, 19, 19), (20, 20, 20), (21, 21, 21), (22, 22, 22), (23, 23, 27)]);
+        for (col, &(end, caret, start)) in expected.iter().enumerate() {
+            let col = col as u32;
+            let got = (layout.display_cell(col, Edge::End), layout.display_cell(col, Edge::Caret), layout.display_cell(col, Edge::Start));
+            assert_eq!(got, (end, caret, start), "col {col}: End, Caret, Start");
+            assert!(got.0 <= got.1 && got.1 <= got.2, "col {col}: End <= Caret <= Start");
+        }
+        for edge in EDGES {
+            let cells: Vec<u32> = (0..=15).map(|col| layout.display_cell(col, edge)).collect();
+            assert!(cells.windows(2).all(|w| w[0] <= w[1]), "{edge:?} is monotone: {cells:?}");
+        }
+        assert_eq!(layout.caret_cell(6), CaretCell::Cell(6), "a suffix renders after the caret");
+        assert_eq!(layout.caret_cell(11), CaretCell::Cell(19), "a prefix renders before the caret");
+        assert_eq!(layout.caret_cell(15), CaretCell::Cell(23), "an end-of-line suffix renders after the caret");
+        for (offset, edge, cell) in [(6, Edge::Start, 11), (11, Edge::End, 16), (15, Edge::Caret, 23)] {
+            let p = rows.position(offset, edge).expect("visible");
+            assert_eq!((p.row, p.x), (DisplayRow(0), CaretCell::Cell(cell)), "position({offset}, {edge:?})");
+        }
+    }
+
+    /// With both groups at one offset the caret sits between them, where the
+    /// next typed char lands; one-sided groups render in server order.
+    #[test]
+    fn a_shared_offset_puts_the_caret_between_the_prefix_and_suffix_groups() {
+        let mut doc = mixed_doc();
+        {
+            let layout = doc.rows().layout(BufferRow(0));
+            let cells = EDGES.map(|e| layout.display_cell(4, e));
+            assert_eq!(cells, [9, 4, 7], "Start, End, Caret at the shared offset");
+            assert_eq!(layout.display_cell(3, Edge::Start), 3);
+            assert_eq!(layout.display_cell(5, Edge::End), 10);
+            assert_eq!(layout.width(), 12);
+        }
+        doc.set_selections(crate::SelectionSet::new(4));
+        doc.type_char('X');
+        let rows = doc.rows();
+        let layout = rows.layout(BufferRow(0));
+        assert_eq!(layout.display_cell(4, Edge::Start), 7, "X renders at the old caret cell");
+        let at: Vec<(inlay::Key, u32)> = layout.inlays().map(|i| (i.key, i.offset)).collect();
+        assert_eq!(at, vec![(inlay::Key::new(2), 4), (inlay::Key::new(1), 5)], "P stays left of X, S moves right of it");
+
+        let mut doc = doc_with_folds("let x = 1;", &[]);
+        install(&mut doc, vec![(5, plain(inlay::Kind::Type, "a", 1)), (5, plain(inlay::Kind::Type, "bb", 2))]);
+        let layout = doc.rows().layout(BufferRow(0));
+        assert_eq!(keys(&layout), key_list(&[1, 2]), "server order");
+        assert_eq!(layout.inlays().map(|i| i.cell).collect::<Vec<_>>(), vec![5, 6]);
+        assert_eq!(layout.display_cell(5, Edge::Caret), layout.display_cell(5, Edge::End), "the caret precedes a suffix group");
+        assert_eq!(layout.display_cell(5, Edge::Start), 8);
+    }
+
+    /// An empty range projects both ends with `Caret`: `Start..End` would be
+    /// inverted over the hints at its offset.
+    #[test]
+    fn an_empty_range_uses_the_caret_edge_for_both_ends() {
+        let doc = mixed_doc();
+        let rows = doc.rows();
+        let cell = |edge| rows.position(4, edge).expect("visible").x.cells();
+        assert_eq!((cell(Edge::Caret), cell(Edge::Caret)), (7.0, 7.0), "an empty range at the caret");
+        assert!(cell(Edge::Start) > cell(Edge::End), "Start..End is inverted");
+    }
+
+    /// A cell on a hint, label or padding, rounds onto the hint's offset;
+    /// cells past it subtract the hint's width.
+    #[test]
+    fn a_hit_on_a_label_or_its_padding_lands_on_the_hint_offset() {
+        let doc = main_doc();
+        let rows = doc.rows();
+        let layout = rows.layout(BufferRow(0));
+        let table = [
+            (5.0, 5),
+            (6.0, 6),
+            (8.4, 6),
+            (10.6, 6),
+            (11.6, 7),
+            (15.0, 10),
+            (16.0, 11),
+            (18.0, 11),
+            (18.5, 11),
+            (20.0, 12),
+            (23.0, 15),
+            (26.4, 15),
+            (40.0, 15),
+        ];
+        for (cell, col) in table {
+            assert_eq!(layout.hit(cell, Bias::Left), col, "cell {cell}");
+            assert_eq!(rows.hit(BufferRow(0), cell, Bias::Left), col, "cell {cell} through Rows");
+        }
+    }
+
+    /// `hit` inverts `display_cell` and `position` at every landable column
+    /// and every edge, around hints, shared offsets and chips.
+    #[test]
+    fn hit_round_trips_every_edge() {
+        for doc in [main_doc(), mixed_doc(), chip_doc()] {
+            let rows = doc.rows();
+            let line = doc.buffer().line(0);
+            let layout = rows.layout(BufferRow(0));
+            for col in landable(&layout, &line) {
+                for edge in EDGES {
+                    let cell = layout.display_cell(col, edge);
+                    assert_eq!(layout.hit(cell as f32, Bias::Left), col, "{line:?} col {col} {edge:?}");
+                    let p = rows.position(col, edge).expect("visible");
+                    assert_eq!(rows.hit(BufferRow(0), p.x.cells(), Bias::Left), col, "{line:?} position {col} {edge:?}");
+                }
+            }
+        }
+    }
+
+    /// `inlay_at` floors the cell and names the label part under it, or
+    /// reports padding; text and the space past the row are `None`.
+    #[test]
+    fn inlay_at_names_the_part_and_reports_padding() {
+        let doc = main_doc();
+        let rows = doc.rows();
+        let label = |key, part, offset, link, cells| {
+            Some(inlay::At::Label {
+                key: inlay::Key::new(key),
+                part,
+                offset,
+                link,
+                insert: inlay::Insert::Unavailable,
+                cells,
+            })
+        };
+        let padding = |key, offset| Some(inlay::At::Padding { key: inlay::Key::new(key), offset });
+        let table = [
+            (-1.0, None),
+            (5.9, None),
+            (6.0, label(1, 0, 6, inlay::Link::None, 6..8)),
+            (7.9, label(1, 0, 6, inlay::Link::None, 6..8)),
+            (8.0, label(1, 1, 6, inlay::Link::Jumps, 8..11)),
+            (10.5, label(1, 1, 6, inlay::Link::Jumps, 8..11)),
+            (11.0, None),
+            (16.2, label(2, 0, 11, inlay::Link::None, 16..18)),
+            (17.0, label(2, 0, 11, inlay::Link::None, 16..18)),
+            (18.0, padding(2, 11)),
+            (23.5, padding(3, 15)),
+            (24.0, label(3, 0, 15, inlay::Link::None, 24..27)),
+            (26.9, label(3, 0, 15, inlay::Link::None, 24..27)),
+            (27.0, None),
+        ];
+        for (cell, at) in table {
+            assert_eq!(rows.inlay_at(BufferRow(0), cell), at, "cell {cell}");
+        }
+        let mut doc = doc_with_folds("let x = 1;", &[]);
+        install(&mut doc, vec![(5, plain(inlay::Kind::Type, ": i32", 1).insert(inlay::Insert::Available))]);
+        assert!(
+            matches!(doc.rows().inlay_at(BufferRow(0), 5.0), Some(inlay::At::Label { insert: inlay::Insert::Available, .. })),
+            "an insertable hint says so"
+        );
+    }
+
+    /// The painting view yields each laid-out hint with its first cell,
+    /// width, padding and label.
+    #[test]
+    fn inlays_yield_each_hint_with_its_first_cell() {
+        let doc = main_doc();
+        let rows = doc.rows();
+        let layout = rows.layout(BufferRow(0));
+        let got: Vec<(u32, u32, u32)> = layout.inlays().map(|i| (i.offset, i.cell, i.width)).collect();
+        assert_eq!(got, vec![(6, 6, 5), (11, 16, 3), (15, 23, 4)], "(offset, cell, width)");
+        assert_eq!(keys(&layout), key_list(&[1, 2, 3]));
+        let paddings: Vec<inlay::Padding> = layout.inlays().map(|i| i.padding).collect();
+        assert_eq!(paddings, vec![pad(false, false), pad(false, true), pad(true, false)]);
+        let texts: Vec<Vec<&str>> = layout.inlays().map(|i| i.hint.parts().iter().map(inlay::Part::text).collect()).collect();
+        assert_eq!(texts, vec![vec![": ", "i32"], vec!["n:"], vec!["end"]], "the installed parts");
+        assert_eq!(rows.layout(BufferRow(1)).inlays().count(), 0, "row 1 has none");
+
+        let doc = chip_doc();
+        let layout = doc.rows().layout(BufferRow(0));
+        let got: Vec<(u32, u32)> = layout.inlays().map(|i| (i.offset, i.cell)).collect();
+        assert_eq!(got, vec![(1, 1), (7, 8)], "only the hints outside the pair");
+    }
+
+    /// The row's width reaches past its end-of-line hints, and a row with
+    /// hints is not plain.
+    #[test]
+    fn width_includes_end_of_line_hints() {
+        let doc = main_doc();
+        let rows = doc.rows();
+        assert_eq!(rows.layout(BufferRow(0)).width(), 27);
+        assert!(!rows.layout(BufferRow(0)).is_plain(), "a hinted row is not plain");
+        assert!(rows.layout(BufferRow(1)).is_plain());
+    }
+
+    /// Tab stops are measured on the buffer line, so a hint before a tab
+    /// shifts it without widening it.
+    #[test]
+    fn tabs_after_a_hint_keep_their_buffer_space_width() {
+        let mut doc = doc_with_folds("a\tb", &[]);
+        install(&mut doc, vec![(1, plain(inlay::Kind::Type, "tt", 1))]);
+        let layout = doc.rows().layout(BufferRow(0));
+        assert_eq!(layout.display_cell(1, Edge::Start), 3, "the tab starts after the hint");
+        assert_eq!(layout.display_cell(2, Edge::Start), 6, "and keeps its three cells");
+    }
+
+    /// Hints inside a collapsed pair are not laid out; those at its outer
+    /// sides shift the chip and the text after it.
+    #[test]
+    fn hints_inside_a_collapsed_inline_fold_are_hidden_and_edges_shift() {
+        let mut doc = chip_doc();
+        {
+            let rows = doc.rows();
+            let layout = rows.layout(BufferRow(0));
+            assert_eq!(keys(&layout), key_list(&[1, 2]), "C and D are inside the pair");
+            let table = [(0, [0, 0, 0]), (1, [3, 1, 1]), (2, [4, 4, 4]), (6, [7, 7, 7]), (7, [10, 8, 10]), (8, [11, 11, 11])];
+            for (col, cells) in table {
+                assert_eq!(EDGES.map(|e| layout.display_cell(col, e)), cells, "col {col}: Start, End, Caret");
+            }
+            assert_eq!(layout.caret_cell(3), CaretCell::ChipCenter(5.5), "a hidden column clips to the chip");
+            let chips: Vec<Chip> = layout.chips().collect();
+            assert_eq!(chips, vec![Chip { cell: 4, center: 5.5, open_col: 1, close_col: 6 }]);
+            assert_eq!(layout.width(), 11);
+            let hits = [(0, 0), (1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (6, 2), (7, 6), (8, 7), (9, 7), (10, 7), (11, 8)];
+            for (cell, col) in hits {
+                assert_eq!(layout.hit(cell as f32, Bias::Left), col, "cell {cell}");
+            }
+            let found: Vec<inlay::Key> = (0..12)
+                .filter_map(|c| match layout.inlay_at(c as f32) {
+                    Some(inlay::At::Label { key, .. } | inlay::At::Padding { key, .. }) => Some(key),
+                    None => None,
+                })
+                .collect();
+            assert_eq!(found, [1, 1, 2, 2].map(inlay::Key::new), "only A and B are under any cell");
+        }
+        assert!(doc.toggle_fold_opener(1), "unfold");
+        assert_eq!(keys(&doc.rows().layout(BufferRow(0))), key_list(&[1, 3, 4, 2]), "unfolded, all four lay out");
+    }
+
+    /// A collapsed block's hidden rows and its tail row show no hints.
+    #[test]
+    fn hints_on_block_folded_rows_are_not_shown() {
+        let doc = header_doc();
+        let rows = doc.rows();
+        assert!(rows.layout(BufferRow(1)).is_plain(), "the hidden body row");
+        assert!(rows.layout(BufferRow(2)).is_plain(), "the tail row");
+        for edge in EDGES {
+            let p = rows.position(19, edge).expect("the tail renders");
+            assert_eq!((p.row, p.x), (DisplayRow(0), CaretCell::Cell(16)), "{edge:?}");
+        }
+        assert_eq!(rows.inlay_at(BufferRow(0), 17.0), None, "the tail row's hint is not shown");
+    }
+
+    /// A hint on a collapsed header widens the head, so the gap and the tail
+    /// move right by its width.
+    #[test]
+    fn a_header_hint_shifts_the_gap_and_the_tail() {
+        let doc = header_doc();
+        let rows = doc.rows();
+        let header = rows.header(BufferRow(0)).expect("row 0 is a collapsed header");
+        assert_eq!(header.head_cells(), 12);
+        assert_eq!(header.gap_center(), 14.0);
+        assert_eq!(header.tail_cell(), 16);
+        assert_eq!(header.width(), 17);
+        assert_eq!(rows.hit(BufferRow(0), 6.0, Bias::Left), 5, "on the hint");
+        assert_eq!(rows.hit(BufferRow(0), 12.6, Bias::Left), 9, "the gap is the header's line end");
+        assert_eq!(rows.hit(BufferRow(0), 16.0, Bias::Left), 19, "the tail");
+        let label = Some(inlay::At::Label {
+            key: inlay::Key::new(1),
+            part: 0,
+            offset: 5,
+            link: inlay::Link::None,
+            insert: inlay::Insert::Unavailable,
+            cells: 5..7,
+        });
+        assert_eq!(rows.inlay_at(BufferRow(0), 5.0), label);
+        assert_eq!(rows.inlay_at(BufferRow(0), 7.0), Some(inlay::At::Padding { key: inlay::Key::new(1), offset: 5 }));
+    }
+
+    /// Text typed between two hints at a shared offset leaves them between
+    /// two word characters, and they still lay out there.
+    #[test]
+    fn a_hint_between_two_word_characters_is_laid_out() {
+        let text = "fn f() {} fn main() { let c: fn() -> fn() = ||f; }";
+        let at = text.find("||f").expect("the closure") as u32 + 2;
+        let mut doc = doc_with_folds(text, &[]);
+        install(&mut doc, vec![(at, plain(inlay::Kind::Type, " -> fn()", 1)), (at, plain(inlay::Kind::Other, "<fn-item-to-fn-pointer>", 2))]);
+        doc.set_selections(crate::SelectionSet::new(at));
+        doc.type_char('X');
+        let rows = doc.rows();
+        let layout = rows.layout(BufferRow(0));
+        let got: Vec<(u32, u32)> = layout.inlays().map(|i| (i.offset, i.width)).collect();
+        assert_eq!(got, vec![(at + 1, 8), (at + 1, 23)], "both after X, in server order");
+        assert_eq!(layout.display_cell(at + 1, Edge::Start), at + 1 + 8 + 23, "f renders past both");
+    }
+
+    /// One `Rows` queries the inlay store once per row, whatever asks.
+    #[test]
+    fn rows_build_each_hinted_row_once() {
+        use crate::decorations::DECORATION_VISITS;
+        let doc = main_doc();
+        let rows = doc.rows();
+        let visits = || DECORATION_VISITS.with(std::cell::Cell::get);
+        let before = visits();
+        let _ = rows.layout(BufferRow(0));
+        let v = visits() - before;
+        assert!(v > 0, "the first build visits the row's hints");
+        let _ = rows.layout(BufferRow(0));
+        let _ = rows.position(6, Edge::Start);
+        let _ = rows.position(15, Edge::Caret);
+        let _ = rows.hit(BufferRow(0), 8.0, Bias::Left);
+        let _ = rows.inlay_at(BufferRow(0), 7.0);
+        let _ = rows.header(BufferRow(0));
+        assert_eq!(visits() - before, v, "every later query reuses the build");
     }
 
     /// Every projection of a document with tabs, a multibyte char, an inline

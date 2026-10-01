@@ -4543,17 +4543,10 @@ mod tests {
         assert_eq!(FoldMap::new(d.folds(), d.brackets(), d.buffer()).fold_at_header(BufferRow(0)), None, "first set not folded");
     }
 
-    #[test]
-    fn typing_at_many_carets_over_folds_stays_linear() {
-        use crate::bracket::ENCLOSING_WALKS;
-        use crate::row_layout::DISPLAY_POSITION_PROBES;
+    /// 400 `fn pid_i(pid: u8) -> u8 { … }` blocks, each folded, with a caret
+    /// at the end of every header line.
+    fn carets_on_folded_headers() -> Document {
         use crate::{Motion, SelectionSet};
-        // Select every `fn pid` occurrence, fold each block, then type.
-        // `expand_folds_touched` is windowed, so per commit it does ONE enclosing
-        // walk (for the first edit point) and O(edit points) display-position
-        // probes, independent of caret count — never O(carets) leftward enclosing
-        // walks plus an O(carets²) per-candidate edit scan. Gates both: an
-        // un-windowed implementation trips these by a factor of N.
         let mut src = String::new();
         for i in 0..400 {
             src.push_str(&format!(
@@ -4569,6 +4562,29 @@ mod tests {
         d.move_carets(Motion::LineEnd, false);
         d.fold_at_carets(false);
         d.move_carets(Motion::LineEnd, false);
+        d
+    }
+
+    /// Display-position probes made by the commit that types `a` at every caret.
+    fn typed_commit_probes(d: &mut Document) -> u64 {
+        use crate::row_layout::DISPLAY_POSITION_PROBES;
+        DISPLAY_POSITION_PROBES.with(|c| c.set(0));
+        d.insert_text("a");
+        DISPLAY_POSITION_PROBES.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn typing_at_many_carets_over_folds_stays_linear() {
+        use crate::bracket::ENCLOSING_WALKS;
+        use crate::row_layout::DISPLAY_POSITION_PROBES;
+        // Select every `fn pid` occurrence, fold each block, then type.
+        // `expand_folds_touched` is windowed, so per commit it does ONE enclosing
+        // walk (for the first edit point) and O(edit points) display-position
+        // probes, independent of caret count — never O(carets) leftward enclosing
+        // walks plus an O(carets²) per-candidate edit scan. Gates both: an
+        // un-windowed implementation trips these by a factor of N.
+        let mut d = carets_on_folded_headers();
+        let carets = d.selections().all().len();
 
         // Measure ONLY the commit for the typed character.
         ENCLOSING_WALKS.with(|c| c.set(0));
@@ -4581,6 +4597,26 @@ mod tests {
             probes <= 4 * carets as u64,
             "display-position probes are O(edit points), not O(carets²): {probes} for {carets} carets"
         );
+    }
+
+    /// Hints on the folded headers leave the typed commit's probe count
+    /// unchanged and O(edit points).
+    #[test]
+    fn hints_leave_display_position_probes_unchanged() {
+        let mut bare = carets_on_folded_headers();
+        let carets = bare.selections().all().len() as u64;
+        let without = typed_commit_probes(&mut bare);
+        let mut hinted = carets_on_folded_headers();
+        let placed: Vec<inlay::Placed> = hinted
+            .text()
+            .match_indices("(pid")
+            .map(|(i, _)| inlay::Placed::new(i as u32 + 4, type_hint(": u8", i as u64)))
+            .collect();
+        let count = placed.len();
+        assert_eq!(hinted.set_inlays(hinted.revision(), placed), inlay::Outcome::Applied { count });
+        let with = typed_commit_probes(&mut hinted);
+        assert_eq!(with, without, "hints add no probes");
+        assert!(with <= 4 * carets, "probes are O(edit points): {with} for {carets} carets");
     }
 
     #[test]
@@ -6384,6 +6420,38 @@ mod tests {
         assert!(d.remove_inlay(inlay::Key::new(1), 5), "the keyed hint goes");
         assert_eq!(with_hints(&d), "let xB = 1;", "its neighbour stays");
         assert!(!d.remove_inlay(inlay::Key::new(1), 5), "and it is gone for good");
+    }
+
+    /// The row filter, `inlay_at` and `remove_inlay` agree on where a hint
+    /// renders after Enter grows its anchor across a line break.
+    #[test]
+    fn render_offset_agrees_across_layout_inlay_at_and_remove_inlay() {
+        let mut d = doc("let ab\nf(cd)\n");
+        install(&mut d, vec![(6, type_hint(": T", 1)), (9, param_hint("x:", 2))]);
+        d.edit(vec![EditOp::insert(6, "\n    ")]).unwrap();
+        let cd = d.text().find("cd").unwrap() as u32;
+        d.edit(vec![EditOp::insert(cd, "\n  ")]).unwrap();
+        let shown: Vec<inlay::Shown> = d.inlays_in(0..d.buffer().len()).collect();
+        assert_eq!(shown.len(), 2, "both hints survive");
+        assert_eq!(d.buffer().offset_to_point(shown[0].offset()).row, 0, "the type hint stays on its line");
+        for s in &shown {
+            let (key, offset) = (s.key(), s.offset());
+            let row = BufferRow(d.buffer().offset_to_point(offset).row);
+            {
+                let rows = d.rows();
+                let layout = rows.layout(row);
+                let laid = layout.inlays().find(|i| i.key == key).expect("laid out on its render row");
+                assert_eq!(laid.offset, offset, "the layout renders it at its shown offset");
+                let label = laid.cell + u32::from(laid.padding.left);
+                match rows.inlay_at(row, label as f32) {
+                    Some(inlay::At::Label { key: k, offset: o, .. }) => assert_eq!((k, o), (key, offset), "inlay_at agrees"),
+                    other => panic!("expected a label at cell {label}, got {other:?}"),
+                }
+            }
+            let before = d.inlays_in(0..d.buffer().len()).count();
+            assert!(d.remove_inlay(key, offset), "remove_inlay finds it at its shown offset");
+            assert_eq!(d.inlays_in(0..d.buffer().len()).count(), before - 1, "exactly one hint goes");
+        }
     }
 
     /// Offsets past the end or inside a char are clipped before anchoring.
