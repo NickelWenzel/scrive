@@ -3,7 +3,9 @@
 use lsp_types::{
     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
     DocumentFormattingClientCapabilities, FailureHandlingKind, GeneralClientCapabilities,
-    GotoCapability, HoverClientCapabilities, HoverProviderCapability, MarkupKind, OneOf,
+    GotoCapability, HoverClientCapabilities, HoverProviderCapability, InlayHintClientCapabilities,
+    InlayHintResolveClientCapabilities, InlayHintServerCapabilities,
+    InlayHintWorkspaceClientCapabilities, MarkupKind, OneOf,
     ParameterInformationSettings, PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
     ServerCapabilities, SignatureHelpClientCapabilities, SignatureInformationSettings,
     TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
@@ -34,6 +36,8 @@ pub(crate) struct Server {
     pub(crate) rename: bool,
     /// Whether the server answers `textDocument/formatting`.
     pub(crate) formatting: bool,
+    /// Whether the server answers `textDocument/inlayHint`, and whether it resolves hints.
+    pub(crate) inlay: Option<Resolve>,
 }
 
 /// What the server asks to be sent when a document is saved.
@@ -45,6 +49,15 @@ pub(crate) enum Save {
     Notify,
     /// `didSave` with the saved text.
     WithText,
+}
+
+/// Whether the server answers `inlayHint/resolve`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Resolve {
+    /// Hints arrive whole.
+    Unsupported,
+    /// Hints arrive without the lazily resolvable properties, which `inlayHint/resolve` fills in.
+    Supported,
 }
 
 impl Server {
@@ -98,7 +111,25 @@ impl Server {
                 capabilities.document_formatting_provider,
                 Some(OneOf::Left(true) | OneOf::Right(_))
             ),
+            inlay: match &capabilities.inlay_hint_provider {
+                None | Some(OneOf::Left(false)) => None,
+                Some(OneOf::Left(true)) => Some(Resolve::Unsupported),
+                Some(OneOf::Right(InlayHintServerCapabilities::Options(options))) => {
+                    Some(resolve(options.resolve_provider))
+                }
+                Some(OneOf::Right(InlayHintServerCapabilities::RegistrationOptions(options))) => {
+                    Some(resolve(options.inlay_hint_options.resolve_provider))
+                }
+            },
         }
+    }
+}
+
+fn resolve(provider: Option<bool>) -> Resolve {
+    if provider == Some(true) {
+        Resolve::Supported
+    } else {
+        Resolve::Unsupported
     }
 }
 
@@ -114,6 +145,9 @@ pub(crate) fn client() -> ClientCapabilities {
                 document_changes: Some(true),
                 failure_handling: Some(FailureHandlingKind::Transactional),
                 ..WorkspaceEditClientCapabilities::default()
+            }),
+            inlay_hint: Some(InlayHintWorkspaceClientCapabilities {
+                refresh_support: Some(true),
             }),
             ..WorkspaceClientCapabilities::default()
         }),
@@ -159,6 +193,14 @@ pub(crate) fn client() -> ClientCapabilities {
             // Without `prepareSupport`: the editor asks for the new name itself.
             rename: Some(RenameClientCapabilities::default()),
             formatting: Some(DocumentFormattingClientCapabilities::default()),
+            // Only tooltips are lazy: locations and text edits arrive with the hint, so a jump or
+            // an insert needs no round trip and cannot meet a stale resolve.
+            inlay_hint: Some(InlayHintClientCapabilities {
+                dynamic_registration: Some(false),
+                resolve_support: Some(InlayHintResolveClientCapabilities {
+                    properties: vec!["tooltip".to_owned(), "label.tooltip".to_owned()],
+                }),
+            }),
             ..TextDocumentClientCapabilities::default()
         }),
         general: Some(GeneralClientCapabilities {

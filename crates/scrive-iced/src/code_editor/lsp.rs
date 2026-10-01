@@ -291,6 +291,18 @@ impl CodeEditor {
                     Err(_) => refused(Refusal::Overlap),
                 }
             }
+            Change::Inlays(placed) => {
+                let Stamp::Ticket(ticket) = stamp else {
+                    return refused(Refusal::Stale);
+                };
+                let accepted = self.accepts(Awaited::Inlays, ticket);
+                self.set_inlays(ticket, placed);
+                if accepted {
+                    update::Applied::default()
+                } else {
+                    refused(Refusal::Stale)
+                }
+            }
         }
     }
 }

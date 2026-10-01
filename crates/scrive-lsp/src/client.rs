@@ -16,20 +16,22 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams,
     DocumentFormattingParams, FormattingOptions, GotoDefinitionParams, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams, RenameParams,
+    InlayHintParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams, RenameParams,
     SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
     WorkspaceFolder,
 };
 use scrive_core::{
-    document, Bias, CompletionRequest, CompletionTrigger, DefinitionRequest, DocId, FormatRequest,
+    document, intel, Bias, CompletionRequest, CompletionTrigger, DefinitionRequest, DocId, FormatRequest,
     HoverRequest, RenameRequest, Revision, SignatureRequest, Snapshot, Ticket,
 };
 use serde_json::Value;
 
 use crate::message::{self, Message};
 use crate::update::{self, jump, Update};
-use crate::{completion, diagnostics, edits, hover, signature, uri, workspace, Encoding};
+use crate::{
+    completion, diagnostics, edits, hover, inlay, signature, uri, workspace, Encoding,
+};
 
 /// JSON-RPC's "method not found": a server request this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -63,6 +65,8 @@ pub struct Client {
     /// Requests in flight, at most one per document and [`Kind`].
     pending: Vec<Pending>,
     next_request: i64,
+    /// The last inlay hint key minted; keys are unique per client.
+    next_inlay: u64,
 }
 
 /// A process-unique client identity, so an editor can tell which client it is registered with.
@@ -158,6 +162,8 @@ struct Tracked {
     /// The completion session of the document's latest completion request, which the pending
     /// completion entry, if any, answers.
     session: Option<completion::Session>,
+    /// The document's last inlay hint answer, which hint gestures are answered from.
+    inlays: Option<inlay::Set>,
 }
 
 /// One request in flight.
@@ -190,6 +196,7 @@ enum Kind {
     Definition,
     Rename,
     Format,
+    Inlays,
 }
 
 /// What a pending request asked, with what its reply needs.
@@ -204,6 +211,8 @@ enum Query {
     Rename { offset: u32, new_name: String },
     /// Formatting of the whole document at this indent width.
     Format { tab_size: u32 },
+    /// The inlay hints over `span`.
+    Inlays { span: Range<u32> },
 }
 
 impl Client {
@@ -266,6 +275,7 @@ impl Client {
             synced: snapshot.clone(),
             version: None,
             session: None,
+            inlays: None,
         });
         if self.opens_and_closes() {
             let index = self.tracked.len() - 1;
@@ -542,6 +552,38 @@ impl Client {
         self.send(doc_id, ticket, query, None)
     }
 
+    /// Asks the server for the inlay hints over the request's byte span, clamped to the
+    /// document. The answer is an [`update::Change::Inlays`] under the request's ticket,
+    /// replacing the hints the editor shows; a request already in flight for the document is
+    /// cancelled.
+    ///
+    /// When the server is not running or has no inlay hint provider, the request is declined
+    /// with an empty [`update::Change::Inlays`] under its ticket. A request from a revision other
+    /// than `snapshot`'s or the last synced one, or for a document that is not registered, gets
+    /// nothing.
+    pub fn inlays(&mut self, snapshot: &Snapshot, request: &intel::inlay::Request) -> Output {
+        let doc_id = snapshot.doc_id();
+        let ticket = request.ticket();
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
+            return Output::default();
+        };
+        if ticket.revision() != snapshot.revision()
+            || snapshot.revision() != tracked.synced.revision()
+        {
+            return Output::default();
+        }
+        if !matches!(&self.state, State::Running(server) if server.inlay.is_some()) {
+            return Output::answer(doc_id, ticket, update::Change::Inlays(Some(Vec::new())));
+        }
+        // rust-analyzer fails a range that ends past the last line instead of clamping it.
+        let span = request.span();
+        let end = span.end.min(snapshot.len());
+        let query = Query::Inlays {
+            span: span.start.min(end)..end,
+        };
+        self.send(doc_id, ticket, query, None)
+    }
+
     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
     /// it leads exactly from what the server has to `snapshot`, and the server syncs
     /// incrementally, the edits go out as ranges; otherwise the whole text goes out. Servers that
@@ -812,7 +854,8 @@ impl Client {
             query @ (Query::Hover(_)
             | Query::Definition { .. }
             | Query::Rename { .. }
-            | Query::Format { .. }) => self.send(
+            | Query::Format { .. }
+            | Query::Inlays { .. }) => self.send(
                 entry.doc_id,
                 entry.latest_ticket,
                 query,
@@ -829,6 +872,7 @@ impl Client {
             Query::Definition { .. } => self.defined(entry, value),
             Query::Rename { .. } => self.renamed(entry, value),
             Query::Format { .. } => self.formatted(entry, value),
+            Query::Inlays { span } => Ok(self.inlaid(entry, span, value)),
         }
     }
 
@@ -958,7 +1002,9 @@ impl Client {
                 .iter()
                 .map(|t| (t.key.clone(), t.synced.revision()))
                 .collect(),
-            Kind::Completion | Kind::Signature | Kind::Hover | Kind::Format => Vec::new(),
+            Kind::Completion | Kind::Signature | Kind::Hover | Kind::Format | Kind::Inlays => {
+                Vec::new()
+            }
         };
         let id = self.next_request();
         let tracked = &self.tracked[index];
@@ -1053,6 +1099,40 @@ impl Client {
         let card = reply
             .and_then(|reply| hover::convert(self.encoding, &entry.request_snapshot, query, reply));
         Output::answer(entry.doc_id, entry.latest_ticket, update::Change::Hover(card))
+    }
+
+    /// Answers the ticket with the reply's hints, and keeps them as the document's set. `null`
+    /// is an empty answer, which clears the editor's hints.
+    fn inlaid(&mut self, entry: &Pending, span: &Range<u32>, value: Value) -> Output {
+        let Ok(entries) = serde_json::from_value::<Option<Vec<Value>>>(value) else {
+            return entry.failed();
+        };
+        let snapshot = &entry.request_snapshot;
+        let fetched = inlay::decode(
+            self.encoding,
+            snapshot,
+            span.clone(),
+            entries.unwrap_or_default(),
+        );
+        let Self {
+            tracked,
+            next_inlay,
+            ..
+        } = self;
+        let Some(tracked) = tracked.iter_mut().find(|t| t.doc_id == entry.doc_id) else {
+            return Output::default();
+        };
+        let previous = tracked
+            .inlays
+            .take()
+            .filter(|set| set.revision() == snapshot.revision());
+        let (set, placed) = inlay::Set::install(snapshot, fetched, previous, next_inlay);
+        tracked.inlays = Some(set);
+        Output::answer(
+            entry.doc_id,
+            entry.latest_ticket,
+            update::Change::Inlays(Some(placed)),
+        )
     }
 
     /// Answers the ticket with the first location in the reply.
@@ -1323,6 +1403,7 @@ impl Builder {
             cached: HashMap::new(),
             pending: Vec::new(),
             next_request: 2,
+            next_inlay: 0,
         };
         (client, Message::Request(initialize))
     }
@@ -1384,6 +1465,11 @@ impl Pending {
             Query::Hover(_) => {
                 Output::answer(self.doc_id, self.latest_ticket, update::Change::Hover(None))
             }
+            Query::Inlays { .. } => Output::answer(
+                self.doc_id,
+                self.latest_ticket,
+                update::Change::Inlays(None),
+            ),
             // `settled` reports command failures as errors before they get here.
             Query::Definition { .. } | Query::Rename { .. } | Query::Format { .. } => {
                 Output::default()
@@ -1396,7 +1482,7 @@ impl Kind {
     /// Whether the user asked for this request, so its failure is reported rather than settled.
     fn is_command(self) -> bool {
         match self {
-            Kind::Completion | Kind::Signature | Kind::Hover => false,
+            Kind::Completion | Kind::Signature | Kind::Hover | Kind::Inlays => false,
             Kind::Definition | Kind::Rename | Kind::Format => true,
         }
     }
@@ -1411,6 +1497,7 @@ impl Query {
             Query::Definition { .. } => Kind::Definition,
             Query::Rename { .. } => Kind::Rename,
             Query::Format { .. } => Kind::Format,
+            Query::Inlays { .. } => Kind::Inlays,
         }
     }
 
@@ -1424,6 +1511,7 @@ impl Query {
             Query::Definition { .. } => lsp_types::request::GotoDefinition::METHOD,
             Query::Rename { .. } => lsp_types::request::Rename::METHOD,
             Query::Format { .. } => lsp_types::request::Formatting::METHOD,
+            Query::Inlays { .. } => lsp_types::request::InlayHintRequest::METHOD,
         }
     }
 
@@ -1436,6 +1524,8 @@ impl Query {
             Query::Definition { offset } | Query::Rename { offset, .. } => *offset,
             // Formatting covers the whole document and asks at no caret.
             Query::Format { .. } => 0,
+            // A fetch covers a span; its start stands in for the caret.
+            Query::Inlays { span } => span.start,
         }
     }
 
@@ -1520,6 +1610,14 @@ impl Query {
                         ..FormattingOptions::default()
                     },
                     work_done_progress_params: Default::default(),
+                },
+            ),
+            Query::Inlays { span } => message::Request::new::<lsp_types::request::InlayHintRequest>(
+                id,
+                InlayHintParams {
+                    work_done_progress_params: Default::default(),
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    range: encoding.range(snapshot, span.clone()),
                 },
             ),
         }

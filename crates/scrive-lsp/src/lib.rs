@@ -11,6 +11,7 @@
 //! - goto definition → [`Client::definition`]
 //! - rename → [`Client::rename`]
 //! - formatting → [`Client::format`]
+//! - inlay hints → [`Client::inlays`]
 //! - what the client hands back → [`Update`] ([`update`])
 //! - the JSON-RPC envelope → [`message`]
 //! - LSP positions ↔ scrive byte offsets → [`encoding`]
@@ -27,6 +28,7 @@ mod diagnostics;
 mod edits;
 mod hover;
 pub mod encoding;
+mod inlay;
 mod markdown;
 pub mod message;
 mod signature;

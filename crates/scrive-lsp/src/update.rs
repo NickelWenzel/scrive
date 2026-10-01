@@ -2,6 +2,7 @@
 
 use std::ops::Range;
 
+use scrive_core::intel::inlay;
 use scrive_core::{
     CompletionItem, Diagnostic, DocId, EditOp, HoverInfo, Revision, SignatureInfo, Ticket,
 };
@@ -53,6 +54,9 @@ pub enum Change {
     /// Where the definition under the requested offset lives; `None` when there is none, or it
     /// is in another open document that moved since the request.
     Definition(Option<Target>),
+    /// The inlay hints answering the ticket's request, replacing the shown set; an empty list
+    /// clears it. `None` means the fetch failed: the editor keeps what it shows.
+    Inlays(Option<Vec<inlay::Placed>>),
 }
 
 /// Where a definition lives, relative to the requesting document.

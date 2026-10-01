@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
 use scrive_core::intel::completion::Start;
+use scrive_core::intel::inlay;
 use scrive_core::intel::ticket::Counter;
 use scrive_core::{
     CompletionItem, DefinitionRequest, Document, EditOp, FormatRequest, GroupingHint, HoverInfo,
@@ -3182,4 +3183,641 @@ fn rename_declines_before_initialize_and_without_a_provider() {
             "a declined rename sends nothing",
         );
     }
+}
+
+/// Server capabilities with utf-16 positions (the default), incremental sync, hover, and inlay
+/// hints whose tooltips resolve lazily.
+fn inlay_capabilities() -> Value {
+    json!({"textDocumentSync": 2, "hoverProvider": true, "inlayHintProvider": {"resolveProvider": true}})
+}
+
+/// `let a = f(1);` / `let b = a;`: `a` ends at 5, `1` starts at 10, `b` ends at 19; 25 bytes, 3
+/// lines.
+const INLAY_TEXT: &str = "let a = f(1);\nlet b = a;\n";
+
+/// `: i32` after `a`; its `i32` part links into the unopened `core.rs`.
+fn type_hint() -> Value {
+    json!({"position": {"line": 0, "character": 5}, "kind": 1, "label": [
+        {"value": ": "},
+        {"value": "i32", "location": {"uri": "file:///w/core.rs", "range": span_on(3, 4, 7)}},
+    ], "paddingLeft": false, "paddingRight": false, "data": {"id": 1}})
+}
+
+/// `x:` before `1`, padded on the right.
+fn parameter_hint() -> Value {
+    json!({"position": {"line": 0, "character": 10}, "kind": 2, "label": "x:",
+        "paddingLeft": false, "paddingRight": true, "data": {"id": 2}})
+}
+
+/// `: i32` after `b`, insertable: the edit rewrites `b` as `b: i32`, which hygiene trims to an
+/// insert at 19.
+fn insertable_hint() -> Value {
+    json!({"position": {"line": 1, "character": 5}, "kind": 1, "label": ": i32",
+        "textEdits": [text_edit((1, 4), (1, 5), "b: i32")], "data": {"id": 3}})
+}
+
+/// A hint at `(line, character)` with a string `label` and optional `kind`.
+fn plain_hint(line: u32, character: u32, label: &str, kind: Option<i32>) -> Value {
+    let mut hint = json!({"position": {"line": line, "character": character}, "label": label});
+    if let Some(kind) = kind {
+        hint["kind"] = json!(kind);
+    }
+    hint
+}
+
+/// A running client with `text` open as `file:///a.rs`.
+fn hinting(text: &str, capabilities: Value) -> (Client, Document) {
+    let doc = document(text);
+    let (mut client, _) = running(Client::builder(), capabilities);
+    open_as(&mut client, &doc, "file:///a.rs");
+    (client, doc)
+}
+
+/// An inlay request over the whole document at its revision.
+fn inlay_request(tickets: &mut Counter, doc: &Document) -> inlay::Request {
+    inlay::Request::new(tickets.issue(doc.revision()), 0..doc.snapshot().len())
+}
+
+/// The fetch request with `id` for `file:///a.rs` over `start..end` (line, character).
+fn inlay_wire(id: i64, start: (u32, u32), end: (u32, u32)) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/inlayHint", "params": {
+        "textDocument": {"uri": "file:///a.rs"},
+        "range": {
+            "start": {"line": start.0, "character": start.1},
+            "end": {"line": end.0, "character": end.1},
+        },
+    }})
+}
+
+/// Requests the hints of `doc`, answers request `id` with `hints`, and returns the installed
+/// hints.
+fn fetch(
+    client: &mut Client,
+    tickets: &mut Counter,
+    doc: &Document,
+    id: i64,
+    hints: Value,
+) -> Vec<inlay::Placed> {
+    let _ = client.inlays(&doc.snapshot(), &inlay_request(tickets, doc));
+    let output = client.receive(reply(id, hints)).expect("the reply is accepted");
+    inlays(only(&output)).1.expect("an answer, not a failure")
+}
+
+/// The stamp and hints of an inlay update.
+fn inlays(update: &Update) -> (update::Stamp, Option<Vec<inlay::Placed>>) {
+    let Update::Document(document) = update else {
+        panic!("expected a document update, got {update:?}")
+    };
+    match document.change() {
+        update::Change::Inlays(hints) => (document.stamp(), hints.clone()),
+        other => panic!("expected inlay hints, got {other:?}"),
+    }
+}
+
+/// The one update in `output`, which sends nothing.
+fn only(output: &Output) -> &Update {
+    assert!(
+        output.messages.is_empty(),
+        "an answer sends nothing: {output:?}"
+    );
+    let [update] = output.updates.as_slice() else {
+        panic!("expected one update, got {:?}", output.updates)
+    };
+    update
+}
+
+/// The offsets of `hints`.
+fn offsets(hints: &[inlay::Placed]) -> Vec<u32> {
+    hints.iter().map(inlay::Placed::offset).collect()
+}
+
+/// The label of each hint, its parts' texts joined.
+fn label_texts(hints: &[inlay::Placed]) -> Vec<String> {
+    hints
+        .iter()
+        .map(|placed| placed.hint().parts().iter().map(inlay::Part::text).collect())
+        .collect()
+}
+
+/// A one-part hint without a link, as the client should have built it.
+fn expected_hint(
+    kind: inlay::Kind,
+    label: &str,
+    key: inlay::Key,
+    padding: (bool, bool),
+    placement: inlay::Placement,
+) -> inlay::Hint {
+    inlay::Hint::new(kind, vec![inlay::Part::new(label, inlay::Link::None)], key)
+        .expect("a visible label")
+        .padding(inlay::Padding {
+            left: padding.0,
+            right: padding.1,
+        })
+        .placement(placement)
+}
+
+/// `initialize` advertises inlay hints that resolve only their tooltips, and refreshes.
+#[test]
+fn initialize_advertises_inlay_hints_with_lazy_tooltips_and_refresh() {
+    let (_, initialize) = Client::builder().build();
+    let initialize = serde_json::to_value(&initialize).expect("serializes");
+    assert_eq!(
+        initialize.pointer("/params/capabilities/textDocument/inlayHint"),
+        Some(&json!({"dynamicRegistration": false, "resolveSupport": {"properties": ["tooltip", "label.tooltip"]}})),
+        "locations and edits come inline; only tooltips resolve",
+    );
+    assert_eq!(
+        initialize.pointer("/params/capabilities/workspace/inlayHint"),
+        Some(&json!({"refreshSupport": true})),
+        "the server may ask for a refetch",
+    );
+}
+
+/// Every shape of `inlayHintProvider` is read, with whether the server resolves.
+#[test]
+fn inlay_provider_is_read_from_every_shape() {
+    let cases = [
+        (None, None),
+        (Some(json!(false)), None),
+        (Some(json!(true)), Some(capabilities::Resolve::Unsupported)),
+        (Some(json!({})), Some(capabilities::Resolve::Unsupported)),
+        (
+            Some(json!({"resolveProvider": false})),
+            Some(capabilities::Resolve::Unsupported),
+        ),
+        (
+            Some(json!({"resolveProvider": true})),
+            Some(capabilities::Resolve::Supported),
+        ),
+        (
+            Some(json!({"resolveProvider": true, "documentSelector": null, "id": "inlays"})),
+            Some(capabilities::Resolve::Supported),
+        ),
+    ];
+    for (provider, expected) in cases {
+        let mut capabilities = json!({"textDocumentSync": 2});
+        if let Some(provider) = &provider {
+            capabilities["inlayHintProvider"] = provider.clone();
+        }
+        let (client, _) = running(Client::builder(), capabilities);
+        assert!(
+            matches!(&client.state, State::Running(server) if server.inlay == expected),
+            "{provider:?} reads as {expected:?}",
+        );
+    }
+}
+
+/// A fetch asks for the request's span as an LSP range.
+#[test]
+fn inlay_request_carries_the_span_as_a_range() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let output = client.inlays(&doc.snapshot(), &inlay_request(&mut tickets, &doc));
+    assert_eq!(
+        wire(&output.messages),
+        vec![inlay_wire(2, (0, 0), (2, 0))],
+        "the whole document, up to the start of its last, empty line",
+    );
+    assert!(output.updates.is_empty(), "nothing is answered yet");
+}
+
+/// A span past the end of the document is clamped to it: rust-analyzer fails a range that ends
+/// past the last line.
+#[test]
+fn inlay_request_past_the_last_line_ends_at_the_buffer_end() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting("let a = 1;", inlay_capabilities());
+    let request = inlay::Request::new(tickets.issue(doc.revision()), 4..1000);
+    assert_eq!(
+        wire(&client.inlays(&doc.snapshot(), &request).messages),
+        vec![inlay_wire(2, (0, 4), (0, 10))],
+        "the range ends at the last character",
+    );
+}
+
+/// With no server to ask, or one without a provider, the editor's hints clear at once.
+#[test]
+fn inlays_decline_before_initialize_and_without_a_provider() {
+    let doc = document(INLAY_TEXT);
+    let (initializing, _) = Client::builder().build();
+    let (without, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
+    let (disabled, _) = running(
+        Client::builder(),
+        json!({"textDocumentSync": 2, "inlayHintProvider": false}),
+    );
+    for mut client in [initializing, without, disabled] {
+        let mut tickets = Counter::new();
+        open_as(&mut client, &doc, "file:///a.rs");
+        let request = inlay_request(&mut tickets, &doc);
+        let (stamp, hints) = inlays(only(&client.inlays(&doc.snapshot(), &request)));
+        assert_eq!(
+            stamp,
+            update::Stamp::Ticket(request.ticket()),
+            "the decline answers the ticket"
+        );
+        assert_eq!(hints.map(|h| h.len()), Some(0), "an empty set, not a failure");
+    }
+}
+
+/// A request from a revision the client has not synced, or that moved on, gets nothing.
+#[test]
+fn stale_inlay_request_is_ignored() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let request = inlay_request(&mut tickets, &doc);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(0, "x")]);
+    assert_silent(
+        &client.inlays(&doc.snapshot(), &request),
+        "a request from an old revision",
+    );
+}
+
+/// A second fetch cancels the one in flight.
+#[test]
+fn new_inlay_request_supersedes_the_previous_one() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let _ = client.inlays(&doc.snapshot(), &inlay_request(&mut tickets, &doc));
+    let output = client.inlays(&doc.snapshot(), &inlay_request(&mut tickets, &doc));
+    assert_eq!(
+        wire(&output.messages),
+        vec![cancel_request(2), inlay_wire(3, (0, 0), (2, 0))],
+        "the old request is cancelled before the new one goes out",
+    );
+}
+
+/// The reply answers the ticket with hints converted to scrive's model.
+#[test]
+fn inlay_reply_answers_the_ticket_with_converted_hints() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let request = inlay_request(&mut tickets, &doc);
+    let _ = client.inlays(&doc.snapshot(), &request);
+    let output = client
+        .receive(reply(
+            2,
+            json!([type_hint(), parameter_hint(), insertable_hint()]),
+        ))
+        .expect("the reply is accepted");
+    let (stamp, hints) = inlays(only(&output));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(request.ticket()),
+        "stamped with the request's ticket"
+    );
+    let hints = hints.expect("an answer");
+    assert_eq!(offsets(&hints), vec![5, 10, 19], "offsets in the request snapshot");
+    let key = |i: usize| hints[i].hint().key();
+    let typed = inlay::Hint::new(
+        inlay::Kind::Type,
+        vec![
+            inlay::Part::new(": ", inlay::Link::None),
+            inlay::Part::new("i32", inlay::Link::Jumps),
+        ],
+        key(0),
+    )
+    .expect("a visible label");
+    assert_eq!(hints[0].hint(), &typed, "a type suffix whose located part jumps");
+    assert_eq!(
+        hints[1].hint(),
+        &expected_hint(
+            inlay::Kind::Parameter,
+            "x:",
+            key(1),
+            (false, true),
+            inlay::Placement::Prefix
+        ),
+        "a parameter prefix padded on the right",
+    );
+    assert_eq!(
+        hints[2].hint(),
+        &expected_hint(
+            inlay::Kind::Type,
+            ": i32",
+            key(2),
+            (false, false),
+            inlay::Placement::Suffix
+        )
+        .insert(inlay::Insert::Available),
+        "a hint with text edits is insertable",
+    );
+}
+
+/// utf-16 positions convert against the request snapshot; one inside a surrogate pair snaps to
+/// the character's start.
+#[test]
+fn inlay_positions_convert_from_utf16_against_the_request_snapshot() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting("let 😀 = f(a);\n", inlay_capabilities());
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([
+            plain_hint(0, 6, "a", None),
+            plain_hint(0, 11, "b", None),
+            plain_hint(0, 5, "c", None),
+        ]),
+    );
+    assert_eq!(offsets(&hints), vec![8, 13, 4], "bytes, in server order");
+}
+
+/// A hint on a line the document does not have is dropped, not clamped to the end.
+#[test]
+fn inlay_hints_on_lines_past_the_end_are_dropped() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting("a\n", inlay_capabilities());
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([plain_hint(1, 0, "x", None), plain_hint(2, 0, "y", None)]),
+    );
+    assert_eq!(offsets(&hints), vec![2], "only the hint on the last, empty line");
+}
+
+/// Hints more than one line outside the requested span are dropped.
+#[test]
+fn inlay_hints_outside_the_request_span_are_clipped() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting("a\nb\nc\nd\ne\n", inlay_capabilities());
+    let request = inlay::Request::new(tickets.issue(doc.revision()), 4..5);
+    assert_eq!(
+        wire(&client.inlays(&doc.snapshot(), &request).messages),
+        vec![inlay_wire(2, (2, 0), (2, 1))],
+        "the span is line 2",
+    );
+    let hints = (0..5)
+        .map(|line| plain_hint(line, 0, &line.to_string(), None))
+        .collect::<Vec<_>>();
+    let output = client
+        .receive(reply(2, Value::Array(hints)))
+        .expect("the reply is accepted");
+    let hints = inlays(only(&output)).1.expect("an answer");
+    assert_eq!(label_texts(&hints), vec!["1", "2", "3"], "lines 1 to 3 survive");
+}
+
+/// The client neither sorts nor groups: hints keep the server's order, ties included.
+#[test]
+fn inlay_answer_keeps_the_server_order_including_ties() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([
+            parameter_hint(),
+            plain_hint(0, 5, ": a", Some(1)),
+            plain_hint(0, 5, ": b", Some(1)),
+            plain_hint(0, 5, ": c", Some(1)),
+        ]),
+    );
+    assert_eq!(offsets(&hints), vec![10, 5, 5, 5], "server order");
+    assert_eq!(
+        label_texts(&hints),
+        vec!["x:", ": a", ": b", ": c"],
+        "ties keep their order"
+    );
+}
+
+/// Control characters become spaces in core, and a label with no visible text drops its hint.
+#[test]
+fn inlay_labels_are_sanitised_by_core_and_empty_labels_dropped() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let at = |label: Value| json!({"position": {"line": 0, "character": 5}, "label": label});
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([
+            at(json!("a\tb")),
+            at(json!("")),
+            at(json!([])),
+            at(json!([{"value": "c"}])),
+        ]),
+    );
+    assert_eq!(label_texts(&hints), vec!["a b", "c"], "two hints survive");
+}
+
+/// A hint of no known kind takes its side from the server's padding: padding faces away from
+/// what it annotates, and symmetric padding leaves the side to the text.
+#[test]
+fn other_inlay_hints_take_their_placement_from_padding() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let cases = [
+        (None, Some((false, true)), inlay::Placement::Prefix),
+        (None, Some((true, false)), inlay::Placement::Suffix),
+        (None, Some((false, false)), inlay::Placement::Auto),
+        (None, Some((true, true)), inlay::Placement::Auto),
+        (None, None, inlay::Placement::Auto),
+        (Some(3), Some((false, true)), inlay::Placement::Prefix),
+    ];
+    let reply_hints = cases
+        .iter()
+        .map(|&(kind, padding, _)| {
+            let mut hint = plain_hint(0, 5, "y", kind);
+            if let Some((left, right)) = padding {
+                hint["paddingLeft"] = json!(left);
+                hint["paddingRight"] = json!(right);
+            }
+            hint
+        })
+        .collect::<Vec<_>>();
+    let hints = fetch(&mut client, &mut tickets, &doc, 2, Value::Array(reply_hints));
+    assert_eq!(hints.len(), cases.len(), "every hint converts");
+    for (placed, (kind, padding, placement)) in hints.iter().zip(cases) {
+        let padding = padding.unwrap_or_default();
+        assert_eq!(
+            placed.hint(),
+            &expected_hint(
+                inlay::Kind::Other,
+                "y",
+                placed.hint().key(),
+                padding,
+                placement
+            ),
+            "kind {kind:?} with padding {padding:?}",
+        );
+    }
+}
+
+/// A padding flag is dropped where the label already carries the space; the side still comes
+/// from the server's flags.
+#[test]
+fn inlay_padding_collapses_when_the_label_has_the_space() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let cases = [
+        (Some(1), (false, false), json!(": i32"), (false, false), inlay::Placement::Suffix),
+        (Some(1), (true, false), json!(": i32"), (true, false), inlay::Placement::Suffix),
+        (Some(2), (false, true), json!("x:"), (false, true), inlay::Placement::Prefix),
+        (Some(2), (false, true), json!("x: "), (false, false), inlay::Placement::Prefix),
+        (None, (false, true), json!("<'_>"), (false, true), inlay::Placement::Prefix),
+        (None, (true, false), json!(" = usize"), (false, false), inlay::Placement::Suffix),
+        (None, (false, false), json!("&*"), (false, false), inlay::Placement::Auto),
+        (
+            None,
+            (true, true),
+            json!([{"value": " a"}, {"value": "b "}]),
+            (false, false),
+            inlay::Placement::Auto,
+        ),
+    ];
+    let reply_hints = cases
+        .iter()
+        .map(|(kind, (left, right), label, ..)| {
+            let mut hint = json!({"position": {"line": 0, "character": 5}, "label": label,
+                "paddingLeft": left, "paddingRight": right});
+            if let Some(kind) = kind {
+                hint["kind"] = json!(kind);
+            }
+            hint
+        })
+        .collect::<Vec<_>>();
+    let hints = fetch(&mut client, &mut tickets, &doc, 2, Value::Array(reply_hints));
+    assert_eq!(hints.len(), cases.len(), "every hint converts");
+    for (placed, (kind, raw, label, padding, placement)) in hints.iter().zip(cases) {
+        let parts = match label {
+            Value::String(text) => vec![inlay::Part::new(text, inlay::Link::None)],
+            Value::Array(parts) => parts
+                .iter()
+                .map(|part| {
+                    inlay::Part::new(part["value"].as_str().unwrap_or_default(), inlay::Link::None)
+                })
+                .collect(),
+            other => panic!("unexpected label {other}"),
+        };
+        let kind = match kind {
+            Some(1) => inlay::Kind::Type,
+            Some(2) => inlay::Kind::Parameter,
+            _ => inlay::Kind::Other,
+        };
+        let expected = inlay::Hint::new(kind, parts, placed.hint().key())
+            .expect("a visible label")
+            .padding(inlay::Padding {
+                left: padding.0,
+                right: padding.1,
+            })
+            .placement(placement);
+        assert_eq!(placed.hint(), &expected, "{kind:?} padded {raw:?}");
+    }
+}
+
+/// One malformed entry is skipped alone; the rest of the answer lands.
+#[test]
+fn one_malformed_inlay_hint_does_not_lose_the_set() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([
+            {"position": {"line": 0, "character": 5}, "label": ": i32", "kind": 1},
+            {"position": "nowhere", "label": "x"},
+            {"position": {"line": 0, "character": 10}, "label": [
+                {"value": "T", "location": {"uri": "file:///bad path.rs", "range": span_on(0, 0, 1)}},
+            ]},
+            {"label": "no position"},
+            7,
+            {"position": {"line": 1, "character": 5}, "label": ": i32", "kind": 1},
+        ]),
+    );
+    assert_eq!(offsets(&hints), vec![5, 19], "the two well-formed hints");
+}
+
+/// `null` is an empty answer, which clears the editor's hints.
+#[test]
+fn null_inlay_result_clears_the_hints() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let hints = fetch(&mut client, &mut tickets, &doc, 2, Value::Null);
+    assert!(hints.is_empty(), "an empty set");
+}
+
+/// A failed fetch, or a result that is not an array, settles the ticket with `None`, so the
+/// editor keeps its hints.
+#[test]
+fn failed_or_undecodable_inlay_result_answers_none() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    for (id, message) in [(2, failure(2, -32603)), (3, reply(3, json!("x")))] {
+        let request = inlay_request(&mut tickets, &doc);
+        let _ = client.inlays(&doc.snapshot(), &request);
+        let output = client.receive(message).expect("an intel failure is no error");
+        let (stamp, hints) = inlays(only(&output));
+        assert_eq!(
+            stamp,
+            update::Stamp::Ticket(request.ticket()),
+            "request {id} settles its ticket"
+        );
+        assert!(hints.is_none(), "request {id} failed");
+    }
+}
+
+/// ContentModified, which ends rust-analyzer's indexing, re-sends the fetch once.
+#[test]
+fn content_modified_reissues_the_inlay_request_once() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let _ = client.inlays(&doc.snapshot(), &inlay_request(&mut tickets, &doc));
+    let reissued = client
+        .receive(failure(2, -32801))
+        .expect("content modified is not an error");
+    assert_eq!(
+        wire(&reissued.messages),
+        vec![inlay_wire(3, (0, 0), (2, 0))],
+        "the same span goes out again",
+    );
+    assert!(reissued.updates.is_empty(), "nothing is answered yet");
+    assert_silent(
+        &client
+            .receive(failure(3, -32801))
+            .expect("content modified is not an error"),
+        "a second content-modified reply for one ticket is final",
+    );
+}
+
+/// A refetch at the same revision keeps the keys of unchanged hints, matched in order, and mints
+/// new ones for the rest.
+#[test]
+fn inlay_keys_are_stable_across_a_refetch_at_the_same_revision() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let a = || plain_hint(0, 5, ": i32", Some(1));
+    let c = || plain_hint(1, 5, ": i32", Some(1));
+    let d = || plain_hint(0, 5, ": i32", Some(2));
+    let keys = |hints: &[inlay::Placed]| hints.iter().map(|p| p.hint().key()).collect::<Vec<_>>();
+    let first = keys(&fetch(&mut client, &mut tickets, &doc, 2, json!([a(), a(), c()])));
+    let second = keys(&fetch(&mut client, &mut tickets, &doc, 3, json!([c(), a(), a(), d()])));
+    assert_eq!(
+        second[..3],
+        [first[2], first[0], first[1]],
+        "unchanged hints keep their keys, repeated ones in order",
+    );
+    assert!(!first.contains(&second[3]), "a different kind is a new hint");
+}
+
+/// After the text moves, every hint gets a new key.
+#[test]
+fn inlay_keys_are_fresh_after_the_revision_moves() {
+    let mut tickets = Counter::new();
+    let (mut client, mut doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let a = || json!([plain_hint(0, 5, ": i32", Some(1))]);
+    let first = fetch(&mut client, &mut tickets, &doc, 2, a());
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(25, "x")]);
+    let second = fetch(&mut client, &mut tickets, &doc, 3, a());
+    assert_ne!(
+        first[0].hint().key(),
+        second[0].hint().key(),
+        "keys match only within one revision"
+    );
 }
