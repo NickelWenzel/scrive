@@ -22,6 +22,8 @@
 //! - move or extend the caret → [`selection`], [`movement`]
 //! - type / paste / indent → [`verbs`]
 //! - expand tabs to columns → [`display_map`]
+//! - place something on screen (row layouts, offset ↔ cell) → [`row_layout::Rows`],
+//!   from [`Document::rows`]
 //! - syntax-highlight a line → [`highlight`]
 //! - attach diagnostics / snippet stops → [`decorations`]
 //! - complete / hover / signature help → [`intel::providers`]

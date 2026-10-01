@@ -19,6 +19,7 @@ use crate::buffer::Buffer;
 use crate::coords::{Bias, Point};
 use crate::display_map::{self, BufferRow, DisplayRow};
 use crate::fold_map::FoldMap;
+use crate::row_layout::{Edge, Rows};
 use crate::selection::SelectionSet;
 
 /// A caret motion.
@@ -83,11 +84,11 @@ pub enum ColumnDir {
 /// Apply `motion` to every selection in `set`. With `extend`, each selection's
 /// head moves and its anchor stays (grow/shrink); without, each collapses to a
 /// caret at the motion target. Re-merges afterward (a move can make two
-/// selections coincide). `tab` is the document's tab-stop width — vertical
-/// motion keeps a *visual* goal column, so it needs the display projection.
-pub fn move_selections(set: &mut SelectionSet, buffer: &Buffer, folds: &FoldMap, tab: u32, motion: Motion, extend: bool) {
+/// selections coincide). `rows` is the document's display projection; vertical
+/// motion keeps a *visual* goal column, so it needs it.
+pub fn move_selections(set: &mut SelectionSet, rows: &Rows<'_>, motion: Motion, extend: bool) {
     set.map_each(|s| {
-        let (target, goal) = motion_target(buffer, folds, tab, s.head(), s.goal, motion);
+        let (target, goal) = motion_target(rows, s.head(), s.goal, motion);
         if extend {
             s.set_head(target);
             s.goal = goal;
@@ -105,14 +106,15 @@ pub fn move_selections(set: &mut SelectionSet, buffer: &Buffer, folds: &FoldMap,
 /// Compute a motion's target offset and the goal *display cell* it should
 /// leave behind (`Some` only for vertical motions, which preserve it;
 /// everything else clears it by returning `None`).
-fn motion_target(buffer: &Buffer, folds: &FoldMap, tab: u32, head: u32, goal: Option<u32>, motion: Motion) -> (u32, Option<u32>) {
+fn motion_target(rows: &Rows<'_>, head: u32, goal: Option<u32>, motion: Motion) -> (u32, Option<u32>) {
+    let (buffer, folds) = (rows.buffer(), rows.folds());
     match motion {
         Motion::Left => (char_left(buffer, folds, head), None),
         Motion::Right => (char_right(buffer, folds, head), None),
-        Motion::Up => vertical_by(buffer, folds, tab, head, goal, -1),
-        Motion::Down => vertical_by(buffer, folds, tab, head, goal, 1),
-        Motion::PageUp(rows) => vertical_by(buffer, folds, tab, head, goal, -(rows as i32)),
-        Motion::PageDown(rows) => vertical_by(buffer, folds, tab, head, goal, rows as i32),
+        Motion::Up => vertical_by(rows, head, goal, -1),
+        Motion::Down => vertical_by(rows, head, goal, 1),
+        Motion::PageUp(n) => vertical_by(rows, head, goal, -(n as i32)),
+        Motion::PageDown(n) => vertical_by(rows, head, goal, n as i32),
         Motion::WordLeft => (skip_fold_left(buffer, folds, word_left(buffer, head)), None),
         Motion::WordRight => (skip_fold_right(buffer, folds, word_right(buffer, head)), None),
         Motion::LineStart => (line_start_smart_folded(buffer, folds, head), None),
@@ -194,21 +196,22 @@ fn skip_fold_right(buffer: &Buffer, folds: &FoldMap, off: u32) -> u32 {
 /// inline folds, and a collapsed block's one-line placeholder. Stepping happens
 /// in DISPLAY rows (a folded interior is not a display row, so the caret can
 /// never land inside a fold), and the landing resolves through the standard
-/// inverse projection ([`FoldMap::hit_row`]) — exactly like a click at the goal
+/// inverse projection ([`Rows::hit`]) — exactly like a click at the goal
 /// cell: a goal in a collapsed header's gap clamps to the header's end, one
 /// over the tail lands on the tail's real offset, one on a chip snaps to its
 /// landable left edge, one mid-tab snaps by bias, and past-EOL clamps.
 /// Overshooting the top lands at the document start, the bottom at the
 /// document end — so a single-row move at an edge lands on the nearest document
 /// end, and page moves that overshoot collapse to those same ends.
-fn vertical_by(buffer: &Buffer, folds: &FoldMap, tab: u32, offset: u32, goal: Option<u32>, delta: i32) -> (u32, Option<u32>) {
+fn vertical_by(rows: &Rows<'_>, offset: u32, goal: Option<u32>, delta: i32) -> (u32, Option<u32>) {
+    let (buffer, folds) = (rows.buffer(), rows.folds());
     // The caret's display position (fold/tab aware). A caret can only rest on
     // a visible slot, but fall back to the raw expansion defensively.
-    let (row, cell) = match folds.display_position(buffer, offset, tab) {
+    let (row, cell) = match rows.position(offset, Edge::Caret) {
         Some(p) => (p.row, p.x.cells()),
         None => {
             let p = buffer.offset_to_point(offset);
-            (folds.to_display_row(BufferRow(p.row)), display_map::expand(&buffer.line(p.row), p.col, tab) as f32)
+            (folds.to_display_row(BufferRow(p.row)), display_map::expand(&buffer.line(p.row), p.col, rows.tab()) as f32)
         }
     };
     let goal_cell = goal.unwrap_or_else(|| cell.round() as u32);
@@ -221,7 +224,7 @@ fn vertical_by(buffer: &Buffer, folds: &FoldMap, tab: u32, offset: u32, goal: Op
         return (buffer.len(), Some(goal_cell)); // past the bottom → document end
     }
     let new_row = folds.to_buffer_row(DisplayRow(target as u32));
-    let off = folds.hit_row(buffer, new_row, goal_cell as f32, Bias::Left, tab);
+    let off = rows.hit(new_row, goal_cell as f32, Bias::Left);
     (off, Some(goal_cell))
 }
 
@@ -230,16 +233,11 @@ fn vertical_by(buffer: &Buffer, folds: &FoldMap, tab: u32, offset: u32, goal: Op
 /// display row (nothing to add there). The landing for add-cursor-above/below:
 /// one call into [`vertical_by`], so tabs, chips, and collapsed headers
 /// resolve exactly as plain vertical movement does.
-pub(crate) fn caret_one_display_row(
-    buffer: &Buffer,
-    folds: &FoldMap,
-    tab: u32,
-    offset: u32,
-    delta: i32,
-) -> Option<u32> {
-    let (off, _) = vertical_by(buffer, folds, tab, offset, None, delta);
+pub(crate) fn caret_one_display_row(rows: &Rows<'_>, offset: u32, delta: i32) -> Option<u32> {
+    let (off, _) = vertical_by(rows, offset, None, delta);
     // vertical_by clamps an over-the-edge step to the doc start/end — which
     // stays on the source's display row; reject that instead of adding there.
+    let (buffer, folds) = (rows.buffer(), rows.folds());
     let row_of = |o: u32| folds.to_display_row(BufferRow(buffer.offset_to_point(o).row));
     (row_of(off) != row_of(offset)).then_some(off)
 }
@@ -509,14 +507,10 @@ mod tests {
     /// `document` tests.
     fn mv(set: &mut SelectionSet, b: &Buffer, motion: Motion, extend: bool) {
         use crate::fold_map::{FoldMap, FoldSet};
-        move_selections(
-            set,
-            b,
-            &FoldMap::new(&FoldSet::new(), &crate::bracket::Brackets::default(), b),
-            display_map::default_tab_size(),
-            motion,
-            extend,
-        );
+        let folds = std::cell::RefCell::new(FoldMap::new(&FoldSet::new(), &crate::bracket::Brackets::default(), b));
+        let inlays = crate::decorations::DecorationStore::new();
+        let rows = Rows::new(folds.borrow(), b, &inlays, display_map::default_tab_size());
+        move_selections(set, &rows, motion, extend);
     }
 
     /// Offset of `(row, col)`.

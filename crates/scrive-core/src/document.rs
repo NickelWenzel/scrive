@@ -29,6 +29,7 @@ use crate::highlight::{HighlightCache, HighlightEngine, HighlightSpan, SyntaxDef
 use crate::history::{GroupingHint, History};
 use crate::intel::inlay;
 use crate::movement::{self, ColumnDir, Granularity, Motion};
+use crate::row_layout::{Edge, Rows};
 use crate::selection::{Selection, SelectionId, SelectionSet};
 use crate::transaction::{apply, Committed, EditOp, TransactionError};
 
@@ -134,6 +135,13 @@ struct FoldMapCache {
     map: FoldMap,
 }
 
+/// The cached fold map, borrowed from the cache cell alone so a caller can hold
+/// it beside `&mut` borrows of other `Document` fields. Freshen the cache with
+/// `ensure_fold_map` first.
+fn cached_fold_map(cache: &RefCell<FoldMapCache>) -> Ref<'_, FoldMap> {
+    Ref::map(cache.borrow(), |c| &c.map)
+}
+
 /// How a reveal request should autoscroll the view to the newest caret.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RevealMode {
@@ -153,7 +161,7 @@ pub enum RevealMode {
 /// display *cells*, not byte columns — tabs and collapsed inline folds make
 /// the two disagree, and the box is a visual rectangle. Every spanned row
 /// resolves the same two cells through the one click inverse
-/// ([`FoldMap::hit_row`]), clamping to its own content, so the box stays
+/// ([`Rows::hit`]), clamping to its own content, so the box stays
 /// rectangular over ragged lines and shrinks exactly when the active corner
 /// moves back toward the anchor.
 #[derive(Copy, Clone, Debug)]
@@ -345,12 +353,20 @@ impl Document {
     #[must_use]
     pub fn fold_map(&self) -> Ref<'_, FoldMap> {
         self.ensure_fold_map();
-        Ref::map(self.fold_cache.borrow(), |c| &c.map)
+        cached_fold_map(&self.fold_cache)
+    }
+
+    /// The document's rows as they render (see [`Rows`]): the view every
+    /// on-screen projection goes through. It borrows the fold cache, so take
+    /// one per pass and drop it before editing.
+    #[must_use]
+    pub fn rows(&self) -> Rows<'_> {
+        Rows::new(self.fold_map(), &self.buffer, &self.inlays, self.tab_size())
     }
 
     /// Rebuild the fold cache iff its inputs changed, leaving it current. Split
     /// from [`fold_map`](Self::fold_map) so a caller that also needs `&mut` on a
-    /// sibling field (e.g. `move_carets` mutating `selections`) can freshen the
+    /// sibling field (the selection paths mutating `selections`) can freshen the
     /// cache and then borrow `fold_cache` and that field disjointly — instead of
     /// building a throwaway O(folds) `FoldMap::new` per keystroke.
     fn ensure_fold_map(&self) {
@@ -449,8 +465,8 @@ impl Document {
         // `selections` disjointly.
         self.ensure_fold_map();
         let tab = self.tab_size();
-        let cache = self.fold_cache.borrow();
-        movement::move_selections(&mut self.selections, &self.buffer, &cache.map, tab, motion, extend);
+        let rows = Rows::new(cached_fold_map(&self.fold_cache), &self.buffer, &self.inlays, tab);
+        movement::move_selections(&mut self.selections, &rows, motion, extend);
     }
 
     /// Add a bare caret at `offset` — the Alt+Click add-caret gesture.
@@ -606,7 +622,7 @@ impl Document {
     /// Ctrl+Alt+↑/↓: add a caret one display row above/below EVERY
     /// existing caret, keeping the current set — the stack-a-column gesture.
     /// Each landing resolves like a click at that caret's visual column (the
-    /// `movement::caret_one_display_row` rule → `hit_row`), so tabs, chips,
+    /// `movement::caret_one_display_row` rule → `Rows::hit`), so tabs, chips,
     /// and collapsed folds behave exactly as plain vertical movement; a caret
     /// already on the first/last display row adds nothing, and a landing on an
     /// existing caret merges via the set's rule. Selection-only. (Landings on
@@ -614,16 +630,18 @@ impl Document {
     /// presses — a deliberate simplification.)
     pub fn add_caret_vertical(&mut self, down: bool) {
         self.reset_transient();
-        let folds = FoldMap::new(&self.folds, &self.brackets, &self.buffer);
+        self.ensure_fold_map();
         let tab = self.tab_size();
         let delta = if down { 1 } else { -1 };
         let heads: Vec<u32> = self.selections.all().iter().map(Selection::head).collect();
         let mut added = false;
-        for head in heads {
-            if let Some(off) = movement::caret_one_display_row(&self.buffer, &folds, tab, head, delta)
-            {
-                self.selections.add_caret(off);
-                added = true;
+        {
+            let rows = Rows::new(cached_fold_map(&self.fold_cache), &self.buffer, &self.inlays, tab);
+            for head in heads {
+                if let Some(off) = movement::caret_one_display_row(&rows, head, delta) {
+                    self.selections.add_caret(off);
+                    added = true;
+                }
             }
         }
         if added {
@@ -872,15 +890,16 @@ impl Document {
         // so it can't go through `reset_transient`.
         self.history.seal();
         self.expand_stack.clear();
-        let folds = FoldMap::new(&self.folds, &self.brackets, &self.buffer);
+        self.ensure_fold_map();
         let tab = self.tab_size();
+        let rows = Rows::new(cached_fold_map(&self.fold_cache), &self.buffer, &self.inlays, tab);
         let mut col = self.column.unwrap_or_else(|| {
-            let corner = self.caret_corner(&folds, tab);
+            let corner = self.caret_corner(&rows);
             ColumnSelection { anchor: corner, active: corner }
         });
-        col.active = Self::step_corner(&folds, col.active, dir);
+        col.active = Self::step_corner(rows.folds(), col.active, dir);
         self.column = Some(col);
-        self.rebuild_column_box(&folds, tab, col);
+        self.selections = Self::column_box(&rows, col);
     }
 
     /// Mouse box (column) selection — Shift+Alt+drag. Sets the box from an
@@ -896,31 +915,33 @@ impl Document {
         // Same boundary + ladder rule as `column_select`.
         self.history.seal();
         self.expand_stack.clear();
-        let folds = FoldMap::new(&self.folds, &self.brackets, &self.buffer);
+        self.ensure_fold_map();
+        let tab = self.tab_size();
         let col = ColumnSelection {
             anchor: CellCorner { row: anchor.0, cell: anchor.1 },
             active: CellCorner { row: active.0, cell: active.1 },
         };
         self.column = Some(col);
-        self.rebuild_column_box(&folds, self.tab_size(), col);
+        let rows = Rows::new(cached_fold_map(&self.fold_cache), &self.buffer, &self.inlays, tab);
+        self.selections = Self::column_box(&rows, col);
     }
 
     /// The primary caret's box corner: its rendered position — the one owner of
-    /// display geometry, [`FoldMap::display_position`] — as a `(visible buffer
+    /// display geometry, [`Rows::position`] — as a `(visible buffer
     /// row, display cell)`
     /// pair. A caret on a collapsed fold's closing tail anchors on the header
     /// row it renders on. (Fold-time ejection keeps carets visible, so the
     /// hidden-offset fallback to the raw buffer point is belt and braces.)
-    fn caret_corner(&self, folds: &FoldMap, tab: u32) -> CellCorner {
+    fn caret_corner(&self, rows: &Rows<'_>) -> CellCorner {
         let head = self.selections.newest().head();
-        match folds.display_position(&self.buffer, head, tab) {
+        match rows.position(head, Edge::Caret) {
             Some(p) => CellCorner {
-                row: folds.to_buffer_row(p.row).0,
+                row: rows.folds().to_buffer_row(p.row).0,
                 cell: crate::row_layout::virtual_cell(p.x.cells()),
             },
             None => {
                 let p = self.buffer.offset_to_point(head);
-                let layout = folds.row_layout(&self.buffer, BufferRow(p.row), tab);
+                let layout = rows.layout(BufferRow(p.row));
                 CellCorner { row: p.row, cell: layout.display_cell(p.col) }
             }
         }
@@ -1029,14 +1050,15 @@ impl Document {
         }
     }
 
-    /// Install the box `col` as the selection set: one selection per spanned
+    /// The box `col` as a selection set: one selection per spanned
     /// *display* row (a collapsed fold's hidden rows get none), each corner cell
     /// resolved to its byte offset through the one click inverse
-    /// ([`FoldMap::hit_row`]: tab snapping, chip resolution, header gap/tail) —
+    /// ([`Rows::hit`]: tab snapping, chip resolution, header gap/tail) —
     /// so the box selects exactly what its rectangle crosses on screen, clamped
     /// to each row's content. The active row's selection is the newest
     /// (autoscroll target).
-    fn rebuild_column_box(&mut self, folds: &FoldMap, tab: u32, col: ColumnSelection) {
+    fn column_box(rows: &Rows<'_>, col: ColumnSelection) -> SelectionSet {
+        let folds = rows.folds();
         let da = folds.to_display_row(BufferRow(col.anchor.row)).index();
         let dv = folds.to_display_row(BufferRow(col.active.row)).index();
         let (d0, d1) = (da.min(dv), da.max(dv));
@@ -1044,14 +1066,14 @@ impl Document {
         let mut newest = 0;
         for d in d0..=d1 {
             let row = folds.to_buffer_row(DisplayRow(d));
-            let anchor_off = folds.hit_row(&self.buffer, row, col.anchor.cell as f32, Bias::Left, tab);
-            let head_off = folds.hit_row(&self.buffer, row, col.active.cell as f32, Bias::Left, tab);
+            let anchor_off = rows.hit(row, col.anchor.cell as f32, Bias::Left);
+            let head_off = rows.hit(row, col.active.cell as f32, Bias::Left);
             if d == dv {
                 newest = ranges.len();
             }
             ranges.push((anchor_off, head_off));
         }
-        self.selections = SelectionSet::from_ranges(&ranges, newest);
+        SelectionSet::from_ranges(&ranges, newest)
     }
 
     /// The full document text (LF-only). Shorthand for `self.buffer().text()`
@@ -1569,7 +1591,7 @@ impl Document {
                     // entry edge — the header line's end, just before the `…`
                     // placeholder (the block analog of the inline pull-out
                     // above), so typing can never edit invisible text. "Hidden"
-                    // comes from the one owner: `display_position` is `None`
+                    // comes from the one owner: `renders` is false
                     // exactly for offsets in a fold's gap.
                     // The one tab-width owner (hoisted above the destructure that
                     // borrows the fields — `self.tab_size()` can't be called after).
@@ -1580,7 +1602,7 @@ impl Document {
                     let entry = buffer.point_to_offset(Point::new(header, buffer.line_len(header)));
                     selections.map_each(|s| {
                         let inside = s.head() > opener && s.head() < close;
-                        if inside && fold_map.display_position(buffer, s.head(), tab).is_none() {
+                        if inside && !fold_map.renders(buffer, s.head(), tab) {
                             s.move_to_caret(entry);
                         }
                     });
@@ -2414,7 +2436,7 @@ impl Document {
     /// offset renders: a jump-class caret placement — find navigation, bracket
     /// jump, select-all-matches — must land on a VISIBLE position. The jump twin
     /// of the edit path's `expand_folds_touched`. Visibility is judged by the one
-    /// owner ([`FoldMap::display_position`]); already-visible offsets (a
+    /// owner ([`FoldMap::renders`]); already-visible offsets (a
     /// collapsed tail, a chip edge) unfold nothing.
     fn unfold_to_reveal(&mut self, offset: u32) -> bool {
         let tab = self.tab_size();
@@ -2422,11 +2444,11 @@ impl Document {
         loop {
             let fm = FoldMap::new(&self.folds, &self.brackets, &self.buffer);
             // "Visible" for a JUMP is stricter than "renders somewhere":
-            // `display_position` clips a chip-hidden column to the chip's
-            // center, so an offset inside a collapsed INLINE fold still gets a
-            // position — but the text itself is hidden, and a jump target must
+            // `renders` is true for a chip-hidden column (it gets the chip's
+            // center), so an offset inside a collapsed INLINE fold still
+            // renders — but the text itself is hidden, and a jump target must
             // be readable, so the gap rule is checked too.
-            let renders = fm.display_position(&self.buffer, offset, tab).is_some();
+            let renders = fm.renders(&self.buffer, offset, tab);
             // Only the inline fold opening just before `offset` can hide it (roots
             // are disjoint) — an O(log) tree probe, not a full-set scan.
             let chip_hidden = fm.inline_fold_before(offset).is_some_and(|f| f.hides_caret_at(offset));
@@ -2529,7 +2551,7 @@ fn expand_folds_touched(
     // answer; compute it once (O(points · log folds)) instead of re-scanning every
     // edit for every candidate, which would be O(carets²) even when nothing is
     // hidden.
-    let any_hidden = pts.iter().any(|&p| fold_map.display_position(buffer, p, tab).is_none());
+    let any_hidden = pts.iter().any(|&p| !fold_map.renders(buffer, p, tab));
     // Inline candidates test their own bracket span against the edit STARTS (only a
     // start reveals an inline pair): "∃ start in (opener, close]", binary-searched.
     let mut starts: Vec<u32> = committed.patch().edits().iter().map(|e| e.new.start).collect();
@@ -2543,7 +2565,7 @@ fn expand_folds_touched(
                 // `[` itself or past `]` doesn't — a start in (opener, close].
                 starts.partition_point(|&s| s <= close) > starts.partition_point(|&s| s <= opener)
             } else {
-                // Block: `display_position` is `None` exactly in the gap; an edit
+                // Block: `renders` is false exactly in the gap; an edit
                 // straddling INTO the gap has an endpoint there, one swallowing the
                 // whole fold broke the pair. Candidate-independent (see above).
                 any_hidden
@@ -2968,9 +2990,8 @@ mod tests {
         assert!(d.toggle_fold_opener(2));
         d.shrink_selection(); // ladder cleared by the toggle → no-op…
         let head = d.selections().newest().head();
-        let fm = crate::fold_map::FoldMap::new(d.folds(), d.brackets(), d.buffer());
         assert!(
-            fm.display_position(d.buffer(), head, d.tab_size()).is_some(),
+            d.rows().position(head, Edge::Caret).is_some(),
             "…so the caret cannot be restored into the collapsed fold"
         );
         // And the toggle sealed the typing group: the later run undoes alone.
@@ -2981,7 +3002,7 @@ mod tests {
 
     #[test]
     fn find_navigation_expands_a_collapsed_inline_fold() {
-        // display_position clips a chip-hidden column to the chip center, so an
+        // Rows::position clips a chip-hidden column to the chip center, so an
         // offset inside a collapsed inline fold still reports a position;
         // unfold_to_reveal must expand the fold anyway so a find jump lands on
         // visible text, not inside the chip.
@@ -3180,9 +3201,8 @@ mod tests {
         d.set_find_query(Some(FindQuery { text: "needle".into(), case_sensitive: false, ..Default::default() }), 0);
         let m = d.find_next(0).expect("the match exists");
         assert!(!d.folds().is_folded(opener), "the fold expanded to reveal the match");
-        let fm = crate::fold_map::FoldMap::new(d.folds(), d.brackets(), d.buffer());
         assert!(
-            fm.display_position(d.buffer(), m.end, d.tab_size()).is_some(),
+            d.rows().position(m.end, Edge::Caret).is_some(),
             "the match head renders"
         );
         // A match on VISIBLE ground (the header line) leaves folds alone.
@@ -6375,4 +6395,3 @@ mod tests {
         assert_eq!(offsets, vec![1, 3], "mid-char snaps left, past-the-end clamps");
     }
 }
-

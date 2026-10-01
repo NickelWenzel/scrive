@@ -14,15 +14,19 @@
 //! remaining job is `x = origin + cell × advance` (and its inverse).
 
 use std::borrow::Cow;
+use std::cell::{Ref, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::buffer::Buffer;
 use crate::coords::{Bias, Point};
+use crate::decorations::DecorationStore;
 use crate::display_map::{self, BufferRow, DisplayRow};
 use crate::fold_map::{FoldMap, InlineFold};
 
-// Op-count canary: counts `display_position` probes on this thread so a test
-// can assert `expand_folds_touched` calls it O(edit points) per commit — once
-// per point, for the hidden-gap check — and never O(candidates · edits), which
+// Op-count canary: counts `FoldMap::renders` and `Rows::position` probes on
+// this thread so a test can assert `expand_folds_touched` probes O(edit points)
+// per commit — once per point, for the hidden-gap check — and never O(candidates · edits), which
 // would make a document-scale multi-caret edit over a folded document cost the
 // product of the two. Debug/test only; zero-cost in release.
 #[cfg(any(test, debug_assertions))]
@@ -60,6 +64,22 @@ impl CaretCell {
             Self::ChipCenter(c) => c,
         }
     }
+}
+
+/// Which side of the inlay hints at one buffer offset a projection lands on.
+/// Hints take cells but no bytes, so an offset with hints spans several cells;
+/// each projection names the one it means. With no hints there, every edge is
+/// the same cell.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Edge {
+    /// After every hint at the offset: glyphs, brackets and their boxes, popup
+    /// anchors at a word start, and the start of a range.
+    Start,
+    /// Before every hint at the offset: the end of a range.
+    End,
+    /// After the offset's prefix hints and before its suffix hints, where the
+    /// next typed character lands: carets, autoscroll, vertical motion.
+    Caret,
 }
 
 /// Where a buffer offset renders: its display row plus its horizontal
@@ -319,8 +339,9 @@ impl<'a> RowLayout<'a> {
 /// caret placement on the tail, selection washes, hit-testing, the hover-chip
 /// rect, and the preview anchor, so they agree to the pixel by construction.
 pub struct HeaderLayout<'a> {
-    /// The header row's own horizontal projection.
-    head: RowLayout<'a>,
+    /// The header row's own horizontal projection, shared with the view that
+    /// built it.
+    head: Rc<RowLayout<'a>>,
     /// The fold's last buffer row — the line the tail glyphs come from.
     last: BufferRow,
     tail_line: Cow<'a, str>,
@@ -330,6 +351,12 @@ pub struct HeaderLayout<'a> {
 }
 
 impl<'a> HeaderLayout<'a> {
+    fn new(head: Rc<RowLayout<'a>>, last: BufferRow, buffer: &'a Buffer, tab: u32) -> Self {
+        let tail_line = buffer.line(last.0);
+        let tail_lead = tail_start_col(&tail_line);
+        Self { head, last, tail_line, tail_lead, tab }
+    }
+
     /// The header row's projection (for hits resolving to [`HeaderHit::Head`]).
     #[must_use]
     pub fn head(&self) -> &RowLayout<'a> {
@@ -426,8 +453,8 @@ impl<'a> HeaderLayout<'a> {
 }
 
 impl FoldMap {
-    /// The horizontal projection of visible buffer `row` — built per use,
-    /// like the `FoldMap` itself; never store it.
+    /// A fresh horizontal projection of visible buffer `row`; [`Rows::layout`]
+    /// shares one per row for a view's lifetime.
     #[must_use]
     pub fn row_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> RowLayout<'a> {
         RowLayout::new(self, buffer, row, tab)
@@ -438,10 +465,7 @@ impl FoldMap {
     #[must_use]
     pub fn header_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> Option<HeaderLayout<'a>> {
         let last = self.fold_at_header(row)?;
-        let head = self.row_layout(buffer, row, tab);
-        let tail_line = buffer.line(last.0);
-        let tail_lead = tail_start_col(&tail_line);
-        Some(HeaderLayout { head, last, tail_line, tail_lead, tab })
+        Some(HeaderLayout::new(Rc::new(self.row_layout(buffer, row, tab)), last, buffer, tab))
     }
 
     /// THE owner of "where does buffer `offset` render": its display row and
@@ -466,6 +490,25 @@ impl FoldMap {
         let layout = self.header_layout(buffer, hdr, tab)?;
         let cell = layout.tail_col_cell(p.col)?;
         Some(DisplayPosition { row: self.to_display_row(hdr), x: CaretCell::Cell(cell) })
+    }
+
+    /// Whether buffer `offset` renders anywhere: `false` only inside a
+    /// collapsed block's gap or before the visible tail on its last row.
+    /// Hint-free, so it answers inside `rebase_views` while the inlay store is
+    /// being moved; geometry goes through [`Rows::position`].
+    #[must_use]
+    pub(crate) fn renders(&self, buffer: &Buffer, offset: u32, tab: u32) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        DISPLAY_POSITION_PROBES.with(|c| c.set(c.get() + 1));
+        crate::perf::charge(1); // complexity gate: one display-map probe
+        let p = buffer.offset_to_point(offset);
+        let row = BufferRow(p.row);
+        if !self.is_folded(row) {
+            return true;
+        }
+        self.header_of_tail(row)
+            .and_then(|hdr| self.header_layout(buffer, hdr, tab))
+            .is_some_and(|layout| layout.tail_col_cell(p.col).is_some())
     }
 
     /// Inverse of [`Self::display_position`] on one visible row: a (fractional,
@@ -497,6 +540,94 @@ impl FoldMap {
     #[must_use]
     pub fn display_row_at(&self, rows_from_top: f64) -> DisplayRow {
         DisplayRow((rows_from_top.floor().max(0.0) as u32).min(self.display_row_count().saturating_sub(1)))
+    }
+}
+
+/// A document's rows as they render: the fold projection, the buffer, the
+/// inlay hints and the tab width in one view, so no geometry query can leave
+/// one of them out. Get it from [`Document::rows`](crate::Document::rows) and
+/// keep it for one pass (a frame, an event, an edit): it borrows the
+/// document's fold cache.
+///
+/// Each row's layout is built once per view and shared, so the passes of one
+/// frame don't rebuild it.
+pub struct Rows<'a> {
+    folds: Ref<'a, FoldMap>,
+    buffer: &'a Buffer,
+    _inlays: &'a DecorationStore,
+    tab: u32,
+    built: RefCell<HashMap<BufferRow, Rc<RowLayout<'a>>>>,
+}
+
+impl<'a> Rows<'a> {
+    pub(crate) fn new(folds: Ref<'a, FoldMap>, buffer: &'a Buffer, inlays: &'a DecorationStore, tab: u32) -> Self {
+        Self { folds, buffer, _inlays: inlays, tab, built: RefCell::new(HashMap::new()) }
+    }
+
+    /// The fold projection: buffer ↔ display rows, visible rows, fold lookups.
+    #[must_use]
+    pub fn folds(&self) -> &FoldMap {
+        &self.folds
+    }
+
+    pub(crate) fn buffer(&self) -> &'a Buffer {
+        self.buffer
+    }
+
+    pub(crate) fn tab(&self) -> u32 {
+        self.tab
+    }
+
+    /// The horizontal projection of visible buffer `row`, built on first use
+    /// and shared afterwards.
+    #[must_use]
+    pub fn layout(&self, row: BufferRow) -> Rc<RowLayout<'a>> {
+        let cached = self.built.borrow().get(&row).cloned();
+        if let Some(layout) = cached {
+            return layout;
+        }
+        let layout = Rc::new(self.folds.row_layout(self.buffer, row, self.tab));
+        self.built.borrow_mut().insert(row, Rc::clone(&layout));
+        layout
+    }
+
+    /// The `head … tail` layout of `row`, iff it is a collapsed block fold's
+    /// header. Its head is [`Self::layout`]'s.
+    #[must_use]
+    pub fn header(&self, row: BufferRow) -> Option<HeaderLayout<'a>> {
+        let last = self.folds.fold_at_header(row)?;
+        Some(HeaderLayout::new(self.layout(row), last, self.buffer, self.tab))
+    }
+
+    /// Where buffer `offset` renders, on the `edge` side of any hints there:
+    /// its display row and cell. Follows a collapsed block's closing tail to
+    /// the header row and clips a column hidden in an inline fold to its chip
+    /// center. `None` iff the offset is hidden: inside a block fold's gap, or
+    /// on the last row before the visible tail.
+    #[must_use]
+    pub fn position(&self, offset: u32, _edge: Edge) -> Option<DisplayPosition> {
+        #[cfg(any(test, debug_assertions))]
+        DISPLAY_POSITION_PROBES.with(|c| c.set(c.get() + 1));
+        crate::perf::charge(1); // complexity gate: one display-map probe
+        let p = self.buffer.offset_to_point(offset);
+        let row = BufferRow(p.row);
+        if !self.folds.is_folded(row) {
+            return Some(DisplayPosition { row: self.folds.to_display_row(row), x: self.layout(row).caret_cell(p.col) });
+        }
+        // A hidden row renders only a collapsed fold's closing tail, on the
+        // header's display line.
+        let hdr = self.folds.header_of_tail(row)?;
+        let cell = self.header(hdr)?.tail_col_cell(p.col)?;
+        Some(DisplayPosition { row: self.folds.to_display_row(hdr), x: CaretCell::Cell(cell) })
+    }
+
+    /// The inverse of [`Self::position`] on visible `row`: a fractional
+    /// display cell → the byte offset a click there lands on. A collapsed
+    /// header's gap resolves to the header line's end, its tail to the last
+    /// row's column.
+    #[must_use]
+    pub fn hit(&self, row: BufferRow, cell: f32, bias: Bias) -> u32 {
+        self.folds.hit_row(self.buffer, row, cell, bias, self.tab)
     }
 }
 
@@ -677,5 +808,63 @@ mod tests {
         assert_eq!(rl.display_cell(1), 4, "tab expands to the stop");
         assert_eq!(rl.width(), 4 + "x = 1".len() as u32);
         assert_eq!(rl.hit(4.0, Bias::Left), 1);
+    }
+
+    // ── Rows: the view every geometry projection goes through ──
+
+    /// One build per row per view, and a collapsed header's head is that build.
+    #[test]
+    fn rows_build_each_row_once_and_the_header_shares_it() {
+        let text = "a {\nhidden\n} tail\nafter\n";
+        let doc = doc_with_folds(text, &[text.find('{').unwrap() as u32]);
+        let rows = doc.rows();
+        let head = rows.layout(BufferRow(0));
+        assert!(Rc::ptr_eq(&head, &rows.layout(BufferRow(0))), "a second query reuses the first build");
+        let hl = rows.header(BufferRow(0)).expect("row 0 is a collapsed header");
+        assert!(std::ptr::eq(hl.head(), &*head), "the header's head is the memoised layout");
+        assert!(rows.header(BufferRow(3)).is_none(), "a plain row has no header layout");
+    }
+
+    /// The view's fold projection is the document's cached one.
+    #[test]
+    fn rows_folds_is_the_documents_fold_map() {
+        let doc = doc_with_folds("a {\nb\n}\nc\n", &[2]);
+        assert_eq!(*doc.rows().folds(), *doc.fold_map(), "the view reads the cached fold map");
+    }
+
+    /// Without hints every edge is the same cell, and `renders` agrees with
+    /// `position` on every offset.
+    #[test]
+    fn rows_position_is_one_cell_on_every_edge_and_renders_agrees() {
+        let text = "f([a, b]) {\ninner\n} tail\nafter\n";
+        let inline_open = text.find('[').unwrap() as u32;
+        let block_open = text.find('{').unwrap() as u32;
+        let doc = doc_with_folds(text, &[inline_open, block_open]);
+        let rows = doc.rows();
+        for offset in 0..=doc.buffer().len() {
+            let caret = rows.position(offset, Edge::Caret);
+            assert_eq!(rows.position(offset, Edge::Start), caret, "offset {offset}: Start");
+            assert_eq!(rows.position(offset, Edge::End), caret, "offset {offset}: End");
+            assert_eq!(rows.folds().renders(doc.buffer(), offset, doc.tab_size()), caret.is_some(), "offset {offset}: renders");
+        }
+    }
+
+    /// `hit` lands back on every landable offset `position` projected, across an
+    /// inline chip, a collapsed header and its tail.
+    #[test]
+    fn rows_hit_inverts_position_on_landable_offsets() {
+        let text = "f([a, b]) {\ninner\n}\nafter\n";
+        let inline_open = text.find('[').unwrap() as u32;
+        let close = text.find(']').unwrap() as u32;
+        let block_open = text.find('{').unwrap() as u32;
+        let doc = doc_with_folds(text, &[inline_open, block_open]);
+        let rows = doc.rows();
+        let tail = doc.buffer().point_to_offset(Point::new(2, 0));
+        let after = doc.buffer().point_to_offset(Point::new(3, 2));
+        for offset in [0, inline_open + 1, close, block_open, tail, after] {
+            let p = rows.position(offset, Edge::Caret).expect("landable offset");
+            let row = rows.folds().to_buffer_row(p.row);
+            assert_eq!(rows.hit(row, p.x.cells(), Bias::Left), offset, "offset {offset} round-trips");
+        }
     }
 }
