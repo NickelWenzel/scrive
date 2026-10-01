@@ -25,6 +25,7 @@
 //! - syntax-highlight a line → [`highlight`]
 //! - attach diagnostics / snippet stops → [`decorations`]
 //! - complete / hover / signature help → [`intel::providers`]
+//! - show inlay hints → [`intel::inlay`]
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
