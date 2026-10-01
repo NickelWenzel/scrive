@@ -34,14 +34,15 @@ use iced::advanced::widget;
 use iced::alignment::{Horizontal, Vertical};
 use iced::widget::operation::{focus, focus_next, focus_previous, is_focused};
 use iced::widget::{button, column, container, row, stack, text, text_input};
-use iced::time::Instant;
+use iced::time::{Duration, Instant};
 use iced::{Alignment, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, Vector};
 
 use scrive_core::intel::completion::Start;
 use scrive_core::intel::hover::escape_markdown;
+use scrive_core::intel::inlay;
 use scrive_core::intel::ticket;
 use scrive_core::{
-    default_indent_size, is_completion_word_char, Bias, CompletionController, CompletionCx, CompletionItem,
+    default_indent_size, is_completion_word_char, Bias, BufferRow, CompletionController, CompletionCx, CompletionItem,
     CompletionState, CompletionTrigger, Completions, DefinitionRequest, Diagnostic, DiagnosticsOutcome,
     Document, EditOp, FindQuery, FormatRequest, Hover,
     HoverCx, HoverInfo, InsertText, Point, RenameRequest, Revision, Selection, SelectionId, SelectionSet, Severity,
@@ -49,7 +50,7 @@ use scrive_core::{
     TokenTheme, TransactionError, LOOKBACK_LINES,
 };
 
-use crate::editor::{Action, Editor};
+use crate::editor::{Action, Editor, Wake};
 use crate::highlight_pool::{HighlightPool, PARALLEL_MIN_BYTES};
 
 #[cfg(feature = "lsp")]
@@ -78,6 +79,19 @@ const BAR_INPUT_W: f32 = 264.0;
 const BAR_ROW_H: f32 = 26.0;
 const BAR_BOX_GAP: f32 = 3.0;
 const BAR_BOX_MARGIN: f32 = 3.0;
+
+/// How long typing must pause before hints are fetched for the new text:
+/// short enough that hints follow the text, long enough not to fetch on every
+/// keystroke (Zed waits 700 ms, Helix 250 ms).
+const INLAY_EDIT_DELAY: Duration = Duration::from_millis(300);
+/// How long scrolling must pause before hints are fetched for the rows it
+/// reached…
+const INLAY_SCROLL_DELAY: Duration = Duration::from_millis(75);
+/// …and the longest a continuous scroll (a scrollbar drag) waits, so a drag
+/// fetches as it goes instead of cancelling each request before it answers.
+const INLAY_SCROLL_CAP: Duration = Duration::from_millis(300);
+/// The fewest rows a hint request covers.
+const INLAY_MIN_ROWS: u32 = 50;
 
 /// The opaque message a [`CodeEditor`] emits and consumes. The host never
 /// matches on it — it only maps it through the three wires
@@ -252,6 +266,17 @@ pub struct CodeEditor {
     /// A pending rename request (the rename field was submitted), for the host
     /// to pull via [`take_rename_request`](CodeEditor::take_rename_request).
     pending_rename_request: Option<RenameRequest>,
+    /// A pending inlay hint fetch, for the host to pull via
+    /// [`take_inlay_request`](CodeEditor::take_inlay_request).
+    pending_inlay_request: Option<inlay::Request>,
+    /// A pending gesture on a hint (tooltip, jump or insert), for the host to
+    /// pull via [`take_inlay_interaction`](CodeEditor::take_inlay_interaction).
+    /// One slot: a newer gesture replaces it.
+    pending_inlay_interaction: Option<inlay::Interaction>,
+    /// The inlay hint scheduler.
+    inlays: Inlays,
+    /// The open inlay tooltip card. At most one card shows: this or `hover`.
+    inlay_card: Option<InlayCard>,
     /// Whether F2 opens the rename field. Off by default, because a host with
     /// no rename provider would show a field that does nothing.
     rename_enabled: bool,
@@ -299,6 +324,36 @@ struct Awaiting {
     hover: Option<(Ticket, u32, Range<u32>)>,
     /// The goto-definition ticket; a landed range is selected and revealed.
     definition: Option<Ticket>,
+    /// The inlay fetch's ticket.
+    inlays: Option<Ticket>,
+    /// The inlay tooltip's ticket, and the hint and label part it describes.
+    inlay_tooltip: Option<(Ticket, inlay::Key, u32)>,
+    /// The inlay insert's ticket, and the hint and the offset it renders at.
+    inlay_insert: Option<(Ticket, inlay::Key, u32)>,
+}
+
+/// Inlay hint fetching: whether hints are on, the wait a fetch is pending on,
+/// and the rows the viewport may move within before the last fetch's window
+/// needs replacing.
+struct Inlays {
+    enabled: bool,
+    /// Bumped by every trigger, so the widget restarts its delay.
+    generation: u64,
+    /// The pending fetch: a delay and cap, never a deadline, because triggers
+    /// arrive outside `update`, where the clock is stale.
+    wait: Option<Wake>,
+    /// The inner half of the last requested window, in buffer rows.
+    window: Option<Range<u32>>,
+    /// The last revision the scheduler saw; a different one is an edit.
+    seen: Revision,
+}
+
+/// The inlay tooltip card: the hint and label part it describes, and its
+/// markdown.
+struct InlayCard {
+    key: inlay::Key,
+    part: u32,
+    markdown: String,
 }
 
 /// The open rename field: the name being typed, the caret offset and revision
@@ -318,6 +373,9 @@ enum Awaited {
     Signature,
     Hover,
     Definition,
+    Inlays,
+    InlayTooltip,
+    InlayInsert,
 }
 
 impl CodeEditor {
@@ -332,6 +390,7 @@ impl CodeEditor {
     pub fn new(source: impl Into<String>) -> Self {
         let source = source.into();
         let doc = Document::new(&source).expect("source fits the u32 offset space");
+        let revision = doc.revision();
         Self {
             doc,
             viewport: 0..0,
@@ -367,6 +426,10 @@ impl CodeEditor {
             pending_definition_request: None,
             pending_format_request: None,
             pending_rename_request: None,
+            pending_inlay_request: None,
+            pending_inlay_interaction: None,
+            inlays: Inlays { enabled: false, generation: 0, wait: None, window: None, seen: revision },
+            inlay_card: None,
             rename_enabled: false,
             rename: None,
             tickets: ticket::Counter::new(),
@@ -441,6 +504,15 @@ impl CodeEditor {
     #[must_use]
     pub fn rename(mut self, enabled: bool) -> Self {
         self.rename_enabled = enabled;
+        self
+    }
+
+    /// Show inlay hints, the server's inline labels such as `: i32`. Default
+    /// off: turn it on when the host answers
+    /// [`take_inlay_request`](CodeEditor::take_inlay_request).
+    #[must_use]
+    pub fn inlay_hints(mut self, enabled: bool) -> Self {
+        self.set_inlay_hints(enabled);
         self
     }
 
@@ -564,6 +636,15 @@ impl CodeEditor {
         // highlight cache stay attached and re-tokenize via `on_commit`.
         let len = self.doc.buffer().len();
         let _ = self.doc.edit(vec![EditOp::new(0..len, &source)]);
+        // The edit would keep the old hints at stale offsets in the new text.
+        self.doc.clear_inlays();
+        self.inlay_card = None;
+        self.abandon(Awaited::Inlays);
+        self.abandon(Awaited::InlayTooltip);
+        self.abandon(Awaited::InlayInsert);
+        self.inlays.seen = self.doc.revision();
+        self.inlays.window = None;
+        self.wait_inlays(Duration::ZERO, None);
         if let Some(g) = grammar {
             self.doc.set_syntax(g, self.theme.clone());
             self.has_syntax = true;
@@ -723,6 +804,86 @@ impl CodeEditor {
         self.after_edit(CompletionEvent::CaretOrClose);
     }
 
+    /// Turn inlay hints on or off at runtime. On asks for the visible rows'
+    /// hints at once. Off removes the hints, closes their tooltip and forgets
+    /// every hint request in flight.
+    pub fn set_inlay_hints(&mut self, enabled: bool) {
+        if enabled == self.inlays.enabled {
+            return;
+        }
+        self.inlays.enabled = enabled;
+        if enabled {
+            self.wait_inlays(Duration::ZERO, None);
+            return;
+        }
+        self.doc.clear_inlays();
+        self.inlay_card = None;
+        self.abandon(Awaited::Inlays);
+        self.abandon(Awaited::InlayTooltip);
+        self.abandon(Awaited::InlayInsert);
+        self.pending_inlay_interaction = None;
+        self.inlays.wait = None;
+        self.inlays.window = None;
+    }
+
+    /// Take the pending inlay hint fetch, if any: a byte span to fetch hints
+    /// for. Answer it through [`set_inlays`](Self::set_inlays) with the
+    /// request's ticket.
+    pub fn take_inlay_request(&mut self) -> Option<inlay::Request> {
+        self.pending_inlay_request.take()
+    }
+
+    /// Land an inlay hint fetch stamped with the request's `ticket`: `Some`
+    /// replaces the shown hints (an empty list clears them), and `None`, a
+    /// failed fetch, keeps them. Dropped unless the editor still awaits
+    /// `ticket` and the text has not changed since.
+    pub fn set_inlays(&mut self, ticket: Ticket, hints: Option<Vec<inlay::Placed>>) {
+        if !self.accepts(Awaited::Inlays, ticket) {
+            return;
+        }
+        self.abandon(Awaited::Inlays);
+        let Some(hints) = hints else { return };
+        // A refetch keeps an unchanged hint's key, so its open card stays.
+        if self.inlay_card.as_ref().is_some_and(|card| !hints.iter().any(|p| p.hint().key() == card.key)) {
+            self.inlay_card = None;
+        }
+        let outcome = self.doc.set_inlays(ticket.revision(), hints);
+        debug_assert!(matches!(outcome, inlay::Outcome::Applied { .. }), "`accepts` checked the revision");
+    }
+
+    /// The wait a hint fetch is pending on, if any: what [`view`](Self::view)
+    /// hands the widget through [`Editor::wake_after`]. A host that runs its
+    /// own timer, or a test, sends [`Action::Wake`] with its generation once
+    /// the delay has passed.
+    #[must_use]
+    pub fn pending_wake(&self) -> Option<Wake> {
+        self.inlays.wait
+    }
+
+    /// Take the pending gesture on a hint, if any: a tooltip to show, a label
+    /// to jump through, or a hint to insert. Answer a tooltip through
+    /// [`set_inlay_tooltip`](Self::set_inlay_tooltip), a jump as a definition,
+    /// and an insert as an edit batch.
+    pub fn take_inlay_interaction(&mut self) -> Option<inlay::Interaction> {
+        self.pending_inlay_interaction.take()
+    }
+
+    /// Land a hint tooltip stamped with the gesture's `ticket`: `Some` shows
+    /// the markdown as a card on the hovered label part, and `None` shows
+    /// nothing. Dropped once the pointer has left the part or the text has
+    /// changed.
+    pub fn set_inlay_tooltip(&mut self, ticket: Ticket, markdown: Option<String>) {
+        if !self.accepts(Awaited::InlayTooltip, ticket) {
+            return;
+        }
+        let Some((_, key, part)) = self.awaiting.inlay_tooltip else { return };
+        self.abandon(Awaited::InlayTooltip);
+        self.inlay_card = markdown.map(|markdown| InlayCard { key, part, markdown });
+        if self.inlay_card.is_some() {
+            self.hover = None;
+        }
+    }
+
     /// Enable or disable the per-commit change log, for a host mirroring
     /// edits to a language server (`textDocument/didChange`). Off by default
     /// (zero overhead); turning it on starts a fresh chain at the current
@@ -757,6 +918,7 @@ impl CodeEditor {
             // it. Not an edit — no history, no find rescan — so it bypasses
             // `apply`.
             Event::Editor(Action::ViewportChanged(rows)) => {
+                let left_window = self.inlays.window.as_ref().is_some_and(|w| rows.start < w.start || rows.end > w.end);
                 self.viewport = rows.clone();
                 self.doc.set_highlight_window(rows.clone());
                 if self.uses_pool() {
@@ -776,6 +938,11 @@ impl CodeEditor {
                 }
                 self.hover = None; // scroll closes the hover…
                 self.abandon(Awaited::Hover); // …and retires a pending one
+                self.inlay_card = None;
+                self.abandon(Awaited::InlayTooltip);
+                if left_window {
+                    self.wait_inlays(INLAY_SCROLL_DELAY, Some(INLAY_SCROLL_CAP));
+                }
                 Task::none()
             }
             // Escape with the bar open closes the BAR and keeps the selections
@@ -855,6 +1022,8 @@ impl CodeEditor {
                 Task::none()
             }
             Event::Editor(Action::HoverQuery(offset)) => {
+                self.inlay_card = None;
+                self.abandon(Awaited::InlayTooltip);
                 let cx = self.build_hover_cx(offset);
                 let has_word = cx.word.start != cx.word.end;
                 let docs = has_word
@@ -878,6 +1047,8 @@ impl CodeEditor {
             Event::Editor(Action::HoverDismiss) => {
                 self.hover = None;
                 self.abandon(Awaited::Hover);
+                self.inlay_card = None;
+                self.abandon(Awaited::InlayTooltip);
                 Task::none()
             }
             Event::Editor(Action::GotoDefinition) => {
@@ -910,8 +1081,58 @@ impl CodeEditor {
                 self.pending_format_request = Some(FormatRequest::new(ticket, default_indent_size()));
                 Task::none()
             }
-            Event::Editor(Action::Wake(_)) => Task::none(),
-            Event::Editor(Action::InlayHover { .. } | Action::InlayJump { .. } | Action::InlayInsert { .. }) => Task::none(),
+            // The pending fetch's wait is over. Kept out of `apply`, whose tail
+            // would close the completion popup after every typing pause.
+            Event::Editor(Action::Wake(generation)) => {
+                if self.inlays.wait.is_some_and(|w| w.generation == generation) {
+                    self.inlays.wait = None;
+                    let (rows, inner) = self.inlay_window();
+                    let buffer = self.doc.buffer();
+                    let start = buffer.point_to_offset(Point::new(rows.start, 0));
+                    let end = if rows.end >= buffer.line_count() {
+                        buffer.len()
+                    } else {
+                        buffer.point_to_offset(Point::new(rows.end, 0))
+                    };
+                    let ticket = self.tickets.issue(self.doc.revision());
+                    self.awaiting.inlays = Some(ticket);
+                    self.pending_inlay_request = Some(inlay::Request::new(ticket, start..end));
+                    self.inlays.window = Some(inner);
+                }
+                Task::none()
+            }
+            // Gestures on hints: kept out of `apply`, whose tail would retire
+            // the slots they fill.
+            Event::Editor(Action::InlayHover { key, part }) => {
+                self.hover = None;
+                self.abandon(Awaited::Hover);
+                self.inlay_card = None;
+                self.abandon(Awaited::InlayTooltip);
+                if self.inlays.enabled && self.inlays_current() {
+                    let ticket = self.tickets.issue(self.doc.revision());
+                    self.awaiting.inlay_tooltip = Some((ticket, key, part));
+                    self.pending_inlay_interaction = Some(inlay::Interaction::tooltip(ticket, key, part));
+                }
+                Task::none()
+            }
+            Event::Editor(Action::InlayJump { key, part }) => {
+                if self.inlays.enabled && self.inlays_current() {
+                    let ticket = self.tickets.issue(self.doc.revision());
+                    // The jump lands as a definition, so every target kind works.
+                    self.awaiting.definition = Some(ticket);
+                    self.pending_definition_request = None;
+                    self.pending_inlay_interaction = Some(inlay::Interaction::jump(ticket, key, part));
+                }
+                Task::none()
+            }
+            Event::Editor(Action::InlayInsert { key, offset }) => {
+                if self.inlays.enabled && self.inlays_current() {
+                    let ticket = self.tickets.issue(self.doc.revision());
+                    self.awaiting.inlay_insert = Some((ticket, key, offset));
+                    self.pending_inlay_interaction = Some(inlay::Interaction::insert(ticket, key, offset));
+                }
+                Task::none()
+            }
             Event::Editor(action) => {
                 self.apply(action);
                 Task::none()
@@ -1147,6 +1368,8 @@ impl CodeEditor {
                     .filter(|(ticket, ..)| ticket.revision() == self.doc.revision())
                     .map(|(_, _, word)| word.clone()),
             )
+            .inlay_tooltip(self.inlay_card.as_ref().map(|card| (card.key, card.part, card.markdown.as_str())))
+            .wake_after(self.inlays.wait)
             .font(self.font)
             .text_size(self.text_size)
             .id(self.id.clone());
@@ -1555,6 +1778,7 @@ impl CodeEditor {
         self.drive_signature(comp_event);
         self.reconcile_snippet();
         self.hover = None;
+        self.inlay_card = None;
         // A caret jump abandons a pending hover and definition. Typing keeps
         // them: their replies are then dropped by revision, and the pointer
         // re-arm asks for hover again.
@@ -1567,6 +1791,7 @@ impl CodeEditor {
         if self.rename.as_ref().is_some_and(|r| r.revision != self.doc.revision()) {
             self.rename = None;
         }
+        self.inlays_after_edit();
         // `dirty` is set by the callers on an actual text change (a bare caret
         // move runs the tail but must not dirty the document — see `apply`).
     }
@@ -1780,6 +2005,7 @@ impl CodeEditor {
         self.doc.tokenize_highlight(self.viewport.end);
         let now = self.now_ms;
         self.doc.maybe_rescan_find(now);
+        self.inlays_after_edit();
         if self.doc.revision() != before {
             self.dirty = true;
         }
@@ -1801,6 +2027,9 @@ impl CodeEditor {
             Awaited::Signature => self.awaiting.signature,
             Awaited::Hover => self.awaiting.hover.as_ref().map(|(t, ..)| *t),
             Awaited::Definition => self.awaiting.definition,
+            Awaited::Inlays => self.awaiting.inlays,
+            Awaited::InlayTooltip => self.awaiting.inlay_tooltip.as_ref().map(|(t, ..)| *t),
+            Awaited::InlayInsert => self.awaiting.inlay_insert.as_ref().map(|(t, ..)| *t),
         };
         awaited == Some(ticket) && ticket.revision() == self.doc.revision()
     }
@@ -1822,10 +2051,84 @@ impl CodeEditor {
                 self.pending_hover_request = None;
             }
             Awaited::Definition => {
-                self.awaiting.definition = None;
+                let ticket = self.awaiting.definition.take();
                 self.pending_definition_request = None;
+                self.drop_interaction(ticket);
+            }
+            Awaited::Inlays => {
+                self.awaiting.inlays = None;
+                self.pending_inlay_request = None;
+            }
+            Awaited::InlayTooltip => {
+                let ticket = self.awaiting.inlay_tooltip.take().map(|(t, ..)| t);
+                self.drop_interaction(ticket);
+            }
+            Awaited::InlayInsert => {
+                let ticket = self.awaiting.inlay_insert.take().map(|(t, ..)| t);
+                self.drop_interaction(ticket);
             }
         }
+    }
+
+    /// Forget the unpulled gesture made under `ticket`; a newer gesture's
+    /// stays.
+    fn drop_interaction(&mut self, ticket: Option<Ticket>) {
+        if ticket.is_some() && self.pending_inlay_interaction.as_ref().map(inlay::Interaction::ticket) == ticket {
+            self.pending_inlay_interaction = None;
+        }
+    }
+
+    /// Ask for hints after `delay`, capped across a run of triggers by `cap`.
+    /// Each call restarts the wait. Ignored while hints are off.
+    fn wait_inlays(&mut self, delay: Duration, cap: Option<Duration>) {
+        if !self.inlays.enabled {
+            return;
+        }
+        self.inlays.generation += 1;
+        self.inlays.wait = Some(Wake { generation: self.inlays.generation, delay, cap });
+    }
+
+    /// Note an edit for the hints: their tooltip and insert describe text that
+    /// is gone, and the new text needs its own hints once typing pauses.
+    fn inlays_after_edit(&mut self) {
+        if self.doc.revision() == self.inlays.seen {
+            return;
+        }
+        self.inlays.seen = self.doc.revision();
+        self.inlay_card = None;
+        self.abandon(Awaited::InlayTooltip);
+        self.abandon(Awaited::InlayInsert);
+        self.wait_inlays(INLAY_EDIT_DELAY, None);
+    }
+
+    /// The buffer rows to fetch hints for, and their inner half: the viewport
+    /// padded by its height above and twice that below, at least
+    /// `INLAY_MIN_ROWS`, within the document. The pads count display rows, so
+    /// a block fold on screen doesn't widen them; a fold's hidden interior
+    /// inside the window is requested too.
+    fn inlay_window(&self) -> (Range<u32>, Range<u32>) {
+        let lines = self.doc.buffer().line_count();
+        let folds = self.doc.fold_map();
+        let shown = folds.display_row_count();
+        let to_display = |row: u32| if row >= lines { shown } else { folds.to_display_row(BufferRow(row)).index() };
+        let first = to_display(self.viewport.start);
+        let vis = first..to_display(self.viewport.end).max(first);
+        let height = vis.end - vis.start;
+        let mut start = vis.start.saturating_sub(height);
+        let mut end = vis.end.saturating_add(2 * height).min(shown);
+        if end - start < INLAY_MIN_ROWS {
+            end = start.saturating_add(INLAY_MIN_ROWS).min(shown);
+            start = end.saturating_sub(INLAY_MIN_ROWS);
+        }
+        let inner = start + (vis.start - start) / 2..end - (end - vis.end) / 2;
+        let to_buffer = |d: u32| if d >= shown { lines } else { folds.to_buffer_row(folds.display_row_at(f64::from(d))).0 };
+        (to_buffer(start)..to_buffer(end), to_buffer(inner.start)..to_buffer(inner.end))
+    }
+
+    /// Whether the hints on screen describe the current text: only then may a
+    /// gesture on them be recorded.
+    fn inlays_current(&self) -> bool {
+        self.doc.inlays_revision() == Some(self.doc.revision())
     }
 
     /// Tab / Shift+Tab through the active snippet session.
@@ -2923,5 +3226,449 @@ mod tests {
         act(&mut ed, Action::HoverQuery(2));
         let card = ed.hover.as_ref().expect("the diagnostic shows at once");
         assert!(card.markdown.contains("expected \\*mut T"), "{}", card.markdown);
+    }
+
+    // ── inlay hints: scheduler, slots and toggle ──
+
+    /// The pending wait's generation.
+    fn wait_gen(ed: &CodeEditor) -> u64 {
+        ed.inlays.wait.expect("a fetch is pending").generation
+    }
+
+    /// Fire the pending wait and return the request it recorded.
+    fn fetch(ed: &mut CodeEditor) -> inlay::Request {
+        act(ed, Action::Wake(wait_gen(ed)));
+        ed.take_inlay_request().expect("the wake records a request")
+    }
+
+    /// Install `hints` in `ed` through a real fetch.
+    fn install(ed: &mut CodeEditor, hints: Vec<inlay::Placed>) {
+        ed.wait_inlays(INLAY_EDIT_DELAY, None);
+        let req = fetch(ed);
+        ed.set_inlays(req.ticket(), Some(hints));
+    }
+
+    /// An editor over `src` with hints on and `hints` installed.
+    fn with_hints(src: &str, hints: Vec<inlay::Placed>) -> CodeEditor {
+        let mut ed = CodeEditor::new(src).inlay_hints(true);
+        install(&mut ed, hints);
+        ed
+    }
+
+    /// The `: i32` hint after `x` in `let x = 1;`, keyed `k`: insertable, and
+    /// its part 1 (`i32`) links.
+    fn type_hint(k: u64) -> inlay::Placed {
+        let label = vec![inlay::Part::new(": ", inlay::Link::None), inlay::Part::new("i32", inlay::Link::Jumps)];
+        let hint = inlay::Hint::new(inlay::Kind::Type, label, inlay::Key::new(k))
+            .expect("non-empty label")
+            .insert(inlay::Insert::Available);
+        inlay::Placed::new(5, hint)
+    }
+
+    /// How many hints the document shows.
+    fn hint_count(ed: &CodeEditor) -> usize {
+        ed.document().inlays_in(0..ed.document().buffer().len()).count()
+    }
+
+    /// The source the slot tests share.
+    const LET_X: &str = "let x = 1;\n";
+
+    /// The ticket of the pending gesture, taken.
+    fn gesture_ticket(ed: &mut CodeEditor) -> Ticket {
+        ed.take_inlay_interaction().expect("a gesture is recorded").ticket()
+    }
+
+    /// A new editor asks for no hints, and typing doesn't either.
+    #[test]
+    fn hints_are_off_by_default_and_ask_for_nothing() {
+        let mut ed = CodeEditor::new("a\n");
+        assert!(ed.inlays.wait.is_none(), "no wait while off");
+        act(&mut ed, Action::Type('b'));
+        assert!(ed.inlays.wait.is_none(), "typing schedules nothing while off");
+        assert!(ed.take_inlay_request().is_none(), "nothing to fetch");
+    }
+
+    /// Turning hints on asks at once, and the wake records a request for the
+    /// window at the current revision.
+    #[test]
+    fn enabling_hints_waits_zero_and_a_wake_records_a_request_for_the_window() {
+        let src = format!("{}x", "x\n".repeat(9));
+        let mut ed = CodeEditor::new(src.as_str()).inlay_hints(true);
+        let wait = ed.inlays.wait.expect("enabling schedules a fetch");
+        assert_eq!((wait.delay, wait.cap), (Duration::ZERO, None), "at once, uncapped");
+        let req = fetch(&mut ed);
+        assert_eq!(req.ticket().revision(), ed.document().revision(), "at the current revision");
+        assert_eq!(req.span(), 0..src.len() as u32, "the whole ten-line document");
+    }
+
+    /// The window is the viewport padded by its height above and twice its
+    /// height below, clipped to the document and at least 50 rows.
+    #[test]
+    fn the_request_window_pads_one_view_above_and_two_below() {
+        let mut ed = CodeEditor::new("x\n".repeat(1000)).inlay_hints(true);
+        act(&mut ed, Action::ViewportChanged(400..436));
+        assert_eq!(fetch(&mut ed).span(), 2 * 364..2 * 508, "rows 364..508");
+        act(&mut ed, Action::ViewportChanged(980..1001));
+        assert_eq!(fetch(&mut ed).span(), 2 * 951..2000, "rows 951..1001, the last 50");
+    }
+
+    /// A wake for a superseded generation records nothing.
+    #[test]
+    fn a_wake_for_an_old_generation_records_nothing() {
+        let mut ed = CodeEditor::new("a\n").inlay_hints(true);
+        let g = wait_gen(&ed);
+        act(&mut ed, Action::Type('b'));
+        assert_eq!(wait_gen(&ed), g + 1, "the edit restarts the wait");
+        act(&mut ed, Action::Wake(g));
+        assert!(ed.take_inlay_request().is_none(), "the old generation asks nothing");
+        act(&mut ed, Action::Wake(g + 1));
+        assert!(ed.take_inlay_request().is_some(), "the current one asks");
+    }
+
+    /// An edit waits 300 ms, uncapped, and each edit restarts the wait; a
+    /// caret move is no edit.
+    #[test]
+    fn an_edit_waits_three_hundred_ms_and_each_edit_restarts_it() {
+        let mut ed = CodeEditor::new("a\n").inlay_hints(true);
+        let _ = fetch(&mut ed);
+        act(&mut ed, Action::Type('b'));
+        let wait = ed.inlays.wait.expect("the edit schedules a fetch");
+        assert_eq!((wait.delay, wait.cap), (INLAY_EDIT_DELAY, None), "300 ms, no cap");
+        act(&mut ed, Action::Type('c'));
+        assert_eq!(wait_gen(&ed), wait.generation + 1, "the next edit restarts it");
+        act(&mut ed, Action::PlaceCaret(0));
+        assert_eq!(wait_gen(&ed), wait.generation + 1, "a caret move changes nothing");
+    }
+
+    /// Accepting a completion edits outside the post-edit tail, and still
+    /// schedules a fetch.
+    #[test]
+    fn accepting_a_completion_schedules_a_fetch() {
+        let mut ed = CodeEditor::new("").completions(OneCompletion).inlay_hints(true);
+        let _ = fetch(&mut ed);
+        act(&mut ed, Action::Type('h'));
+        let typed = wait_gen(&ed);
+        act(&mut ed, Action::PopupAccept);
+        assert_eq!(ed.document().text().into_owned(), "hello", "the completion landed");
+        assert!(wait_gen(&ed) > typed, "the accept restarts the wait");
+    }
+
+    /// A trigger outside `update` (a server's refresh) leaves a delay with no
+    /// clock in it, which the widget times from the frame that first sees it.
+    #[test]
+    fn a_refresh_wait_is_a_delay_not_a_deadline() {
+        let mut ed = CodeEditor::new("a\n").inlay_hints(true);
+        let _ = fetch(&mut ed);
+        ed.wait_inlays(INLAY_EDIT_DELAY, None);
+        let wait = ed.inlays.wait.expect("the refresh schedules a fetch");
+        assert_eq!((wait.delay, wait.cap), (INLAY_EDIT_DELAY, None), "a plain 300 ms delay");
+    }
+
+    /// Scrolling within the inner half of the last window asks nothing.
+    #[test]
+    fn scrolling_inside_the_inner_window_asks_nothing() {
+        let mut ed = CodeEditor::new("x\n".repeat(1000)).inlay_hints(true);
+        act(&mut ed, Action::ViewportChanged(0..36));
+        let _ = fetch(&mut ed);
+        act(&mut ed, Action::ViewportChanged(10..46));
+        assert!(ed.inlays.wait.is_none(), "still inside rows 0..72");
+    }
+
+    /// Scrolling out of the inner half waits 75 ms with a 300 ms cap, and the
+    /// fetch covers the new window.
+    #[test]
+    fn scrolling_out_of_the_inner_window_waits_with_a_cap_and_re_requests() {
+        let mut ed = CodeEditor::new("x\n".repeat(1000)).inlay_hints(true);
+        act(&mut ed, Action::ViewportChanged(0..36));
+        let _ = fetch(&mut ed);
+        act(&mut ed, Action::ViewportChanged(40..76));
+        let wait = ed.inlays.wait.expect("leaving the inner rows schedules a fetch");
+        assert_eq!((wait.delay, wait.cap), (INLAY_SCROLL_DELAY, Some(INLAY_SCROLL_CAP)), "75 ms, capped at 300");
+        assert_eq!(fetch(&mut ed).span().start, 2 * 4, "the window starts one view above, at row 4");
+    }
+
+    /// While hints are off no trigger schedules a fetch.
+    #[test]
+    fn triggers_are_ignored_while_disabled() {
+        let mut ed = CodeEditor::new("x\n".repeat(100));
+        act(&mut ed, Action::Type('a'));
+        act(&mut ed, Action::ViewportChanged(60..90));
+        ed.load("y\n", None);
+        ed.wait_inlays(INLAY_EDIT_DELAY, None);
+        assert!(ed.inlays.wait.is_none(), "nothing is pending");
+    }
+
+    /// An answer lands only under the ticket the editor still awaits, and
+    /// only once.
+    #[test]
+    fn set_inlays_lands_only_under_the_awaited_ticket() {
+        let mut ed = CodeEditor::new(LET_X).inlay_hints(true);
+        let t1 = fetch(&mut ed).ticket();
+        ed.wait_inlays(INLAY_EDIT_DELAY, None);
+        let t2 = fetch(&mut ed).ticket();
+        ed.set_inlays(t1, Some(vec![type_hint(1)]));
+        assert_eq!(ed.document().inlays_revision(), None, "a superseded answer is dropped");
+        ed.set_inlays(t2, Some(vec![type_hint(1)]));
+        assert_eq!(ed.document().inlays_revision(), Some(ed.document().revision()), "the awaited answer installs");
+        ed.set_inlays(t2, Some(Vec::new()));
+        assert_eq!(hint_count(&ed), 1, "a settled ticket lands nothing");
+    }
+
+    /// A failed fetch settles its slot and keeps the hints on screen.
+    #[test]
+    fn a_failed_fetch_keeps_the_shown_hints() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        ed.wait_inlays(INLAY_EDIT_DELAY, None);
+        let t = fetch(&mut ed).ticket();
+        ed.set_inlays(t, None);
+        assert_eq!(hint_count(&ed), 1, "the hint stays");
+        assert!(ed.awaiting.inlays.is_none(), "the slot is settled");
+    }
+
+    /// An empty answer clears the hints.
+    #[test]
+    fn an_empty_answer_clears_the_hints() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        ed.wait_inlays(INLAY_EDIT_DELAY, None);
+        let t = fetch(&mut ed).ticket();
+        ed.set_inlays(t, Some(Vec::new()));
+        assert_eq!(hint_count(&ed), 0, "no hints");
+    }
+
+    /// The wake bypasses the post-edit tail, so the completion popup stays
+    /// open across a typing pause.
+    #[test]
+    fn a_wake_keeps_the_completion_popup_open() {
+        let mut ed = CodeEditor::new("").completions(OneCompletion).inlay_hints(true);
+        act(&mut ed, Action::Type('h'));
+        assert!(matches!(ed.completion.state(), CompletionState::Open(_)), "typing opens the popup");
+        let g = wait_gen(&ed);
+        act(&mut ed, Action::Wake(g));
+        assert!(matches!(ed.completion.state(), CompletionState::Open(_)), "the wake keeps it open");
+        assert!(ed.take_inlay_request().is_some(), "and records the fetch");
+    }
+
+    /// No hint action runs the post-edit tail: the popup and every slot they
+    /// fill survive.
+    #[test]
+    fn inlay_actions_never_reach_apply() {
+        let mut ed = CodeEditor::new(LET_X).completions(OneCompletion).inlay_hints(true);
+        install(&mut ed, vec![type_hint(1)]);
+        act(&mut ed, Action::TriggerCompletion);
+        assert!(matches!(ed.completion.state(), CompletionState::Open(_)), "Ctrl+Space opens the popup");
+        let key = inlay::Key::new(1);
+        act(&mut ed, Action::InlayJump { key, part: 1 });
+        let jump = gesture_ticket(&mut ed);
+        act(&mut ed, Action::InlayHover { key, part: 1 });
+        let hover = gesture_ticket(&mut ed);
+        act(&mut ed, Action::InlayInsert { key, offset: 5 });
+        act(&mut ed, Action::Wake(0));
+        assert!(matches!(ed.completion.state(), CompletionState::Open(_)), "the popup stays open");
+        assert!(ed.accepts(Awaited::Definition, jump), "the jump still awaits its definition");
+        assert!(ed.accepts(Awaited::InlayTooltip, hover), "the tooltip still awaits");
+    }
+
+    /// Hovering a hint asks for its part's tooltip, and the answer shows a
+    /// card keyed to that part in place of the word hover.
+    #[test]
+    fn inlay_hover_records_a_tooltip_interaction_and_the_answer_shows_a_keyed_card() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        let key = inlay::Key::new(1);
+        act(&mut ed, Action::InlayHover { key, part: 1 });
+        let gesture = ed.take_inlay_interaction().expect("the hover records a gesture");
+        assert_eq!((gesture.key(), gesture.gesture()), (key, inlay::interaction::Gesture::Tooltip { part: 1 }), "part 1");
+        ed.set_inlay_tooltip(gesture.ticket(), Some("**i32**".into()));
+        let card = ed.inlay_card.as_ref().expect("the tooltip shows");
+        assert_eq!((card.key, card.part), (key, 1), "keyed to the hovered part");
+        assert!(ed.hover.is_none(), "one card at a time");
+
+        act(&mut ed, Action::InlayHover { key, part: 1 });
+        let t = gesture_ticket(&mut ed);
+        ed.set_inlay_tooltip(t, None);
+        assert!(ed.inlay_card.is_none(), "no tooltip, no card");
+    }
+
+    /// Show the `i32` tooltip card on `ed`.
+    fn show_card(ed: &mut CodeEditor) {
+        act(ed, Action::InlayHover { key: inlay::Key::new(1), part: 1 });
+        let t = gesture_ticket(ed);
+        ed.set_inlay_tooltip(t, Some("**i32**".into()));
+        assert!(ed.inlay_card.is_some(), "the card shows");
+    }
+
+    /// A refetch that keeps the card's hint keeps the card.
+    #[test]
+    fn the_tooltip_card_survives_a_refetch_that_keeps_its_key() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        show_card(&mut ed);
+        install(&mut ed, vec![type_hint(1)]);
+        assert!(ed.inlay_card.is_some(), "the hint is still there, so is its card");
+    }
+
+    /// A refetch without the card's hint closes the card.
+    #[test]
+    fn a_refetch_without_the_key_closes_the_tooltip_card() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        show_card(&mut ed);
+        install(&mut ed, vec![type_hint(2)]);
+        assert!(ed.inlay_card.is_none(), "the card's hint is gone");
+    }
+
+    /// A label jump awaits through the definition slot, so its answer lands
+    /// like a goto-definition.
+    #[test]
+    fn inlay_jump_awaits_through_the_definition_slot() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        act(&mut ed, Action::InlayJump { key: inlay::Key::new(1), part: 1 });
+        let gesture = ed.take_inlay_interaction().expect("the jump records a gesture");
+        assert_eq!(gesture.gesture(), inlay::interaction::Gesture::Jump { part: 1 }, "a jump through part 1");
+        assert!(ed.accepts(Awaited::Definition, gesture.ticket()), "awaited as a definition");
+        ed.set_definition(gesture.ticket(), Some(0..3));
+        assert_eq!(ed.selection(), 0..3, "the target is selected");
+    }
+
+    /// A double-click insert records its hint and offset.
+    #[test]
+    fn inlay_insert_records_an_insert_interaction() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        let key = inlay::Key::new(1);
+        act(&mut ed, Action::InlayInsert { key, offset: 5 });
+        let gesture = ed.take_inlay_interaction().expect("the insert records a gesture");
+        assert_eq!(gesture.gesture(), inlay::interaction::Gesture::Insert { offset: 5 }, "an insert at 5");
+        assert_eq!(ed.awaiting.inlay_insert, Some((gesture.ticket(), key, 5)), "the slot holds the hint");
+    }
+
+    /// The gesture slot holds the newest gesture; the older one's own slot
+    /// keeps waiting.
+    #[test]
+    fn a_newer_gesture_supersedes_the_pending_interaction() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        let key = inlay::Key::new(1);
+        act(&mut ed, Action::InlayHover { key, part: 1 });
+        let hover = ed.awaiting.inlay_tooltip.map(|(t, ..)| t).expect("the tooltip awaits");
+        act(&mut ed, Action::InlayInsert { key, offset: 5 });
+        let gesture = ed.take_inlay_interaction().expect("a gesture is pending");
+        assert_eq!(gesture.gesture(), inlay::interaction::Gesture::Insert { offset: 5 }, "the insert replaced the hover");
+        assert!(ed.accepts(Awaited::InlayTooltip, hover), "the tooltip slot still awaits");
+    }
+
+    /// Once the text moved past the set, gestures on it record nothing.
+    #[test]
+    fn interactions_on_a_stale_set_record_nothing() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        act(&mut ed, Action::PlaceCaret(LET_X.len() as u32));
+        act(&mut ed, Action::Type('a'));
+        let key = inlay::Key::new(1);
+        for action in [Action::InlayHover { key, part: 1 }, Action::InlayJump { key, part: 1 }, Action::InlayInsert { key, offset: 5 }] {
+            act(&mut ed, action);
+        }
+        assert!(ed.take_inlay_interaction().is_none(), "no gesture");
+        assert!(ed.awaiting.inlay_tooltip.is_none() && ed.awaiting.inlay_insert.is_none(), "no inlay slot");
+        assert!(ed.awaiting.definition.is_none(), "no jump");
+    }
+
+    /// Turning hints off clears the hints, the slots, the card and the wait.
+    #[test]
+    fn disabling_hints_clears_the_store_the_slots_the_card_and_the_wait() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        show_card(&mut ed);
+        act(&mut ed, Action::InlayInsert { key: inlay::Key::new(1), offset: 5 });
+        act(&mut ed, Action::InlayHover { key: inlay::Key::new(1), part: 0 });
+        ed.wait_inlays(INLAY_EDIT_DELAY, None);
+        let _ = fetch(&mut ed);
+        ed.wait_inlays(INLAY_EDIT_DELAY, None);
+        ed.set_inlay_hints(false);
+        assert_eq!(hint_count(&ed), 0, "no hints");
+        assert!(ed.inlay_card.is_none(), "no card");
+        assert!(ed.awaiting.inlays.is_none(), "no fetch awaited");
+        assert!(ed.awaiting.inlay_tooltip.is_none() && ed.awaiting.inlay_insert.is_none(), "no gesture awaited");
+        assert!(ed.inlays.wait.is_none(), "no wait");
+        assert!(ed.take_inlay_interaction().is_none(), "no gesture to pull");
+    }
+
+    /// Leaving the hint retires its tooltip query.
+    #[test]
+    fn hover_dismiss_retires_the_inlay_tooltip() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        act(&mut ed, Action::InlayHover { key: inlay::Key::new(1), part: 1 });
+        let t = gesture_ticket(&mut ed);
+        act(&mut ed, Action::HoverDismiss);
+        ed.set_inlay_tooltip(t, Some("**i32**".into()));
+        assert!(ed.inlay_card.is_none(), "the late answer shows nothing");
+    }
+
+    /// Scrolling retires a tooltip query and closes a shown card.
+    #[test]
+    fn scrolling_retires_the_inlay_tooltip() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        act(&mut ed, Action::InlayHover { key: inlay::Key::new(1), part: 1 });
+        let t = gesture_ticket(&mut ed);
+        act(&mut ed, Action::ViewportChanged(0..2));
+        ed.set_inlay_tooltip(t, Some("**i32**".into()));
+        assert!(ed.inlay_card.is_none(), "the late answer shows nothing");
+        show_card(&mut ed);
+        act(&mut ed, Action::ViewportChanged(0..3));
+        assert!(ed.inlay_card.is_none(), "scrolling closes the card");
+    }
+
+    /// An edit retires the tooltip query and the insert, and closes the card.
+    #[test]
+    fn an_edit_retires_the_inlay_tooltip_and_insert() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        let key = inlay::Key::new(1);
+        show_card(&mut ed);
+        act(&mut ed, Action::InlayInsert { key, offset: 5 });
+        let insert = gesture_ticket(&mut ed);
+        act(&mut ed, Action::InlayHover { key, part: 0 });
+        act(&mut ed, Action::Type('a'));
+        assert!(ed.awaiting.inlay_tooltip.is_none(), "the tooltip query is retired");
+        assert!(ed.awaiting.inlay_insert.is_none(), "the insert is retired");
+        assert!(!ed.accepts(Awaited::InlayInsert, insert), "its answer can't land");
+
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        show_card(&mut ed);
+        act(&mut ed, Action::Type('a'));
+        assert!(ed.inlay_card.is_none(), "the edit closes the card");
+    }
+
+    /// Loading a new buffer drops the old hints and asks at once.
+    #[test]
+    fn load_clears_the_hints_and_waits_zero() {
+        let mut ed = with_hints(LET_X, vec![type_hint(1)]);
+        ed.load("new\n", None);
+        assert_eq!(hint_count(&ed), 0, "the old hints are gone");
+        assert_eq!(ed.inlays.wait.map(|w| w.delay), Some(Duration::ZERO), "the new text is fetched at once");
+    }
+
+    /// `pending_wake` is the wait `view` hands the widget, and waking it
+    /// records the fetch.
+    #[test]
+    fn pending_wake_is_the_wait_the_widget_is_handed() {
+        assert_eq!(CodeEditor::new("a\n").pending_wake(), None, "off: no wait");
+        let mut ed = CodeEditor::new("a\n").inlay_hints(true);
+        let wake = ed.pending_wake().expect("on: a wait");
+        assert_eq!((wake.delay, wake.cap), (Duration::ZERO, None), "at once");
+        assert_eq!(Some(wake), ed.inlays.wait, "the scheduler's own wait");
+        act(&mut ed, Action::Wake(wake.generation));
+        assert!(ed.take_inlay_request().is_some(), "the wake records a request");
+        assert_eq!(ed.pending_wake(), None, "and settles the wait");
+    }
+
+    /// With a block fold on screen, the pads count display rows: the window
+    /// reaches past the fold by the visible height, not by its buffer rows.
+    #[test]
+    fn a_folded_viewport_pads_its_window_in_display_rows() {
+        let mut lines = vec!["x"; 1001];
+        lines[10] = "{";
+        lines[500] = "}";
+        let src = lines.join("\n");
+        let mut ed = CodeEditor::new(src.as_str()).inlay_hints(true);
+        let opener = src.find('{').expect("the block opens") as u32;
+        act(&mut ed, Action::ToggleFold { opener });
+        act(&mut ed, Action::ViewportChanged(0..520));
+        let span = fetch(&mut ed).span();
+        let row_start = |row: u32| ed.document().buffer().point_to_offset(Point::new(row, 0));
+        assert_eq!(span, 0..row_start(580), "display rows 0..90 are buffer rows 0..580, the fold included");
+        assert_eq!(ed.inlays.window, Some(0..550), "the inner window ends at display row 60");
     }
 }
