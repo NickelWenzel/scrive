@@ -141,7 +141,9 @@ impl App {
                     return Task::none();
                 };
                 let task = tab.editor.update(event, now).map(Message::Editor.with(id));
-                let outgoing = tab.editor.sync_lsp(client);
+                let synced = tab.editor.sync_lsp(client);
+                let mut outgoing = synced.messages;
+                outgoing.extend(follow(tabs, active, client, transport, synced.jump));
                 Task::batch([task, transport.send(outgoing)])
             }
             Message::Lsp(message) => {
@@ -168,34 +170,7 @@ impl App {
                             if let Some(refusal) = applied.refused {
                                 transport.note(format!("refused: {refusal}"));
                             }
-                            match applied.jump {
-                                Some(lsp::update::Jump::Open(open)) => {
-                                    let Some(target) = tabs.iter_mut().find(|tab| {
-                                        tab.editor.document().doc_id() == open.doc_id()
-                                    }) else {
-                                        continue;
-                                    };
-                                    match target.editor.jump(client, open) {
-                                        Ok(messages) => {
-                                            outgoing.extend(messages);
-                                            *active = target.id;
-                                        }
-                                        Err(refusal) => {
-                                            transport.note(format!("jump refused: {refusal}"))
-                                        }
-                                    }
-                                }
-                                // A host with files would read this one, open a tab, `open_lsp`
-                                // it, then `select(unopened.span(&text))`. Every demo file is
-                                // open, and wasm has no disk.
-                                Some(lsp::update::Jump::Unopened(unopened)) => {
-                                    transport.note(format!(
-                                        "definition in unopened {}",
-                                        unopened.uri().as_str()
-                                    ));
-                                }
-                                None => {}
-                            }
+                            outgoing.extend(follow(tabs, active, client, transport, applied.jump));
                         }
                         // A host with files writes `edits.apply(&disk_text)` back to disk.
                         lsp::Update::FileEdits(edits) => {
@@ -292,6 +267,44 @@ impl Transport {
         }
         self.traffic.push_back(line);
     }
+}
+
+/// Route `jump` to the tab whose document holds it, and so on for any jump that tab's sync
+/// returns. Returns the messages to send. A host with files would read an unopened one, open a
+/// tab, `open_lsp` it, then `select(unopened.span(&text))`; every demo file is open, and wasm
+/// has no disk, so it is only noted.
+fn follow(
+    tabs: &mut [Tab],
+    active: &mut tab::Id,
+    client: &mut lsp::Client,
+    transport: &mut Transport,
+    mut jump: Option<lsp::update::Jump>,
+) -> Vec<lsp::Message> {
+    let mut outgoing = Vec::new();
+    while let Some(next) = jump.take() {
+        match next {
+            lsp::update::Jump::Open(open) => {
+                let Some(target) = tabs
+                    .iter_mut()
+                    .find(|tab| tab.editor.document().doc_id() == open.doc_id())
+                else {
+                    break;
+                };
+                match target.editor.jump(client, open) {
+                    Ok(applied) => {
+                        outgoing.extend(applied.messages);
+                        jump = applied.jump;
+                        *active = target.id;
+                    }
+                    Err(refusal) => transport.note(format!("jump refused: {refusal}")),
+                }
+            }
+            lsp::update::Jump::Unopened(unopened) => {
+                transport.note(format!("definition in unopened {}", unopened.uri().as_str()));
+            }
+        }
+    }
+    outgoing
 }
 
 fn tab_button(tab: &Tab, active: tab::Id) -> Element<'_, Message> {

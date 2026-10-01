@@ -478,7 +478,11 @@ fn main() {
             match message {
                 Message::Editor(event) => {
                     let task = editor.update(event, now).map(Message::Editor);
-                    link.send(editor.sync_lsp(client));
+                    let synced = editor.sync_lsp(client);
+                    link.send(synced.messages);
+                    if let Some(line) = jumped(synced.jump) {
+                        *status = line;
+                    }
                     task
                 }
                 Message::Save => {
@@ -486,7 +490,11 @@ fn main() {
                     // The buffer holds LF; a CRLF file is written back as CRLF.
                     match std::fs::write(&*file, doc.serialize(doc.buffer().eol_flavor())) {
                         Ok(()) => {
-                            link.send(editor.save_lsp(client));
+                            let saved = editor.save_lsp(client);
+                            link.send(saved.messages);
+                            if let Some(line) = jumped(saved.jump) {
+                                *status = line;
+                            }
                             let name = file.file_name().unwrap_or(file.as_os_str()).display();
                             *status = match link {
                                 Link::Connected(_) => {
@@ -526,19 +534,8 @@ fn main() {
                                 if let Some(refusal) = applied.refused {
                                     *status = format!("refused: {refusal}");
                                 }
-                                match applied.jump {
-                                    // A host with several editors hands this to the one that
-                                    // owns `open.doc_id()`; here every open document is local.
-                                    Some(lsp::update::Jump::Open(_)) => {
-                                        *status = "definition in another open document".to_owned();
-                                    }
-                                    Some(lsp::update::Jump::Unopened(unopened)) => {
-                                        *status = format!(
-                                            "definition in {}, which is not open",
-                                            unopened.uri()
-                                        );
-                                    }
-                                    None => {}
+                                if let Some(line) = jumped(applied.jump) {
+                                    *status = line;
                                 }
                             }
                             lsp::Update::FileEdits(edits) => {
@@ -651,6 +648,17 @@ fn main() {
                 Some(Message::Save)
             }
             _ => None,
+        }
+    }
+
+    /// The status line a jump earns. A host with several editors hands `Jump::Open` to the one
+    /// that owns `open.doc_id()`; here every open document is local.
+    fn jumped(jump: Option<lsp::update::Jump>) -> Option<String> {
+        match jump? {
+            lsp::update::Jump::Open(_) => Some("definition in another open document".to_owned()),
+            lsp::update::Jump::Unopened(unopened) => {
+                Some(format!("definition in {}, which is not open", unopened.uri()))
+            }
         }
     }
 
@@ -920,13 +928,13 @@ fn main() {
             let fixed = lsp::update::Stamp::Revision(doc.revision());
             let saved = editor.save_lsp(&mut client);
             assert!(
-                saved.iter().any(|message| {
+                saved.messages.iter().any(|message| {
                     matches!(message, lsp::Message::Notification(n) if n.method == "textDocument/didSave")
                 }),
                 "rust-analyzer asks for saves, so the didSave goes out",
             );
             eprintln!("{:?}: saved", started.elapsed());
-            sender.send(saved);
+            sender.send(saved.messages);
 
             let deadline = Instant::now() + Duration::from_secs(120);
             let mut cleared = false;
