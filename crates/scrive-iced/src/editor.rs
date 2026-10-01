@@ -1203,6 +1203,19 @@ fn range_covered_by(sels: &[scrive_core::Selection], start: u32, end: u32) -> bo
     i > 0 && sels[i - 1].end() >= end
 }
 
+/// The edge a selection's caret renders on: an empty selection at the caret
+/// edge, a non-empty one at its wash edge, so it never floats past a boundary
+/// hint the wash excludes.
+fn caret_edge(sel: &scrive_core::Selection) -> Edge {
+    if sel.is_empty() {
+        Edge::Caret
+    } else if sel.head() == sel.end() {
+        Edge::End
+    } else {
+        Edge::Start
+    }
+}
+
 impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Message> {
     fn tag(&self) -> widget::tree::Tag {
         widget::tree::Tag::of::<State>()
@@ -1699,11 +1712,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         let match_box = Color { a: 0.45, ..text_color };
         if let Some((a, b)) = self.doc.brackets().active_pair(self.doc.selections().newest().head()) {
             for off in [a, b] {
-                // Route through `offset_xy` so a matched bracket on a collapsed
+                // Through the one projection, so a matched bracket on a collapsed
                 // fold's closing tail (the `}` inline on the header line) gets boxed
                 // too, not just the visible opening bracket.
-                let Some((x, y)) = offset_xy(off, Edge::Start) else { continue };
-                fill_border(renderer, Rectangle { x, y, width: advance, height: line_h }, match_box, 1.0);
+                let Some(rect) = self.bracket_box(&rows, &geo, off) else { continue };
+                if !window.contains(&fold_map.display_row_at(geo.rows_from_top(rect.y + 1.0)).index()) {
+                    continue;
+                }
+                fill_border(renderer, rect, match_box, 1.0);
             }
         }
 
@@ -1737,21 +1753,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 if row < sp_row || row > ep_row {
                     continue;
                 }
-                let row_start = if row == sp_row { start } else { buffer.point_to_offset(BufPoint { row, col: 0 }) };
-                let row_end = if row == ep_row { end } else { buffer.point_to_offset(BufPoint { row, col: buffer.line_len(row) }) };
-                // A boundary row a multi-line span doesn't actually cover (its
-                // end landing at column 0, or an empty interior line) has zero
-                // width here — skip it so the min-one-cell rule below doesn't
-                // manufacture a phantom squiggle. A genuinely zero-width
-                // diagnostic (a point) still gets its one cell.
-                if row_start == row_end && start != end {
-                    continue;
-                }
-                // Fold-aware endpoints: a diagnostic spanning a collapsed
-                // inline fold underlines the shifted glyphs, not the raw columns.
-                let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
-                let x0 = self.offset_screen_x(&rows, &geo, row_start, from);
-                let x1 = self.offset_screen_x(&rows, &geo, row_end, if row == ep_row { to } else { Edge::Start }).max(x0 + advance);
+                let Some((x0, x1)) = self.squiggle_extent(&rows, &geo, row, start, end, sp_row, ep_row) else { continue };
                 let baseline = row_y + line_h - SQUIGGLE_AMPLITUDE - 0.5;
                 squiggle_spans(x0, x1, baseline, |rect| fill(renderer, rect, color));
             }
@@ -1838,14 +1840,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             // the per-frame cost of a document-scale multi-cursor set to O(visible).
             let sels = self.doc.selections().all();
             for sel in &sels[visible_selection_span(sels, vis_start, vis_end)] {
-                let edge = if sel.is_empty() {
-                    Edge::Caret
-                } else if sel.head() == sel.end() {
-                    Edge::End
-                } else {
-                    Edge::Start
-                };
-                if let Some((x, y)) = offset_xy(sel.head(), edge) {
+                if let Some((x, y)) = offset_xy(sel.head(), caret_edge(sel)) {
                     let r = Rectangle { x: x - CARET_WIDTH / 2.0, y: y + 1.0, width: CARET_WIDTH, height: line_h - 2.0 };
                     fill(renderer, r, text_color);
                 }
@@ -2986,12 +2981,23 @@ impl<Message> Editor<'_, Message> {
             self.draw_fold_tail_wash(renderer, rows, geo, row, a, b, color);
             return;
         }
-        let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
-        let buffer = self.doc.buffer();
+        let (bounds, line_h) = (geo.bounds(), geo.line_h());
         let y = geo.row_y(fold_map.to_display_row(BufferRow(row)));
         if y + line_h < bounds.y || y > bounds.y + bounds.height {
             return;
         }
+        let (x0, x1) = self.wash_extent(rows, geo, row, a, b, start, end);
+        fill(renderer, Rectangle { x: x0, y, width: (x1 - x0).max(1.0), height: line_h }, color);
+    }
+
+    /// The `(x0, x1)` screen span a range `start..end` (points `a..b`) washes on
+    /// visible, unfolded buffer `row`: `Start` at its start, `End` at its end,
+    /// `Caret` for both ends of an empty range; an interior row runs to `Start`
+    /// of its line end plus half a cell, or across a collapsed header's
+    /// placeholder.
+    #[allow(clippy::too_many_arguments)] // the wash's row, both points and both offsets are all read
+    fn wash_extent(&self, rows: &Rows<'_>, geo: &Geo, row: u32, a: BufPoint, b: BufPoint, start: u32, end: u32) -> (f32, f32) {
+        let buffer = self.doc.buffer();
         let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
         let x0 = if row == a.row { self.offset_screen_x(rows, geo, start, from) } else { geo.cell_x(0.0) };
         let x1 = if row == b.row {
@@ -3004,9 +3010,38 @@ impl<Message> Editor<'_, Message> {
             geo.cell_x(hl.tail_cell() as f32)
         } else {
             let line_end = buffer.point_to_offset(scrive_core::Point::new(row, buffer.line_len(row)));
-            self.offset_screen_x(rows, geo, line_end, Edge::Start) + advance * 0.5
+            self.offset_screen_x(rows, geo, line_end, Edge::Start) + geo.advance() * 0.5
         };
-        fill(renderer, Rectangle { x: x0, y, width: (x1 - x0).max(1.0), height: line_h }, color);
+        (x0, x1)
+    }
+
+    /// The `(x0, x1)` screen span diagnostic `start..end` (rows
+    /// `sp_row..=ep_row`) underlines on visible buffer `row`, at least one cell
+    /// wide; `None` on a boundary row the range doesn't actually cover.
+    #[allow(clippy::too_many_arguments)] // the row plus the span's offsets and rows
+    fn squiggle_extent(&self, rows: &Rows<'_>, geo: &Geo, row: u32, start: u32, end: u32, sp_row: u32, ep_row: u32) -> Option<(f32, f32)> {
+        let buffer = self.doc.buffer();
+        let row_start = if row == sp_row { start } else { buffer.point_to_offset(BufPoint { row, col: 0 }) };
+        let row_end = if row == ep_row { end } else { buffer.point_to_offset(BufPoint { row, col: buffer.line_len(row) }) };
+        // A boundary row a multi-line span doesn't actually cover (its end
+        // landing at column 0, or an empty interior line) has zero width here —
+        // skip it so the min-one-cell rule below doesn't manufacture a phantom
+        // squiggle. A genuinely zero-width diagnostic (a point) still gets its
+        // one cell.
+        if row_start == row_end && start != end {
+            return None;
+        }
+        let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
+        let x0 = self.offset_screen_x(rows, geo, row_start, from);
+        let x1 = self.offset_screen_x(rows, geo, row_end, if row == ep_row { to } else { Edge::Start }).max(x0 + geo.advance());
+        Some((x0, x1))
+    }
+
+    /// The matching-bracket outline around the bracket at `offset`, in screen
+    /// space, or `None` if the offset doesn't render.
+    fn bracket_box(&self, rows: &Rows<'_>, geo: &Geo, offset: u32) -> Option<Rectangle> {
+        let p = rows.position(offset, Edge::Start)?;
+        Some(Rectangle { x: geo.cell_x(p.x.cells()), y: geo.row_y(p.row), width: geo.advance(), height: geo.line_h() })
     }
 
     /// Wash the selected part of a collapsed fold's closing (tail) row, which
