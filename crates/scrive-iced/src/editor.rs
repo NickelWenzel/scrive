@@ -3032,6 +3032,8 @@ impl<Message> Editor<'_, Message> {
             geo.cell_x(hl.tail_cell() as f32)
         } else {
             let line_end = buffer.point_to_offset(scrive_core::Point::new(row, buffer.line_len(row)));
+            // An interior row's end is after its end-of-line hints: they are
+            // inside the range.
             self.offset_screen_x(rows, geo, line_end, Edge::Start) + geo.advance() * 0.5
         };
         (x0, x1)
@@ -3043,19 +3045,30 @@ impl<Message> Editor<'_, Message> {
     #[allow(clippy::too_many_arguments)] // the row plus the span's offsets and rows
     fn squiggle_extent(&self, rows: &Rows<'_>, geo: &Geo, row: u32, start: u32, end: u32, sp_row: u32, ep_row: u32) -> Option<(f32, f32)> {
         let buffer = self.doc.buffer();
-        let row_start = if row == sp_row { start } else { buffer.point_to_offset(BufPoint { row, col: 0 }) };
-        let row_end = if row == ep_row { end } else { buffer.point_to_offset(BufPoint { row, col: buffer.line_len(row) }) };
+        let empty = start == end;
+        let (row_start, start_edge) = if row == sp_row {
+            (start, if empty { Edge::Caret } else { Edge::Start })
+        } else {
+            // A hint at column 0 of a continuation row is inside the range.
+            (buffer.point_to_offset(BufPoint { row, col: 0 }), Edge::End)
+        };
+        let (row_end, end_edge) = if row == ep_row {
+            (end, if empty { Edge::Caret } else { Edge::End })
+        } else {
+            // An interior row's end is after its end-of-line hints: they are
+            // inside the range.
+            (buffer.point_to_offset(BufPoint { row, col: buffer.line_len(row) }), Edge::Start)
+        };
         // A boundary row a multi-line span doesn't actually cover (its end
         // landing at column 0, or an empty interior line) has zero width here —
         // skip it so the min-one-cell rule below doesn't manufacture a phantom
         // squiggle. A genuinely zero-width diagnostic (a point) still gets its
         // one cell.
-        if row_start == row_end && start != end {
+        if row_start == row_end && !empty {
             return None;
         }
-        let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
-        let x0 = self.offset_screen_x(rows, geo, row_start, from);
-        let x1 = self.offset_screen_x(rows, geo, row_end, if row == ep_row { to } else { Edge::Start }).max(x0 + geo.advance());
+        let x0 = self.offset_screen_x(rows, geo, row_start, start_edge);
+        let x1 = self.offset_screen_x(rows, geo, row_end, end_edge).max(x0 + geo.advance());
         Some((x0, x1))
     }
 
@@ -4580,6 +4593,140 @@ mod tests {
         assert_eq!(pills(&doc), vec![true, true, true], "boundary hints keep their pills");
         select(&mut doc, 1, 4);
         assert_eq!(pills(&doc), vec![false, false, true], "T and P are washed; E is outside");
+    }
+
+    /// An empty caret sits on the caret edge (before a Suffix hint, after a
+    /// Prefix one); a non-empty selection's caret sits on its wash edge instead.
+    #[test]
+    fn caret_x_sits_on_the_edge_its_selection_names() {
+        let mut doc = fixture();
+        let geo = test_geo();
+        let mut caret_x = |anchor: u32, head: u32| {
+            select(&mut doc, anchor, head);
+            let ed = Editor::new(&doc, |_: Action| ());
+            let rows = doc.rows();
+            let sel = *doc.selections().newest();
+            ed.offset_screen_x(&rows, &geo, sel.head(), caret_edge(&sel))
+        };
+        assert_eq!(caret_x(2, 2), 76.0, "before the Suffix hint T: typed text lands before it");
+        assert_eq!(caret_x(3, 3), 166.0, "after the Prefix hint P: typed text lands after it");
+        assert_eq!(caret_x(5, 5), 186.0, "before the end-of-line Suffix hint E");
+        assert_eq!(caret_x(0, 3), 136.0, "forward selection ends at End, before P");
+        assert_eq!(caret_x(5, 2), 126.0, "reversed selection's head is at Start, after T");
+    }
+
+    /// A one-row wash runs from Start to End: hints at its ends stay outside,
+    /// hints strictly inside are covered; an empty range sits at the caret edge.
+    #[test]
+    fn washes_exclude_boundary_hints_and_cover_interior_ones() {
+        let doc = fixture();
+        let ed = Editor::new(&doc, |_: Action| ());
+        let rows = doc.rows();
+        let geo = test_geo();
+        let p = |off: u32| doc.buffer().offset_to_point(off);
+        let wash = |start: u32, end: u32| ed.wash_extent(&rows, &geo, 0, p(start), p(end), start, end);
+        assert_eq!(wash(2, 3), (126.0, 136.0), "just the space: T and P are boundary hints");
+        assert_eq!(wash(1, 4), (66.0, 176.0), "T and P are inside and washed");
+        assert_eq!(wash(3, 3), (166.0, 166.0), "an empty range sits at Caret (after P)");
+    }
+
+    /// On a multi-row range, the first row's wash ends after its end-of-line
+    /// hint (it is inside the range), and the next row starts at the text
+    /// origin.
+    #[test]
+    fn an_interior_row_wash_runs_past_end_of_line_hints() {
+        let doc = fixture();
+        let ed = Editor::new(&doc, |_: Action| ());
+        let rows = doc.rows();
+        let geo = test_geo();
+        let (a, b) = (doc.buffer().offset_to_point(4), doc.buffer().offset_to_point(7));
+        assert_eq!(ed.wash_extent(&rows, &geo, 0, a, b, 4, 7), (176.0, 221.0), "to Start of EOL (16) + half a cell");
+        assert_eq!(ed.wash_extent(&rows, &geo, 1, a, b, 4, 7), (56.0, 66.0), "row 1 from the origin to the end at `f`");
+    }
+
+    /// Squiggles share the wash's edges; a zero-width diagnostic is one cell
+    /// wide from the caret edge, so it marks the side typing would land on.
+    #[test]
+    fn squiggles_span_start_to_end_and_an_empty_one_sits_at_the_caret_edge() {
+        let doc = fixture();
+        let ed = Editor::new(&doc, |_: Action| ());
+        let rows = doc.rows();
+        let geo = test_geo();
+        let on_row_0 = |start: u32, end: u32| ed.squiggle_extent(&rows, &geo, 0, start, end, 0, 0);
+        assert_eq!(on_row_0(2, 3), Some((126.0, 136.0)), "Start of 2 to End of 3");
+        assert_eq!(on_row_0(2, 2), Some((76.0, 86.0)), "empty at T's offset: before T, one cell");
+        assert_eq!(on_row_0(3, 3), Some((166.0, 176.0)), "empty at P's offset: after P, one cell");
+        assert_eq!(on_row_0(5, 5), Some((186.0, 196.0)), "empty at the line end: before E");
+        // A diagnostic over `d` … `e` (4..7): the first row runs past E, the
+        // second starts at column 0.
+        assert_eq!(ed.squiggle_extent(&rows, &geo, 0, 4, 7, 0, 1), Some((176.0, 216.0)), "row 0 runs to Start of EOL");
+        assert_eq!(ed.squiggle_extent(&rows, &geo, 1, 4, 7, 0, 1), Some((56.0, 66.0)), "row 1 starts at column 0");
+        assert_eq!(ed.squiggle_extent(&rows, &geo, 0, 5, 7, 0, 1), None, "one that starts at row 0's line end covers nothing there");
+    }
+
+    /// A continuation row of a multi-row squiggle starts before a hint at its
+    /// column 0, which lies strictly inside the range.
+    #[test]
+    fn a_squiggle_continuation_row_underlines_a_column_0_hint() {
+        let doc = hinted("ab\ncd\n", &[(3, inlay::Kind::Parameter, "n:", inlay::Padding::default())]);
+        let ed = Editor::new(&doc, |_: Action| ());
+        let rows = doc.rows();
+        let geo = test_geo();
+        assert_eq!(ed.squiggle_extent(&rows, &geo, 1, 1, 5, 0, 1), Some((56.0, 96.0)), "from cell 0, before the hint, to the end of `cd`");
+    }
+
+    /// The matching-bracket box sits on the bracket glyph, after a Suffix hint
+    /// that shares the bracket's offset, and its partner shifts with the row.
+    #[test]
+    fn the_bracket_box_sits_after_a_hint_at_the_bracket() {
+        let mut doc = hinted("ab(c)\n", &[(2, inlay::Kind::Type, ": i32", inlay::Padding::default())]);
+        select(&mut doc, 3, 3);
+        assert_eq!(doc.brackets().active_pair(3).map(|(x, y)| (x.min(y), x.max(y))), Some((2, 4)), "the caret is next to `(`");
+        let ed = Editor::new(&doc, |_: Action| ());
+        let rows = doc.rows();
+        let geo = test_geo();
+        let x = |off: u32| ed.bracket_box(&rows, &geo, off).expect("visible").x;
+        assert_eq!(x(2), 126.0, "`(` at Start: cell 2 + 5");
+        assert_eq!(x(4), 146.0, "`)` at cell 4 + 5");
+    }
+
+    /// An end-of-line hint widens the row, so horizontal scroll reaches it.
+    #[test]
+    fn max_scroll_reaches_an_end_of_line_hint() {
+        let line = "x".repeat(100);
+        let plain = Document::new(&format!("{line}\n")).expect("doc fits");
+        let doc = hinted(&format!("{line}\n"), &[(100, inlay::Kind::Type, ": usize", inlay::Padding::default())]);
+        let vp = Rectangle { x: 0.0, y: 0.0, width: 300.0, height: 200.0 };
+        let without = Editor::new(&plain, |_: Action| ());
+        let with = Editor::new(&doc, |_: Action| ());
+        let (rows, plain_rows) = (doc.rows(), plain.rows());
+        assert_eq!(with.max_line_px(&rows, 10.0, 20.0, vp, 0.0), 107.0 * 10.0, "100 cells of text + 7 of hint");
+        assert_eq!(
+            with.max_scroll_x(&rows, vp, 10.0, 20.0, 0.0) - without.max_scroll_x(&plain_rows, vp, 10.0, 20.0, 0.0),
+            70.0,
+            "the scroll range grows by exactly the hint",
+        );
+    }
+
+    /// A click anywhere on a hint, label or padding, places the caret at the
+    /// hint's offset; the caret then renders on that offset's caret edge.
+    #[test]
+    fn a_click_on_a_hint_places_the_caret_at_its_offset() {
+        let doc = fixture();
+        let mut r = headless_renderer();
+        // The geometry `pump`'s widget uses: real metrics, a 500x320 viewport at
+        // the origin, unscrolled.
+        let ed = Editor::new(&doc, |a: Action| a);
+        let mut state = State::default();
+        ed.ensure_metrics(&mut state);
+        let geo = ed.geo(&state, Rectangle { x: 0.0, y: 0.0, width: 500.0, height: 320.0 });
+        let y = geo.line_h() / 2.0;
+        for (cell, offset, what) in [(4.3, 2, "T's label"), (8.3, 3, "P's label"), (10.3, 3, "P's padding"), (14.3, 5, "E at the line end")] {
+            let at = Point::new(geo.cell_x(cell), y);
+            let press = [iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))];
+            let (actions, _) = pump(&doc, None, iced_runtime::user_interface::Cache::new(), &mut r, at, &press);
+            assert!(actions.contains(&Action::PlaceCaret(offset)), "a click on {what} lands at {offset}: {actions:?}");
+        }
     }
 
     #[test]
