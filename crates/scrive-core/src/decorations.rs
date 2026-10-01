@@ -30,6 +30,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::coords::Bias;
+use crate::intel::inlay;
 use crate::patch::Patch;
 use crate::sum_tree::{Dimension, Item, Summary, SumTree};
 
@@ -142,16 +143,23 @@ pub enum DecorationKind {
     },
     /// The provenance region of an auto-inserted closing pair.
     AutoClosePair,
+    /// An inlay hint, ranged over the token it annotates. Only a document's
+    /// inlay store holds this kind, and no public API hands one out. An
+    /// anchored hint goes with its token: when the token is deleted, or one
+    /// edit replaces all of it.
+    InlayHint(inlay::Anchor),
 }
 
 impl DecorationKind {
     /// Post-commit policy for a range of this kind that has collapsed to empty:
-    /// [`FindMatch`](Self::FindMatch) is re-queried so it drops; everything else
-    /// keeps (the owner controls its lifetime).
+    /// [`FindMatch`](Self::FindMatch) is re-queried so it drops, and an
+    /// [`InlayHint`](Self::InlayHint) anchored to a token goes with the token;
+    /// everything else keeps (the owner controls its lifetime).
     #[must_use]
     pub fn empty_policy(&self) -> EmptyPolicy {
         match self {
             Self::FindMatch => EmptyPolicy::Drop,
+            Self::InlayHint(anchor) => anchor.empty_policy(),
             _ => EmptyPolicy::Keep,
         }
     }
@@ -378,14 +386,19 @@ fn decoitems_to_ranges(tree: &SumTree<DecoItem>, base: u32) -> Vec<TrackedRange>
 /// Map every range's endpoints through `patch` with its stickiness bias, never
 /// inverting (a collapse pins both ends to the mapped end — [`Patch::map_range`]'s
 /// rule), and drop the ranges that collapsed to empty whose kind re-publishes
-/// ([`EmptyPolicy::Drop`], i.e. find matches). Shared by the naive and windowed
-/// movers so their per-range semantics are identical by construction.
+/// ([`EmptyPolicy::Drop`], i.e. find matches), and drop the inlay hints whose
+/// whole token one edit replaced. Shared by the naive and windowed movers so
+/// their per-range semantics are identical by construction.
 fn remap_ranges(patch: &Patch, v: &mut Vec<TrackedRange>) {
     let mut queries: Vec<(u32, Bias)> = Vec::with_capacity(v.len() * 2);
+    // Coverage is a question about the old text, so read it before the remap
+    // below overwrites the ranges.
+    let mut replaced: Vec<bool> = Vec::with_capacity(v.len());
     for r in v.iter() {
         let (bs, be) = r.stickiness.biases();
         queries.push((r.range.start, bs));
         queries.push((r.range.end, be));
+        replaced.push(rides_a_token(&r.kind) && replaces_whole(patch.edits(), &r.range));
     }
     let mut mapped: Vec<u32> = Vec::new();
     patch.map_many(&queries, &mut mapped);
@@ -393,10 +406,25 @@ fn remap_ranges(patch: &Patch, v: &mut Vec<TrackedRange>) {
         let (ms, me) = (mapped[2 * i], mapped[2 * i + 1]);
         r.range = ms.min(me)..me;
     }
+    let mut replaced = replaced.into_iter();
     v.retain(|r| {
+        let replaced = replaced.next().expect("one flag per range");
         let collapsed = r.range.start == r.range.end;
-        !(collapsed && matches!(r.kind.empty_policy(), EmptyPolicy::Drop))
+        !(replaced || (collapsed && matches!(r.kind.empty_policy(), EmptyPolicy::Drop)))
     });
+}
+
+/// Whether `kind` is an inlay hint anchored to a token.
+fn rides_a_token(kind: &DecorationKind) -> bool {
+    matches!(kind, DecorationKind::InlayHint(anchor) if anchor.is_anchored())
+}
+
+/// Whether one of `edits` (ascending, disjoint) replaces all of `range` with
+/// new text. Only the first edit whose old end reaches `range.end` can cover
+/// it: every later edit starts at or after that end.
+fn replaces_whole(edits: &[crate::patch::Edit], range: &Range<u32>) -> bool {
+    let k = edits.partition_point(|e| e.old.end < range.end);
+    edits.get(k).is_some_and(|e| e.old.start <= range.start && e.new.start < e.new.end)
 }
 
 /// Re-anchor a split-off `zone_c` (decorations entirely after the edit) onto a
@@ -480,6 +508,10 @@ impl DecorationStore {
         kind: DecorationKind,
         stickiness: Stickiness,
     ) -> DecorationId {
+        debug_assert!(
+            !matches!(kind, DecorationKind::InlayHint(_)),
+            "inlay hints enter a store only through `replace_all`",
+        );
         let id = self.mint();
         let mut v = self.to_vec();
         v.push(TrackedRange { id, range, kind, stickiness });
@@ -579,6 +611,25 @@ impl DecorationStore {
         out.into_iter()
     }
 
+    /// Every range touching `range`, borrowed, in ascending `(start, id)` order:
+    /// the allocation-free sibling of [`Self::decorations_in`] for per-row
+    /// render queries.
+    pub(crate) fn visit_in<'s>(&'s self, range: Range<u32>, mut f: impl FnMut(Range<u32>, &'s DecorationKind)) {
+        let (qs, qe) = (range.start, range.end);
+        self.tree.filter_visit::<StartDim, _, _>(
+            &|before: &StartDim, sum: &DecoSummary| before.0 <= qe && before.0 + sum.max_end >= qs,
+            &mut |it: &'s DecoItem, before: &StartDim| {
+                let start = before.0 + it.gap;
+                let end = start + it.len;
+                if start <= qe && end >= qs {
+                    crate::perf::charge(1);
+                    count_visit();
+                    f(start..end, &it.kind);
+                }
+            },
+        );
+    }
+
     /// How many [`DecorationKind::FindMatch`] ranges the store holds — an O(1)
     /// read of the root summary, not a whole-store walk.
     #[must_use]
@@ -631,6 +682,10 @@ impl DecorationStore {
         kind: DecorationKind,
         stickiness: Stickiness,
     ) -> Vec<DecorationId> {
+        debug_assert!(
+            !matches!(kind, DecorationKind::InlayHint(_)),
+            "inlay hints enter a store only through `replace_all`",
+        );
         if spans.is_empty() {
             return Vec::new();
         }
@@ -749,6 +804,10 @@ impl DecorationStore {
         kind: DecorationKind,
         stickiness: Stickiness,
     ) -> Vec<DecorationId> {
+        debug_assert!(
+            !matches!(kind, DecorationKind::InlayHint(_)),
+            "inlay hints enter a store only through `replace_all`",
+        );
         let mut v = self.to_vec();
         let mut ids = Vec::new();
         for range in spans {
@@ -885,6 +944,8 @@ impl DecorationStore {
     /// interior, which makes it *touch* the edit — so it is in the middle. The store
     /// never holds a collapsed Drop-kind range (it is never added empty and is
     /// dropped on the edit that collapses it), so left/zone_c need no retain pass.
+    /// The same holds for an inlay hint whose whole token the edit replaces:
+    /// covering the token means touching the edit.
     fn apply_single_edit(&mut self, patch: &Patch, edit: &crate::patch::Edit) {
         let (os, oe) = (edit.old.start, edit.old.end);
         let delta = (i64::from(edit.new.end) - i64::from(edit.new.start))
@@ -964,6 +1025,21 @@ impl DecorationStore {
         DiagnosticsOutcome::Applied { count }
     }
 
+    /// Replace every range with `items`, minting ids in item order so that, at
+    /// one start, the items keep that order. One sort for the whole set.
+    pub(crate) fn replace_all(&mut self, items: impl IntoIterator<Item = (Range<u32>, DecorationKind, Stickiness)>) {
+        let v: Vec<TrackedRange> = items
+            .into_iter()
+            .map(|(range, kind, stickiness)| TrackedRange { id: self.mint(), range, kind, stickiness })
+            .collect();
+        self.set_sorted(v);
+    }
+
+    /// Remove every range. Ids already minted are never reused.
+    pub(crate) fn clear(&mut self) {
+        self.tree = SumTree::new();
+    }
+
     /// Mint the next id and bump the monotonic counter.
     fn mint(&mut self) -> DecorationId {
         let id = DecorationId(self.next_id);
@@ -1001,6 +1077,7 @@ impl DecorationStore {
 mod tests {
     use super::*;
     use crate::coords::Bias::{Left, Right};
+    use crate::intel::inlay;
     use crate::patch::Edit;
 
     fn store() -> DecorationStore {
@@ -1800,5 +1877,128 @@ mod tests {
             "splice_sorted_batch allocates superlinearly ({small} -> {big} nodes): it rebuilt \
              the whole store instead of splicing the window band"
         );
+    }
+
+    // ─── Inlay hints ────────────────────────────────────────────────────────
+
+    fn hint() -> Arc<inlay::Hint> {
+        let label = vec![inlay::Part::new("h", inlay::Link::None)];
+        Arc::new(inlay::Hint::new(inlay::Kind::Other, label, inlay::Key::new(0)).expect("visible"))
+    }
+
+    fn on_token(side: inlay::Side) -> DecorationKind {
+        DecorationKind::InlayHint(inlay::Anchor::token(hint(), side, 0))
+    }
+
+    fn at_point(side: inlay::Side) -> DecorationKind {
+        DecorationKind::InlayHint(inlay::Anchor::point(hint(), side, 0))
+    }
+
+    /// One `(range, kind, stickiness)` store item.
+    fn item(range: Range<u32>, kind: DecorationKind, stickiness: Stickiness) -> (Range<u32>, DecorationKind, Stickiness) {
+        (range, kind, stickiness)
+    }
+
+    /// A hint anchored to a token goes when the token collapses; a zero-width
+    /// fallback hint keeps.
+    #[test]
+    fn anchored_inlay_hints_drop_on_collapse_and_point_hints_keep() {
+        assert_eq!(on_token(inlay::Side::Suffix).empty_policy(), EmptyPolicy::Drop, "anchored drops");
+        assert_eq!(at_point(inlay::Side::Prefix).empty_policy(), EmptyPolicy::Keep, "a point keeps");
+    }
+
+    /// One edit replacing a whole anchor drops the hint even where its
+    /// stickiness would keep it; a partial replacement keeps it; the naive
+    /// (multi-edit) mover agrees.
+    #[test]
+    fn an_edit_replacing_a_whole_anchor_drops_the_hint_on_both_movers() {
+        let prefix = || {
+            let mut s = store();
+            s.replace_all([item(4..6, on_token(inlay::Side::Prefix), Stickiness::GrowsOnlyBefore)]);
+            s
+        };
+        let survives = |patch: Patch| {
+            let mut s = prefix();
+            s.apply_patch(&patch);
+            s.len() == 1
+        };
+        assert!(!survives(Patch::single(Edit { old: 4..6, new: 4..7 })), "exact replacement drops");
+        assert!(!survives(Patch::single(Edit { old: 3..7, new: 3..5 })), "a wider replacement drops");
+        assert!(survives(Patch::single(Edit { old: 5..6, new: 5..7 })), "a partial replacement keeps");
+        assert!(survives(Patch::single(Edit { old: 6..6, new: 6..8 })), "an insert at the end keeps");
+        let mut two = Patch::new();
+        two.push(Edit { old: 0..1, new: 0..1 });
+        two.push(Edit { old: 4..6, new: 4..7 });
+        assert!(!survives(two), "the multi-edit path drops it too");
+    }
+
+    /// The windowed single-edit mover equals the naive one with anchored and
+    /// zero-width inlay hints in the store, including edits that replace whole
+    /// anchors.
+    #[test]
+    fn windowed_apply_patch_equals_naive_with_inlay_hints() {
+        let mut next = xorshift(0x1A1A_7E57);
+        let kind_of = |t: u64| -> (DecorationKind, Stickiness) {
+            match t % 7 {
+                0 => (DecorationKind::FindMatch, Stickiness::NeverGrows),
+                1 => (DecorationKind::AutoClosePair, Stickiness::AlwaysGrows),
+                2 => (diag(Severity::Error), Stickiness::GrowsOnlyAfter),
+                3 => (on_token(inlay::Side::Suffix), Stickiness::GrowsOnlyAfter),
+                4 => (on_token(inlay::Side::Prefix), Stickiness::GrowsOnlyBefore),
+                5 => (at_point(inlay::Side::Suffix), Stickiness::GrowsOnlyAfter),
+                _ => (at_point(inlay::Side::Prefix), Stickiness::NeverGrows),
+            }
+        };
+        let proj = |s: &DecorationStore| -> Vec<(u64, u32, u32)> {
+            s.iter().map(|r| (r.id.0, r.range.start, r.range.end)).collect()
+        };
+        for trial in 0..4000u32 {
+            let n = next() % 40;
+            let mut items = Vec::new();
+            for _ in 0..n {
+                let a = (next() % 120) as u32;
+                let (kind, stick) = kind_of(next());
+                let len = match kind.empty_policy() {
+                    // The store never holds a collapsed Drop range.
+                    EmptyPolicy::Drop => 1 + (next() % 24) as u32,
+                    EmptyPolicy::Keep if matches!(kind, DecorationKind::InlayHint(_)) => 0,
+                    EmptyPolicy::Keep => (next() % 25) as u32,
+                };
+                items.push(item(a..a + len, kind, stick));
+            }
+            let (mut windowed, mut naive) = (store(), store());
+            windowed.replace_all(items.clone());
+            naive.replace_all(items);
+            let os = (next() % 120) as u32;
+            let oe = os + (next() % 15) as u32;
+            let ins = (next() % 15) as u32;
+            let patch = Patch::single(Edit { old: os..oe, new: os..os + ins });
+            windowed.apply_patch(&patch);
+            naive.apply_patch_naive(&patch);
+            assert_eq!(proj(&windowed), proj(&naive), "trial {trial}: edit {os}..{oe} → +{ins}");
+        }
+    }
+
+    /// Ids follow item order, so at one start the items keep their order.
+    #[test]
+    fn replace_all_mints_ids_in_item_order() {
+        let mut s = store();
+        s.replace_all([
+            item(9..9, DecorationKind::AutoClosePair, Stickiness::NeverGrows),
+            item(2..2, DecorationKind::AutoClosePair, Stickiness::NeverGrows),
+            item(2..2, DecorationKind::SnippetStop { index: 7 }, Stickiness::NeverGrows),
+        ]);
+        let order: Vec<(u32, u64)> = s.iter().map(|r| (r.range.start, r.id.0)).collect();
+        assert_eq!(order, vec![(2, 2), (2, 3), (9, 1)], "sorted by start, ties in item order");
+        s.clear();
+        assert!(s.is_empty(), "clear empties the store");
+    }
+
+    /// Hints never enter a store through the bulk producers.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "inlay hints enter a store only through")]
+    fn add_decoration_rejects_the_inlay_hint_kind() {
+        store().add_decoration(0..1, on_token(inlay::Side::Suffix), Stickiness::GrowsOnlyAfter);
     }
 }

@@ -858,16 +858,16 @@ impl<T: Item> SumTree<T> {
     /// hook for pruning by a summary field the seek dimension can't express (an
     /// interval tree's max-end: enter iff `start < hi && start + max_end > lo`).
     /// O(log n + visited).
-    pub fn filter_visit<D: Dimension<T::Summary>, F: Fn(&D, &T::Summary) -> bool, G: FnMut(&T, &D)>(
-        &self,
+    pub fn filter_visit<'s, D: Dimension<T::Summary>, F: Fn(&D, &T::Summary) -> bool, G: FnMut(&'s T, &D)>(
+        &'s self,
         descend: &F,
         visit: &mut G,
     ) {
         self.filter_visit_from(&D::default(), descend, visit);
     }
 
-    fn filter_visit_from<D: Dimension<T::Summary>, F: Fn(&D, &T::Summary) -> bool, G: FnMut(&T, &D)>(
-        &self,
+    fn filter_visit_from<'s, D: Dimension<T::Summary>, F: Fn(&D, &T::Summary) -> bool, G: FnMut(&'s T, &D)>(
+        &'s self,
         start: &D,
         descend: &F,
         visit: &mut G,

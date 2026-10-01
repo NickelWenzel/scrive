@@ -27,6 +27,7 @@ use std::cell::{Ref, RefCell};
 use crate::fold_map::{FoldMap, FoldSet};
 use crate::highlight::{HighlightCache, HighlightEngine, HighlightSpan, SyntaxDef, TokenTheme};
 use crate::history::{GroupingHint, History};
+use crate::intel::inlay;
 use crate::movement::{self, ColumnDir, Granularity, Motion};
 use crate::selection::{Selection, SelectionId, SelectionSet};
 use crate::transaction::{apply, Committed, EditOp, TransactionError};
@@ -64,6 +65,12 @@ pub struct Document {
     /// still occupies, and emptiness is read straight off the store
     /// (`!self.autoclose.is_empty()`).
     autoclose: DecorationStore,
+    /// Inlay hints, in their own store so installing a set never re-sorts
+    /// diagnostics or find matches. Each range covers the token its hint
+    /// annotates, and rides every edit, undo and redo through the one mover.
+    inlays: DecorationStore,
+    /// The revision the inlay set was installed at; `None` when none is.
+    inlays_at: Option<Revision>,
     /// Active code folds — **view state**, never on the buffer or the undo
     /// stack. Rides the commit-path patch mover (see `rebase_views`) like a
     /// decoration, so folds survive edits and undo/redo with no fold-specific
@@ -313,6 +320,8 @@ impl Document {
             brackets,
             decorations: DecorationStore::new(),
             autoclose: DecorationStore::new(),
+            inlays: DecorationStore::new(),
+            inlays_at: None,
             folds: FoldSet::new(),
             find: FindState::new(),
             line_comment: None,
@@ -1126,6 +1135,7 @@ impl Document {
                     brackets: &mut self.brackets,
                     decorations: &mut self.decorations,
                     autoclose: &mut self.autoclose,
+                    inlays: &mut self.inlays,
                     folds: &mut self.folds,
                     find: &mut self.find,
                 },
@@ -1228,10 +1238,10 @@ impl Document {
         let mut caret_home: Option<u32> = None;
         let bracket_cfg = self.bracket_config();
         let Self {
-            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find,
-            changes, ..
+            history, buffer, selections, highlight, brackets, decorations, autoclose, inlays, folds,
+            find, changes, ..
         } = self;
-        let mut views = Views { highlight, brackets, decorations, autoclose, folds, find };
+        let mut views = Views { highlight, brackets, decorations, autoclose, inlays, folds, find };
         // Each step is its own commit (its own revision), so the log gets one
         // entry per step, each recorded against the text the step applied to.
         let mut before = changes.capture(buffer);
@@ -1272,10 +1282,10 @@ impl Document {
         let mut caret_home: Option<u32> = None;
         let bracket_cfg = self.bracket_config();
         let Self {
-            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find,
-            changes, ..
+            history, buffer, selections, highlight, brackets, decorations, autoclose, inlays, folds,
+            find, changes, ..
         } = self;
-        let mut views = Views { highlight, brackets, decorations, autoclose, folds, find };
+        let mut views = Views { highlight, brackets, decorations, autoclose, inlays, folds, find };
         let mut before = changes.capture(buffer);
         let redone = history.redo(buffer, selections, |committed, buffer| {
             // The same one mover as `undo` (folds ride it, position + fold reveal).
@@ -1985,6 +1995,91 @@ impl Document {
         })
     }
 
+    /// Install the inlay hints computed against `revision`, replacing the
+    /// previous set. When the document has moved past `revision` this returns
+    /// [`inlay::Outcome::Stale`] and changes nothing. Offsets are clipped to
+    /// the buffer. Each hint moves with the token it annotates from then on,
+    /// and goes when that token is deleted or replaced whole. The order of
+    /// `hints` is the render order among hints at one offset.
+    pub fn set_inlays(&mut self, revision: Revision, hints: Vec<inlay::Placed>) -> inlay::Outcome {
+        let current = self.buffer.revision();
+        if revision != current {
+            return inlay::Outcome::Stale { current };
+        }
+        let count = hints.len();
+        let anchored = inlay::Anchor::install(&self.buffer, hints);
+        self.inlays.replace_all(
+            anchored.into_iter().map(|(range, anchor, stickiness)| (range, DecorationKind::InlayHint(anchor), stickiness)),
+        );
+        self.inlays_at = Some(current);
+        inlay::Outcome::Applied { count }
+    }
+
+    /// Remove every inlay hint.
+    pub fn clear_inlays(&mut self) {
+        self.inlays.clear();
+        self.inlays_at = None;
+    }
+
+    /// The revision the current inlay set was installed at, or `None` when
+    /// there is none. While it differs from [`revision`](Self::revision) the
+    /// hints have moved with edits since their host computed them.
+    #[must_use]
+    pub fn inlays_revision(&self) -> Option<Revision> {
+        self.inlays_at
+    }
+
+    /// Remove the hint keyed `key` that renders at `offset`, and say whether
+    /// there was one. `offset` is exact only at the revision the caller read
+    /// it at.
+    pub fn remove_inlay(&mut self, key: inlay::Key, offset: u32) -> bool {
+        if self.inlays.is_empty() {
+            return false;
+        }
+        let row = self.buffer.offset_to_point(offset).row;
+        let row_start = self.buffer.point_to_offset(Point::new(row, 0));
+        let line = self.buffer.line(row);
+        let row_end = row_start + line.len() as u32;
+        // Keys are the host's and may repeat, so take at most one hint.
+        let mut found = false;
+        let taken = self.inlays.take_matching_in(offset..offset, |r| {
+            let hit = !found
+                && matches!(&r.kind, DecorationKind::InlayHint(anchor)
+                    if anchor.hint().key() == key
+                        && anchor.render_offset(r.range.clone(), row_start, row_end, &line) == Some(offset));
+            found |= hit;
+            hit
+        });
+        !taken.is_empty()
+    }
+
+    /// The inlay hints that render within `range` (touching counts), in render
+    /// order: by offset, and at one offset [`Prefix`](inlay::Side::Prefix)
+    /// hints before [`Suffix`](inlay::Side::Suffix) hints, each in install
+    /// order.
+    pub fn inlays_in(&self, range: Range<u32>) -> impl Iterator<Item = inlay::Shown> {
+        let mut shown = Vec::new();
+        if !self.inlays.is_empty() {
+            let len = self.buffer.len();
+            let first = self.buffer.offset_to_point(range.start.min(len)).row;
+            let last = self.buffer.offset_to_point(range.end.min(len)).row;
+            for row in first..=last {
+                let row_start = self.buffer.point_to_offset(Point::new(row, 0));
+                let line = self.buffer.line(row);
+                let row_end = row_start + line.len() as u32;
+                self.inlays.visit_in(row_start..row_end, |stored, kind| {
+                    let DecorationKind::InlayHint(anchor) = kind else { return };
+                    let Some(offset) = anchor.render_offset(stored, row_start, row_end, &line) else { return };
+                    if (range.start..=range.end).contains(&offset) {
+                        shown.push(anchor.shown(offset));
+                    }
+                });
+            }
+        }
+        shown.sort_by_key(inlay::Shown::render_order);
+        shown.into_iter()
+    }
+
     /// Set (or clear with `None`) the find query, scanning synchronously.
     /// Never scrolls and drops the active match; the app calls [`find_next`] after
     /// if it wants reveal-as-you-type. `now_ms` is the injected clock. This is the
@@ -2474,6 +2569,9 @@ struct Views<'a> {
     /// beside `decorations` so a forward edit's pairs rebase for free (and undo/redo
     /// inherit the move, though `reset_transient` empties it there first).
     autoclose: &'a mut DecorationStore,
+    /// The inlay-hint store, a separate [`DecorationStore`] moved beside
+    /// `decorations`.
+    inlays: &'a mut DecorationStore,
     folds: &'a mut FoldSet,
     find: &'a mut FindState,
 }
@@ -2560,6 +2658,7 @@ fn rebase_views(
     // is a no-op there — keeping it in the one mover means no edit path can ever
     // leave a pair stranded at a stale offset.
     views.autoclose.apply_patch(committed.patch());
+    views.inlays.apply_patch(committed.patch());
     // The find repair rides the same commit hook, AFTER the store move (it needs
     // post-patch positions) — the match set is re-verified in a window around
     // each edit, so it is always current and undo/redo inherit the repair with no
@@ -5971,4 +6070,309 @@ mod tests {
         assert_eq!(healed.len(), 1, "logging resumes after the drain");
         assert_chain(&healed, &d);
     }
+
+    // ─── Inlay hints ────────────────────────────────────────────────────────
+
+    fn hint(kind: inlay::Kind, label: &str, key: u64) -> inlay::Hint {
+        inlay::Hint::new(kind, vec![inlay::Part::new(label, inlay::Link::None)], inlay::Key::new(key)).expect("a visible label")
+    }
+
+    fn type_hint(label: &str, key: u64) -> inlay::Hint {
+        hint(inlay::Kind::Type, label, key)
+    }
+
+    fn param_hint(label: &str, key: u64) -> inlay::Hint {
+        hint(inlay::Kind::Parameter, label, key).padding(inlay::Padding { left: false, right: true })
+    }
+
+    /// Install `hints` at the current revision.
+    fn install(d: &mut Document, hints: Vec<(u32, inlay::Hint)>) {
+        let count = hints.len();
+        let placed = hints.into_iter().map(|(offset, hint)| inlay::Placed::new(offset, hint)).collect();
+        let revision = d.revision();
+        assert_eq!(d.set_inlays(revision, placed), inlay::Outcome::Applied { count }, "a current set installs");
+    }
+
+    /// The text with every shown hint spliced in at its render offset,
+    /// padding as spaces: what a reader sees, minus colour.
+    fn with_hints(d: &Document) -> String {
+        let text = d.text().into_owned();
+        let (mut out, mut at) = (String::new(), 0);
+        for shown in d.inlays_in(0..d.buffer().len()) {
+            let offset = shown.offset() as usize;
+            out.push_str(&text[at..offset]);
+            at = offset;
+            let padding = shown.hint().padded();
+            out.push_str(if padding.left { " " } else { "" });
+            shown.hint().parts().iter().for_each(|part| out.push_str(part.text()));
+            out.push_str(if padding.right { " " } else { "" });
+        }
+        out.push_str(&text[at..]);
+        out
+    }
+
+    fn caret(d: &mut Document, offset: u32) {
+        d.set_selections(SelectionSet::new(offset));
+    }
+
+    fn select(d: &mut Document, range: Range<u32>) {
+        d.set_selections(SelectionSet::from_ranges(&[(range.start, range.end)], 0));
+    }
+
+    /// Typing at a suffix hint's offset extends the token it follows, so the
+    /// text lands before the hint.
+    #[test]
+    fn typing_at_a_suffix_hint_lands_before_it() {
+        let mut d = doc("let x = 1;");
+        install(&mut d, vec![(5, type_hint(": i32", 1))]);
+        assert_eq!(with_hints(&d), "let x: i32 = 1;");
+        caret(&mut d, 5);
+        d.type_char('y');
+        assert_eq!(with_hints(&d), "let xy: i32 = 1;", "typed text lands before a suffix hint");
+    }
+
+    /// Typing at a prefix hint's offset extends the token it precedes, so the
+    /// text lands after the hint.
+    #[test]
+    fn typing_at_a_prefix_hint_lands_after_it() {
+        let mut d = doc("foo(x)");
+        install(&mut d, vec![(4, param_hint("n:", 1))]);
+        assert_eq!(with_hints(&d), "foo(n: x)");
+        caret(&mut d, 4);
+        d.type_char('y');
+        assert_eq!(with_hints(&d), "foo(n: yx)", "typed text lands after a prefix hint");
+    }
+
+    /// Enter at the end of a hinted line grows the suffix range over the
+    /// newline and the indent, but the hint stays at the end of its line.
+    #[test]
+    fn enter_at_the_end_of_a_line_keeps_its_hint_on_that_line() {
+        let mut d = doc("    foo()");
+        install(&mut d, vec![(9, type_hint(": u8", 1))]);
+        caret(&mut d, 9);
+        d.enter();
+        assert_eq!(d.text(), "    foo()\n    ");
+        assert_eq!(with_hints(&d), "    foo(): u8\n    ", "the hint stays on its line, not right of the caret");
+    }
+
+    /// Enter typed before an argument carries its prefix hint to the
+    /// argument's new line, past the indent.
+    #[test]
+    fn enter_before_an_argument_moves_its_prefix_hint_to_the_first_non_blank() {
+        let mut d = doc("    foo(a)");
+        install(&mut d, vec![(8, param_hint("n:", 1))]);
+        caret(&mut d, 8);
+        d.enter();
+        let a = d.text().find('a').expect("the argument survives") as u32;
+        let shown: Vec<u32> = d.inlays_in(0..d.buffer().len()).map(|s| s.offset()).collect();
+        assert_eq!(shown, vec![a], "the hint renders before the argument, not before the indent");
+    }
+
+    /// Backspacing the last char of an annotated word shrinks the anchor; the
+    /// hint stays, so a typo fix doesn't make the line jump.
+    #[test]
+    fn backspace_inside_the_anchor_word_keeps_the_hint() {
+        let mut d = doc("let count = 1;");
+        install(&mut d, vec![(9, type_hint(": i32", 1))]);
+        caret(&mut d, 9);
+        d.backspace();
+        assert_eq!(with_hints(&d), "let coun: i32 = 1;", "the hint follows the shortened word");
+    }
+
+    /// Deleting the whole annotated token drops its hint, and undo brings the
+    /// text back without it.
+    #[test]
+    fn deleting_the_anchor_token_drops_the_hint_and_undo_does_not_restore_it() {
+        let mut d = doc("let x = 1;");
+        install(&mut d, vec![(5, type_hint(": i32", 1))]);
+        caret(&mut d, 5);
+        d.backspace();
+        assert_eq!(with_hints(&d), "let  = 1;", "the hint went with its token");
+        assert!(d.undo());
+        assert_eq!(with_hints(&d), "let x = 1;", "undo restores the text, not the hint");
+        assert!(d.redo());
+        assert_eq!(d.inlays_in(0..d.buffer().len()).count(), 0, "redo brings nothing back either");
+        assert_ne!(d.inlays_revision(), Some(d.revision()), "the set is no longer current");
+    }
+
+    /// A hint that survives an edit rides that edit's undo and redo.
+    #[test]
+    fn a_surviving_hint_rides_undo_and_redo() {
+        let mut d = doc("let x = 1;");
+        install(&mut d, vec![(5, type_hint(": i32", 1))]);
+        caret(&mut d, 5);
+        d.type_char('y');
+        assert!(d.undo());
+        assert_eq!(with_hints(&d), "let x: i32 = 1;", "undo moves the hint back");
+        assert!(d.redo());
+        assert_eq!(with_hints(&d), "let xy: i32 = 1;", "redo moves it forward again");
+    }
+
+    /// A suffix hint at a line start and a prefix hint at a line end have no
+    /// token beside them; they keep a zero-width anchor with the same typing
+    /// rule.
+    #[test]
+    fn hints_without_a_neighbour_on_their_line_keep_a_zero_width_anchor() {
+        let mut d = doc("ab\ncd");
+        install(&mut d, vec![(3, type_hint("S", 1)), (5, param_hint("P", 2))]);
+        assert_eq!(with_hints(&d), "ab\nScdP ");
+        caret(&mut d, 3);
+        d.type_char('x');
+        assert_eq!(with_hints(&d), "ab\nxScdP ", "text typed at a suffix point lands before it");
+        caret(&mut d, 6);
+        d.type_char('y');
+        assert_eq!(with_hints(&d), "ab\nxScdP y", "text typed at a prefix point lands after it");
+    }
+
+    /// A paste over a selection replaces whole tokens; the hints anchored to
+    /// them go, on either side.
+    #[test]
+    fn pasting_over_a_selection_drops_the_hints_anchored_there() {
+        let mut d = doc("foo(count, 1)");
+        install(&mut d, vec![(4, param_hint("n:", 1)), (9, type_hint(": i32", 2)), (11, param_hint("m:", 3))]);
+        select(&mut d, 4..9);
+        d.paste("total", false);
+        assert_eq!(with_hints(&d), "foo(total, m: 1)", "both hints on the replaced word go");
+    }
+
+    /// A host edit that replaces a whole line drops the hints on it and leaves
+    /// the other lines' hints alone.
+    #[test]
+    fn a_line_replacing_edit_drops_the_hints_on_that_line() {
+        let mut d = doc("foo(x)\nbar(y)\n");
+        install(&mut d, vec![(4, param_hint("a:", 1)), (11, param_hint("b:", 2))]);
+        d.edit(vec![EditOp::new(0..6, "foo(z)")]).unwrap();
+        assert_eq!(with_hints(&d), "foo(z)\nbar(b: y)\n", "only the replaced line loses its hint");
+    }
+
+    /// Retyping a selected word drops its hint whichever side the hint is on;
+    /// stickiness alone would keep the prefix one at an arbitrary byte.
+    #[test]
+    fn retyping_a_selected_word_drops_its_hint_on_either_side() {
+        let mut d = doc("let x = f(y);");
+        install(&mut d, vec![(5, type_hint(": i32", 1)), (10, param_hint("n:", 2))]);
+        select(&mut d, 4..5);
+        d.type_char('z');
+        select(&mut d, 10..11);
+        d.type_char('w');
+        assert_eq!(with_hints(&d), "let z = f(w);", "both retyped tokens lost their hints");
+    }
+
+    /// Alt+↓ replaces both swapped lines in one edit, so their hints drop
+    /// until the next fetch; a third line keeps its hint.
+    #[test]
+    fn moving_a_line_drops_the_hints_on_both_swapped_lines() {
+        let mut d = doc("a(x)\nb(y)\nc(z)\n");
+        install(&mut d, vec![(2, param_hint("p:", 1)), (7, param_hint("q:", 2)), (12, param_hint("r:", 3))]);
+        caret(&mut d, 0);
+        d.move_line(true);
+        assert_eq!(with_hints(&d), "b(y)\na(x)\nc(r: z)\n", "the swapped lines lost their hints");
+    }
+
+    /// `Other` hints left at `Auto` annotate the text the way rust-analyzer
+    /// means them: adjustments and binding modes the expression or pattern
+    /// after them, lifetimes, discriminants, drops and closing-brace labels
+    /// what comes before. Typing at the hint's offset shows the side.
+    #[test]
+    fn auto_placement_follows_the_text_around_the_hint() {
+        let other = |label: &str, left, right| {
+            hint(inlay::Kind::Other, label, 1).padding(inlay::Padding { left, right })
+        };
+        let cases = [
+            ("let r = &s;", 8, other("&*", false, false), "let r = &*X&s;"),
+            ("fn foo() {}", 6, other("<'0>", false, false), "fn fooX<'0>() {}"),
+            ("fn foo(s: &str) {}", 11, other("'0", false, true), "fn foo(s: &'0 Xstr) {}"),
+            ("enum E { A, B }", 10, other("= 0", true, false), "enum E { AX = 0, B }"),
+            ("{ w }\n", 5, other("drop(w)", true, false), "{ w }X drop(w)\n"),
+            ("let (x, y) = p;", 4, other("&", false, false), "let &X(x, y) = p;"),
+            ("let g = ||f;", 10, other("<fn-item-to-fn-pointer>", false, false), "let g = ||<fn-item-to-fn-pointer>Xf;"),
+            ("fn foo(s: &str) {}", 18, other("// fn foo", true, false), "fn foo(s: &str) {}X // fn foo"),
+        ];
+        for (text, at, h, typed) in cases {
+            let mut d = doc(text);
+            install(&mut d, vec![(at, h)]);
+            caret(&mut d, at);
+            d.type_char('X');
+            assert_eq!(with_hints(&d), typed, "{text} at {at}");
+        }
+    }
+
+    /// Hints at one fetch offset that want both sides all become suffixes in
+    /// server order, so typed text lands before the whole group (Zed's
+    /// `test_colocated_mixed_kind_hints_share_bias`).
+    #[test]
+    fn mixed_sides_at_one_offset_render_as_suffixes_in_server_order() {
+        let text = "fn f() {} fn main() { let c: fn() -> fn() = ||f; }";
+        let at = text.find("||f").expect("the closure") as u32 + 2;
+        let mut d = doc(text);
+        install(&mut d, vec![(at, type_hint(" -> fn()", 1)), (at, hint(inlay::Kind::Other, "<fn-item-to-fn-pointer>", 2))]);
+        assert_eq!(with_hints(&d), "fn f() {} fn main() { let c: fn() -> fn() = || -> fn()<fn-item-to-fn-pointer>f; }");
+        assert!(d.inlays_in(0..d.buffer().len()).all(|s| s.side() == inlay::Side::Suffix), "both are suffixes");
+        caret(&mut d, at);
+        d.type_char('X');
+        assert_eq!(
+            with_hints(&d),
+            "fn f() {} fn main() { let c: fn() -> fn() = ||X -> fn()<fn-item-to-fn-pointer>f; }",
+            "typed text lands before the whole group",
+        );
+    }
+
+    /// Unsorted answers render in offset order; hints at one offset render in
+    /// the order the server sent them, whatever their keys.
+    #[test]
+    fn hints_render_in_offset_order_and_in_server_order_at_one_offset() {
+        let mut d = doc("let x = 1;");
+        install(&mut d, vec![(9, type_hint("C", 7)), (5, type_hint("B", 9)), (5, type_hint("A", 3))]);
+        let keys: Vec<inlay::Key> = d.inlays_in(0..d.buffer().len()).map(|s| s.key()).collect();
+        assert_eq!(keys, vec![inlay::Key::new(9), inlay::Key::new(3), inlay::Key::new(7)], "offset, then server order");
+        assert_eq!(with_hints(&d), "let xBA = 1C;");
+    }
+
+    /// A set computed for an older revision is refused and leaves the current
+    /// set in place.
+    #[test]
+    fn a_stale_hint_set_is_refused_and_changes_nothing() {
+        let mut d = doc("let x = 1;");
+        install(&mut d, vec![(5, type_hint(": i32", 1))]);
+        let installed = d.revision();
+        d.edit(vec![EditOp::insert(10, "\n")]).unwrap();
+        let stale = d.set_inlays(installed, vec![inlay::Placed::new(5, type_hint(": u8", 2))]);
+        assert_eq!(stale, inlay::Outcome::Stale { current: d.revision() }, "an old revision is refused");
+        assert_eq!(with_hints(&d), "let x: i32 = 1;\n", "the installed set is untouched");
+        assert_eq!(d.inlays_revision(), Some(installed), "the set keeps its install revision");
+    }
+
+    /// Clearing empties the set and forgets the revision it was installed at.
+    #[test]
+    fn clear_inlays_empties_the_set_and_forgets_its_revision() {
+        let mut d = doc("let x = 1;");
+        install(&mut d, vec![(5, type_hint(": i32", 1))]);
+        assert_eq!(d.inlays_revision(), Some(d.revision()), "the set is current once installed");
+        d.clear_inlays();
+        assert_eq!(d.inlays_in(0..d.buffer().len()).count(), 0, "no hints left");
+        assert_eq!(d.inlays_revision(), None, "no install revision either");
+    }
+
+    /// `remove_inlay` takes the one keyed hint at its render offset and
+    /// nothing else.
+    #[test]
+    fn remove_inlay_takes_only_the_keyed_hint_at_its_render_offset() {
+        let mut d = doc("let x = 1;");
+        install(&mut d, vec![(5, type_hint("A", 1)), (5, type_hint("B", 2))]);
+        assert!(!d.remove_inlay(inlay::Key::new(1), 4), "a wrong offset removes nothing");
+        assert!(!d.remove_inlay(inlay::Key::new(3), 5), "an unknown key removes nothing");
+        assert!(d.remove_inlay(inlay::Key::new(1), 5), "the keyed hint goes");
+        assert_eq!(with_hints(&d), "let xB = 1;", "its neighbour stays");
+        assert!(!d.remove_inlay(inlay::Key::new(1), 5), "and it is gone for good");
+    }
+
+    /// Offsets past the end or inside a char are clipped before anchoring.
+    #[test]
+    fn installed_hint_offsets_are_clipped_to_the_buffer() {
+        let mut d = doc("aé");
+        install(&mut d, vec![(99, type_hint("E", 1)), (2, type_hint("M", 2))]);
+        let offsets: Vec<u32> = d.inlays_in(0..u32::MAX).map(|s| s.offset()).collect();
+        assert_eq!(offsets, vec![1, 3], "mid-char snaps left, past-the-end clamps");
+    }
 }
+
