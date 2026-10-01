@@ -918,6 +918,11 @@ impl Client {
                 output.messages.push(self.did_open(index));
             }
         }
+        // Requests from before the handshake were declined; this re-arms every editor, which
+        // also covers servers that never send `workspace/inlayHint/refresh`.
+        if matches!(&self.state, State::Running(server) if server.inlay.is_some()) {
+            output.updates.extend(self.refreshes());
+        }
         Ok(output)
     }
 
@@ -1271,18 +1276,45 @@ impl Client {
     }
 
     fn answer(&self, request: message::Request) -> Output {
-        let response = match self.state {
+        use lsp_types::request::Request;
+        let refresh = request.method == lsp_types::request::InlayHintRefreshRequest::METHOD;
+        let (response, updates) = match self.state {
             // After `shutdown()` the client promises nothing; `null` keeps the server unblocked.
-            State::ShuttingDown { .. } | State::Exited => message::Response::ok(request.id, ()),
-            State::Initializing { .. } | State::Running(_) => self.respond(request),
+            State::ShuttingDown { .. } | State::Exited => {
+                (message::Response::ok(request.id, ()), Vec::new())
+            }
+            State::Initializing { .. } => (self.respond(request), Vec::new()),
+            State::Running(_) => {
+                let updates = if refresh {
+                    self.refreshes()
+                } else {
+                    Vec::new()
+                };
+                (self.respond(request), updates)
+            }
         };
         Output {
             messages: vec![Message::Response(response)],
-            updates: Vec::new(),
+            updates,
         }
     }
 
+    /// An inlay refresh for every open document, at its synced revision.
+    fn refreshes(&self) -> Vec<Update> {
+        self.tracked
+            .iter()
+            .map(|t| {
+                Update::Document(update::Document::new(
+                    t.doc_id,
+                    update::Stamp::Revision(t.synced.revision()),
+                    update::Change::InlayRefresh,
+                ))
+            })
+            .collect()
+    }
+
     fn respond(&self, request: message::Request) -> message::Response {
+        use lsp_types::request::Request;
         let message::Request { id, method, params } = request;
         match method.as_str() {
             "workspace/configuration" => {
@@ -1322,8 +1354,12 @@ impl Client {
                     failed_change: None,
                 },
             ),
-            // `workspace/semanticTokens/refresh`, `workspace/inlayHint/refresh`, …: nothing is
-            // cached that a refresh would invalidate.
+            // `answer` also tells each open document to refetch.
+            method if method == lsp_types::request::InlayHintRefreshRequest::METHOD => {
+                message::Response::ok(id, ())
+            }
+            // `workspace/semanticTokens/refresh`, …: nothing is cached that a refresh would
+            // invalidate.
             method if method.starts_with("workspace/") && method.ends_with("/refresh") => {
                 message::Response::ok(id, ())
             }

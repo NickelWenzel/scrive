@@ -57,6 +57,9 @@ pub enum Change {
     /// The inlay hints answering the ticket's request, replacing the shown set; an empty list
     /// clears it. `None` means the fetch failed: the editor keeps what it shows.
     Inlays(Option<Vec<inlay::Placed>>),
+    /// The server's hints changed: fetch them again. Stamped with the synced revision, but valid
+    /// whatever the editor's revision.
+    InlayRefresh,
 }
 
 /// Where a definition lives, relative to the requesting document.

@@ -3821,3 +3821,93 @@ fn inlay_keys_are_fresh_after_the_revision_moves() {
         "keys match only within one revision"
     );
 }
+
+/// The document and stamp of an inlay refresh.
+fn refreshed(update: &Update) -> (DocId, update::Stamp) {
+    let Update::Document(document) = update else {
+        panic!("expected a document update, got {update:?}")
+    };
+    match document.change() {
+        update::Change::InlayRefresh => (document.doc_id(), document.stamp()),
+        other => panic!("expected an inlay refresh, got {other:?}"),
+    }
+}
+
+/// `workspace/inlayHint/refresh` with id 7.
+fn inlay_refresh() -> Message {
+    from_server(json!({"jsonrpc": "2.0", "id": 7, "method": "workspace/inlayHint/refresh"}))
+}
+
+/// A refresh is answered `null` and tells every open document, at its synced revision, to
+/// refetch.
+#[test]
+fn inlay_refresh_answers_null_and_reaches_every_open_document() {
+    let (mut client, a) = hinting(INLAY_TEXT, inlay_capabilities());
+    let mut b = document(CALLEE);
+    open_as(&mut client, &b, "file:///b.rs");
+    type_ops(&mut client, &mut b, vec![EditOp::insert(0, "\n")]);
+    let output = client.receive(inlay_refresh()).expect("server requests are answered");
+    assert_eq!(
+        wire(&output.messages),
+        vec![json!({"jsonrpc": "2.0", "id": 7, "result": null})],
+        "the refresh is acknowledged",
+    );
+    assert_eq!(
+        output.updates.iter().map(refreshed).collect::<Vec<_>>(),
+        vec![
+            (a.doc_id(), update::Stamp::Revision(a.revision())),
+            (b.doc_id(), update::Stamp::Revision(b.revision())),
+        ],
+        "one refresh per open document, in registration order",
+    );
+}
+
+/// Other refreshes are acknowledged and reach no document.
+#[test]
+fn other_refreshes_answer_null_without_updates() {
+    let (mut client, _doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let response = answer(&mut client, "workspace/semanticTokens/refresh", json!(null));
+    assert_eq!(response.get("result"), Some(&Value::Null), "acknowledged");
+}
+
+/// Before the handshake a refresh is only acknowledged: `initialized` re-arms the editors.
+#[test]
+fn inlay_refresh_before_initialize_is_only_acknowledged() {
+    let doc = document(INLAY_TEXT);
+    let (mut client, _) = Client::builder().build();
+    open_as(&mut client, &doc, "file:///a.rs");
+    let output = client.receive(inlay_refresh()).expect("server requests are answered");
+    assert_eq!(output.messages.len(), 1, "the refresh is acknowledged");
+    assert!(output.updates.is_empty(), "no document refetches yet");
+}
+
+/// Requests made before the handshake were declined, so `initialized` asks every open document
+/// to refetch, even from a server that never sends refreshes.
+#[test]
+fn initialized_refreshes_inlays_for_a_server_without_refresh_support() {
+    let doc = document(INLAY_TEXT);
+    let (mut client, _) = Client::builder().build();
+    open_as(&mut client, &doc, "file:///a.rs");
+    let output = client
+        .receive(from_server(json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities":
+            {"textDocumentSync": 2, "inlayHintProvider": true}}})))
+        .expect("initialize answer is accepted");
+    assert_eq!(
+        output.updates.iter().map(refreshed).collect::<Vec<_>>(),
+        vec![(doc.doc_id(), update::Stamp::Revision(doc.revision()))],
+        "the open document refetches",
+    );
+}
+
+/// Without an inlay provider the handshake asks for no refetch.
+#[test]
+fn initialized_sends_no_inlay_refresh_without_a_provider() {
+    let doc = document(INLAY_TEXT);
+    let (mut client, _) = Client::builder().build();
+    open_as(&mut client, &doc, "file:///a.rs");
+    let output = client
+        .receive(from_server(json!({"jsonrpc": "2.0", "id": 1, "result": {"capabilities":
+            {"textDocumentSync": 2}}})))
+        .expect("initialize answer is accepted");
+    assert!(output.updates.is_empty(), "nothing to refetch");
+}

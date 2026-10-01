@@ -11,7 +11,7 @@ use scrive_lsp::lsp_types::Uri;
 use scrive_lsp::update::{self, Change, Refusal, Stamp, Target};
 use scrive_lsp::{Client, Error, Message, Output, Update};
 
-use super::{Awaited, CodeEditor};
+use super::{Awaited, CodeEditor, INLAY_EDIT_DELAY};
 
 impl CodeEditor {
     /// Register this editor's document with `client` under `uri`, in language `language`, and
@@ -208,8 +208,8 @@ impl CodeEditor {
             return refused(Refusal::Foreign);
         }
         let (_, stamp, change) = document.into_parts();
-        // The client stamps diagnostics and rename edits with a revision, and every other
-        // change with a ticket; any other pairing is treated as stale.
+        // The client stamps diagnostics, rename edits and inlay refreshes with a revision, and
+        // every other change with a ticket; any other pairing is treated as stale.
         match change {
             Change::Diagnostics(diagnostics) => {
                 let Stamp::Revision(revision) = stamp else {
@@ -302,6 +302,11 @@ impl CodeEditor {
                 } else {
                     refused(Refusal::Stale)
                 }
+            }
+            Change::InlayRefresh => {
+                // The server's hints changed whatever text it saw, so a refresh is never stale.
+                self.wait_inlays(INLAY_EDIT_DELAY, None);
+                update::Applied::default()
             }
         }
     }
