@@ -4,8 +4,10 @@
 //! queued the moment its request arrives, and the example's transport delivers them one per
 //! `Message::Deliver`. Canned: `initialize`, completion, signature help, and hover (on `greet`).
 //! Computed from the text the client sent: diagnostics (trailing whitespace), definition
-//! (`fn <word>(` in any document), rename (whole-word, every document) and formatting (strip
-//! trailing whitespace). Columns are bytes: the initialize result picks `utf-8` positions.
+//! (`fn <word>(` in any document), rename (whole-word, every document), formatting (strip
+//! trailing whitespace), and inlay hints: a type hint after `let x = f(…)` for a function some
+//! document defines, a parameter hint before each call's first argument, and their tooltips
+//! through `inlayHint/resolve`. Columns are bytes: the initialize result picks `utf-8` positions.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -23,7 +25,8 @@ const INITIALIZE: &str = r#"{
         "hoverProvider": true,
         "definitionProvider": true,
         "renameProvider": true,
-        "documentFormattingProvider": true
+        "documentFormattingProvider": true,
+        "inlayHintProvider": { "resolveProvider": true }
     },
     "serverInfo": { "name": "scrive-demo", "version": "0.4.0" }
 }"#;
@@ -70,6 +73,10 @@ const HOVER: &str = r#"{
     }
 }"#;
 
+/// Where the scripted standard library's `String` lives. No editor opens it, so a jump to it
+/// comes back as `Jump::Unopened`.
+const STRING_URI: &str = "file:///demo/std/string.rs";
+
 /// The server's state: each document as the client last described it, and the replies not yet
 /// delivered.
 #[derive(Default)]
@@ -81,6 +88,15 @@ pub struct Scripted {
 struct Document {
     version: i64,
     text: String,
+}
+
+/// A function some document defines as `fn name(param: …) -> Returns`.
+struct Signature<'a> {
+    name: &'a str,
+    param: &'a str,
+    returns: &'a str,
+    /// Where the parameter's name is, as an LSP location.
+    param_location: Value,
 }
 
 impl Scripted {
@@ -131,6 +147,8 @@ impl Scripted {
             "textDocument/definition" => self.definition(params),
             "textDocument/rename" => self.rename(params),
             "textDocument/formatting" => self.format(params),
+            "textDocument/inlayHint" => self.inlay_hints(params),
+            "inlayHint/resolve" => resolve(params),
             // `shutdown`, and anything unscripted.
             _ => Value::Null,
         }
@@ -305,11 +323,145 @@ impl Scripted {
         }])
     }
 
+    /// Every `fn name(param: …) -> Returns` in any document whose first parameter and return
+    /// type are on the `fn` line.
+    fn signatures(&self) -> Vec<Signature<'_>> {
+        let mut found = Vec::new();
+        for (uri, document) in &self.documents {
+            let text = document.text.as_str();
+            for (at, _) in text.match_indices("fn ") {
+                let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
+                let name_at = at + "fn ".len();
+                let name = word(text, name_at);
+                let param_at = name_at + name.len() + "(".len();
+                if name.is_empty() || !text[name_at + name.len()..].starts_with('(') {
+                    continue;
+                }
+                let Some(arrow) = text[param_at..line_end].find(") -> ") else {
+                    continue;
+                };
+                let param = word(text, param_at);
+                let returns = word(text, param_at + arrow + ") -> ".len());
+                if param.is_empty() || returns.is_empty() {
+                    continue;
+                }
+                let range = json!({
+                    "start": position(text, param_at),
+                    "end": position(text, param_at + param.len())
+                });
+                found.push(Signature {
+                    name,
+                    param,
+                    returns,
+                    param_location: json!({ "uri": uri, "range": range }),
+                });
+            }
+        }
+        found
+    }
+
+    /// The hints for one document. The request's range is ignored: the client drops what falls
+    /// outside the span it asked for.
+    fn inlay_hints(&self, params: &Value) -> Value {
+        let Some(document) = params["textDocument"]["uri"]
+            .as_str()
+            .and_then(|uri| self.documents.get(uri))
+        else {
+            return Value::Null;
+        };
+        let text = document.text.as_str();
+        let signatures = self.signatures();
+        let mut hints = Vec::new();
+        for signature in &signatures {
+            for at in occurrences(text, signature.name) {
+                let open = at + signature.name.len();
+                let defines = text[..at].ends_with("fn ");
+                if defines || !text[open..].starts_with('(') || text[open + 1..].starts_with(')') {
+                    continue;
+                }
+                hints.push(parameter_hint(text, open + 1, signature));
+            }
+        }
+        for (at, _) in text.match_indices("let ") {
+            let name_at = at + "let ".len();
+            let name_end = name_at + word(text, name_at).len();
+            let line_end = text[name_end..].find('\n').map_or(text.len(), |i| name_end + i);
+            let rest = &text[name_end..line_end];
+            // `let x: T = …` already states its type.
+            if name_end == name_at || !rest.starts_with(" = ") {
+                continue;
+            }
+            let called = signatures
+                .iter()
+                .find(|signature| rest.contains(&format!("{}(", signature.name)));
+            if let Some(signature) = called {
+                hints.push(type_hint(text, name_end, signature));
+            }
+        }
+        Value::Array(hints)
+    }
+
     fn push(&mut self, envelope: Value) {
         self.outbox.push_back(
             serde_json::from_value(envelope).expect("the script writes valid envelopes"),
         );
     }
+}
+
+/// `param:` before a call's first argument; the name links to the parameter.
+fn parameter_hint(text: &str, at: usize, signature: &Signature<'_>) -> Value {
+    json!({
+        "position": position(text, at),
+        "kind": 2,
+        "label": [
+            { "value": signature.param, "location": signature.param_location },
+            { "value": ":" }
+        ],
+        "paddingRight": true,
+        "data": {
+            "tooltip": format!("The `{}` parameter of `{}`.", signature.param, signature.name)
+        }
+    })
+}
+
+/// `: Returns` after a `let` name, insertable; `String` links into the unopened standard library.
+fn type_hint(text: &str, at: usize, signature: &Signature<'_>) -> Value {
+    let mut returns = json!({ "value": signature.returns });
+    if signature.returns == "String" {
+        returns["location"] = json!({
+            "uri": STRING_URI,
+            "range": {
+                "start": { "line": 0, "character": 11 },
+                "end": { "line": 0, "character": 17 }
+            }
+        });
+    }
+    json!({
+        "position": position(text, at),
+        "kind": 1,
+        "label": [{ "value": ": " }, returns],
+        "textEdits": [{
+            "range": { "start": position(text, at), "end": position(text, at) },
+            "newText": format!(": {}", signature.returns)
+        }],
+        "data": { "tooltip": format!("What `{}` returns.", signature.name) }
+    })
+}
+
+/// `inlayHint/resolve`: the hint, with the tooltip its `data` carries. A real server would look
+/// the tooltip up; the script keeps it in `data` so the round trip stays visible.
+fn resolve(params: &Value) -> Value {
+    let mut hint = params.clone();
+    hint["tooltip"] = json!({ "kind": "markdown", "value": params["data"]["tooltip"] });
+    hint
+}
+
+/// The identifier starting at byte `at`, empty when none does.
+fn word(text: &str, at: usize) -> &str {
+    let end = text[at..]
+        .find(|c: char| !is_word(c))
+        .map_or(text.len(), |i| at + i);
+    &text[at..end]
 }
 
 fn canned(payload: &str) -> Value {

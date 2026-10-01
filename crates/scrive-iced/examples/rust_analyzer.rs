@@ -12,6 +12,9 @@
 //! signature help. Ctrl+S (Cmd+S on macOS) writes the file and tells the server, which re-runs
 //! `cargo check`: the type error's squiggle updates only then.
 //!
+//! Inlay hints are on: double-click a type hint to insert it, Ctrl+click a part to jump, hover
+//! one for its tooltip. Ctrl+I (Cmd+I on macOS) turns them off and on.
+//!
 //! The update loop is the one `examples/lsp` uses, cut down to one editor. What that example
 //! fakes with an in-process server is real here: a child process, a reader thread that decodes
 //! the LSP base protocol from its stdout, and a writer thread that encodes onto its stdin. The
@@ -365,6 +368,8 @@ fn main() {
         file: PathBuf,
         /// The one-line status bar.
         status: String,
+        /// Whether inlay hints show; Ctrl+I flips it.
+        hints: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -373,6 +378,8 @@ fn main() {
         Editor(Event),
         /// Ctrl+S: write the document to its file and tell the server.
         Save,
+        /// Ctrl+I: turn inlay hints off or on.
+        ToggleHints,
         /// A JSON-RPC message from the server.
         Lsp(lsp::Message),
         /// The server process is running, and this reaches its stdin.
@@ -449,7 +456,8 @@ fn main() {
                 .build();
             let mut editor = CodeEditor::new(workspace.text())
                 .language(rust())
-                .rename(true);
+                .rename(true)
+                .inlay_hints(true);
             let mut queued = vec![initialize];
             // Before the handshake this only records the text; the didOpen follows `initialized`.
             queued.extend(
@@ -463,6 +471,7 @@ fn main() {
                 link: Link::Connecting(queued),
                 file: workspace.file.clone(),
                 status: format!("starting {}…", transport::SERVER),
+                hints: true,
             }
         }
 
@@ -474,6 +483,7 @@ fn main() {
                 link,
                 file,
                 status,
+                hints,
             } = self;
             match message {
                 Message::Editor(event) => {
@@ -507,6 +517,12 @@ fn main() {
                             *status = format!("could not save {}: {error}", file.display());
                         }
                     }
+                    Task::none()
+                }
+                Message::ToggleHints => {
+                    *hints = !*hints;
+                    editor.set_inlay_hints(*hints);
+                    *status = format!("inlay hints {}", if *hints { "on" } else { "off" });
                     Task::none()
                 }
                 Message::Connected(sender) => {
@@ -577,6 +593,7 @@ fn main() {
             Subscription::batch([
                 self.editor.subscription().map(Message::Editor),
                 keyboard::listen().filter_map(save_chord),
+                keyboard::listen().filter_map(toggle_chord),
                 Subscription::run(connect),
             ])
         }
@@ -646,6 +663,22 @@ fn main() {
                 ..
             } if c == "s" && modifiers.command() && !modifiers.shift() && !modifiers.alt() => {
                 Some(Message::Save)
+            }
+            _ => None,
+        }
+    }
+
+    /// Ctrl+I, or Cmd+I on macOS, without Shift or Alt and not repeated. The editor binds no
+    /// Ctrl+I, so the key reaches `keyboard::listen`.
+    fn toggle_chord(event: keyboard::Event) -> Option<Message> {
+        match event {
+            keyboard::Event::KeyPressed {
+                key: Key::Character(c),
+                modifiers,
+                repeat: false,
+                ..
+            } if c == "i" && modifiers.command() && !modifiers.shift() && !modifiers.alt() => {
+                Some(Message::ToggleHints)
             }
             _ => None,
         }
@@ -722,6 +755,7 @@ fn main() {
         use iced::keyboard::key::{Code, Physical};
         use iced::keyboard::{Location, Modifiers};
         use scrive_core::{Diagnostic, EditOp};
+        use scrive_iced::Action;
         use serde_json::Value;
 
         use super::*;
@@ -803,6 +837,38 @@ fn main() {
                 assert!(
                     save_chord(press(modifiers, repeat)).is_none(),
                     "{chord} does not save",
+                );
+            }
+        }
+
+        /// Only a plain Ctrl+I (Cmd+I on macOS) toggles the hints.
+        #[test]
+        fn toggle_chord_matches_only_plain_ctrl_i() {
+            let press = |modifiers: Modifiers, repeat: bool| keyboard::Event::KeyPressed {
+                key: Key::Character("i".into()),
+                modified_key: Key::Character("i".into()),
+                physical_key: Physical::Code(Code::KeyI),
+                location: Location::Standard,
+                modifiers,
+                text: None,
+                repeat,
+            };
+            assert!(
+                matches!(
+                    toggle_chord(press(Modifiers::COMMAND, false)),
+                    Some(Message::ToggleHints)
+                ),
+                "Ctrl+I toggles",
+            );
+            for (modifiers, repeat, chord) in [
+                (Modifiers::COMMAND | Modifiers::SHIFT, false, "Ctrl+Shift+I"),
+                (Modifiers::COMMAND | Modifiers::ALT, false, "Ctrl+Alt+I"),
+                (Modifiers::COMMAND, true, "a repeated Ctrl+I"),
+                (Modifiers::empty(), false, "a plain i"),
+            ] {
+                assert!(
+                    toggle_chord(press(modifiers, repeat)).is_none(),
+                    "{chord} does not toggle",
                 );
             }
         }
@@ -954,6 +1020,16 @@ fn main() {
                 }
             }
 
+            shut_down(&mut client, &incoming, &sender);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        /// Ask the server to shut down, answer it until it exits, and log why it left.
+        fn shut_down(
+            client: &mut lsp::Client,
+            incoming: &mpsc::Receiver<transport::Incoming>,
+            sender: &transport::Sender,
+        ) {
             sender.send(client.shutdown().messages);
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
@@ -970,6 +1046,164 @@ fn main() {
                     Err(_) => panic!("the server did not exit after shutdown"),
                 }
             }
+        }
+
+        /// The offsets of the hints `editor` shows.
+        fn hint_offsets(editor: &CodeEditor) -> Vec<u32> {
+            let document = editor.document();
+            document
+                .inlays_in(0..document.buffer().len())
+                .map(|hint| hint.offset())
+                .collect()
+        }
+
+        /// Drive `editor` against the server until `done` holds, and say whether it did before
+        /// `deadline`. Each round fires a scheduled hint fetch at once, as the widget would
+        /// once its delay passed, then takes one server message and lands its updates.
+        fn settle_until(
+            editor: &mut CodeEditor,
+            client: &mut lsp::Client,
+            incoming: &mpsc::Receiver<transport::Incoming>,
+            sender: &transport::Sender,
+            (started, deadline): (Instant, Instant),
+            done: impl Fn(&CodeEditor) -> bool,
+        ) -> bool {
+            while !done(editor) {
+                if let Some(wake) = editor.pending_wake() {
+                    let event = Event::Editor(Action::Wake(wake.generation));
+                    let _ = editor.update(event, Instant::now());
+                    sender.send(editor.sync_lsp(client).messages);
+                }
+                let Some(output) = pump(client, incoming, sender, deadline) else {
+                    return false;
+                };
+                for update in output.updates {
+                    let lsp::Update::Document(document) = update else {
+                        continue;
+                    };
+                    if let lsp::update::Change::Inlays(Some(hints)) = document.change() {
+                        eprintln!(
+                            "{:?}: {} hints at {:?}",
+                            started.elapsed(),
+                            hints.len(),
+                            document.stamp(),
+                        );
+                    }
+                    let applied = editor.apply_lsp(client, document);
+                    sender.send(applied.messages);
+                }
+            }
+            true
+        }
+
+        /// Against a real rust-analyzer: the scratch file's `let sum = add(1, 2);` gets its
+        /// `: i32` hint after load; an edit above moves the hint before any refetch; a refetch
+        /// at the new revision keeps it there; and a double-click inserts `: i32` once, with no
+        /// hint left beside it, before or after the next refetch.
+        #[test]
+        #[ignore = "needs rust-analyzer on PATH and a Rust toolchain; run with --ignored"]
+        fn rust_analyzer_hints_arrive_move_refresh_and_insert_once() {
+            let root =
+                std::env::temp_dir().join(format!("{SCRATCH}-hints-test-{}", std::process::id()));
+            let workspace = Workspace::scratch(&root).expect("the scratch crate is written");
+            let (deliver, incoming) = mpsc::channel();
+            let sender = transport::spawn(move |message| {
+                let _ = deliver.send(message);
+            })
+            .unwrap_or_else(|error| panic!("{}", transport::describe(&error)));
+
+            let (mut client, initialize) = lsp::Client::builder()
+                .root(workspace.root_uri())
+                .process_id(std::process::id())
+                .build();
+            let mut editor = CodeEditor::new(workspace.text()).inlay_hints(true);
+            let mut outgoing = vec![initialize];
+            outgoing.extend(
+                editor
+                    .open_lsp(&mut client, &workspace.file_uri(), "rust")
+                    .expect("the only document"),
+            );
+            sender.send(outgoing);
+            let started = Instant::now();
+            let within = || (started, Instant::now() + Duration::from_secs(120));
+            let current = |editor: &CodeEditor| {
+                let document = editor.document();
+                document.inlays_revision() == Some(document.revision())
+            };
+
+            let sum_end = SCRATCH_MAIN.find("let sum").expect("the scratch has `sum`");
+            let sum_end = u32::try_from(sum_end + "let sum".len()).expect("small");
+            let arrived = settle_until(
+                &mut editor,
+                &mut client,
+                &incoming,
+                &sender,
+                within(),
+                |e| hint_offsets(e).contains(&sum_end),
+            );
+            assert!(arrived, "the `sum` hint arrived within the timeout");
+
+            let moved = "// moved\n";
+            let main_at = SCRATCH_MAIN.find("fn main").expect("the scratch has main");
+            editor
+                .try_edit(vec![EditOp::insert(u32::try_from(main_at).expect("small"), moved)])
+                .expect("the edit applies");
+            let typed = sum_end + 9;
+            assert!(
+                hint_offsets(&editor).contains(&typed),
+                "the hint rides the edit before any refetch: {:?}",
+                hint_offsets(&editor),
+            );
+            sender.send(editor.sync_lsp(&mut client).messages);
+            let refetched = settle_until(
+                &mut editor,
+                &mut client,
+                &incoming,
+                &sender,
+                within(),
+                |e| current(e) && hint_offsets(e).contains(&typed),
+            );
+            assert!(refetched, "a refetch at the new revision keeps the hint after `sum`");
+
+            let key = editor
+                .document()
+                .inlays_in(typed..typed)
+                .find(|hint| hint.offset() == typed)
+                .expect("the `sum` hint shows")
+                .key();
+            let insert = Event::Editor(Action::InlayInsert { key, offset: typed });
+            let _ = editor.update(insert, Instant::now());
+            sender.send(editor.sync_lsp(&mut client).messages);
+            let text = editor.document().text().into_owned();
+            assert_eq!(
+                text.matches("let sum: i32 = add(1, 2);").count(),
+                1,
+                "the type is inserted once: {text}",
+            );
+            let typed_end = typed + u32::try_from(": i32".len()).expect("small");
+            let beside = |editor: &CodeEditor| {
+                let offsets = hint_offsets(editor);
+                offsets.contains(&typed) || offsets.contains(&typed_end)
+            };
+            assert!(!beside(&editor), "no hint is left beside the inserted type");
+
+            let settled = settle_until(
+                &mut editor,
+                &mut client,
+                &incoming,
+                &sender,
+                within(),
+                current,
+            );
+            assert!(settled, "the hints are refetched after the insert");
+            assert!(
+                !beside(&editor),
+                "the refetch brings no hint beside the inserted type: {:?}",
+                hint_offsets(&editor),
+            );
+            eprintln!("{:?}: done", started.elapsed());
+
+            shut_down(&mut client, &incoming, &sender);
             let _ = std::fs::remove_dir_all(&root);
         }
     }
