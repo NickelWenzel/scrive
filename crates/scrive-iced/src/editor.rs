@@ -1610,7 +1610,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                         self.draw_spans(renderer, &line, spans, origin, advance, code_clip);
                     }
                     _ if !line.is_empty() => {
-                        self.draw_line(renderer, expand_tabs(&line), origin, text_color, Alignment::Left, code_clip);
+                        self.draw_line(renderer, expand_tabs(&line, 0), origin, text_color, Alignment::Left, code_clip);
                     }
                     _ => {}
                 }
@@ -3105,7 +3105,7 @@ impl<Message> Editor<'_, Message> {
                 return;
             }
             let x = origin.x + row_layout.display_cell(start_col, Edge::Start) as f32 * advance;
-            self.draw_line(renderer, expand_tabs(text), Point::new(x, origin.y), color, Alignment::Left, clip);
+            self.draw_line(renderer, expand_tabs(text, display_map::expand(line, start_col, TAB)), Point::new(x, origin.y), color, Alignment::Left, clip);
         };
         match spans {
             Some(spans) if !spans.is_empty() => {
@@ -3324,7 +3324,7 @@ impl<Message> Editor<'_, Message> {
                     let line = buffer.line(r);
                     let l = line.trim_start();
                     if !l.is_empty() {
-                        self.draw_line(renderer, expand_tabs(l), Point::new(rect.x + pad, ry), text_color, Alignment::Left, rect);
+                        self.draw_line(renderer, expand_tabs(l, line_indent_cells(&line)), Point::new(rect.x + pad, ry), text_color, Alignment::Left, rect);
                     }
                 }
             }
@@ -3357,7 +3357,7 @@ impl<Message> Editor<'_, Message> {
             let fg = span.style.fg;
             self.draw_line(
                 renderer,
-                expand_tabs(text),
+                expand_tabs(text, cell),
                 Point::new(x, origin.y),
                 Color::from_rgb8(fg.r, fg.g, fg.b),
                 Alignment::Left,
@@ -3466,15 +3466,16 @@ impl<Message> Editor<'_, Message> {
     }
 }
 
-/// Expand tabs to spaces for display (the caret math uses the display map, so
-/// they agree).
-fn expand_tabs(line: &str) -> String {
-    if !line.contains('\t') {
-        return line.to_owned();
+/// Expand the tabs of a run that starts at raw cell `start_cell` (its
+/// tab-expanded cell before chips and hints shift it), so each tab reaches the
+/// same stop the display map measures.
+fn expand_tabs(run: &str, start_cell: u32) -> String {
+    if !run.contains('\t') {
+        return run.to_owned();
     }
-    let mut out = String::with_capacity(line.len());
-    let mut cell = 0u32;
-    for ch in line.chars() {
+    let mut out = String::with_capacity(run.len());
+    let mut cell = start_cell;
+    for ch in run.chars() {
         if ch == '\t' {
             let w = display_map::tab_width(cell, TAB);
             for _ in 0..w {
@@ -3981,6 +3982,22 @@ mod tests {
                 // Covered iff some single selection spans the whole range.
                 let brute = sels.iter().any(|s| s.start() <= start && s.end() >= end);
                 assert_eq!(got, brute, "range [{start}, {end}]");
+            }
+        }
+    }
+
+    /// A run that starts off a tab stop expands its tabs from its own raw cell,
+    /// so it paints exactly as wide as the display map measures it.
+    #[test]
+    fn a_run_expands_its_tabs_from_its_raw_cell() {
+        assert_eq!(expand_tabs("\ty", 1), "   y", "a tab at cell 1 reaches the stop at 4");
+        let line = "a\tbc\t\td\te";
+        let len = line.len() as u32;
+        for start in 0..=len {
+            for end in start..=len {
+                let cell = display_map::expand(line, start, TAB);
+                let painted = expand_tabs(&line[start as usize..end as usize], cell).chars().count() as u32;
+                assert_eq!(cell + painted, display_map::expand(line, end, TAB), "run {start}..{end}");
             }
         }
     }
