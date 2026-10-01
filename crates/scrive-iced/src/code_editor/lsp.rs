@@ -308,6 +308,18 @@ impl CodeEditor {
                 self.wait_inlays(INLAY_EDIT_DELAY, None);
                 update::Applied::default()
             }
+            Change::InlayTooltip(markdown) => {
+                let Stamp::Ticket(ticket) = stamp else {
+                    return refused(Refusal::Stale);
+                };
+                let accepted = self.accepts(Awaited::InlayTooltip, ticket);
+                self.set_inlay_tooltip(ticket, markdown);
+                if accepted {
+                    update::Applied::default()
+                } else {
+                    refused(Refusal::Stale)
+                }
+            }
         }
     }
 }

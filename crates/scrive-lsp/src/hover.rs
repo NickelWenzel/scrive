@@ -39,7 +39,8 @@ pub(crate) fn convert(
     Some(HoverInfo { markdown, range })
 }
 
-fn contents(contents: HoverContents) -> String {
+/// Hover contents in the hover card's subset.
+pub(crate) fn contents(contents: HoverContents) -> String {
     match contents {
         HoverContents::Scalar(marked) => marked_string(marked),
         HoverContents::Array(list) => list

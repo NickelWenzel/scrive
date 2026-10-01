@@ -4,40 +4,54 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
-use lsp_types::{InlayHintKind, InlayHintLabel, Position};
+use lsp_types::{
+    InlayHintKind, InlayHintLabel, InlayHintLabelPartTooltip, InlayHintTooltip, MarkupKind,
+    Position,
+};
+use scrive_core::intel::hover::escape_markdown;
 use scrive_core::{intel, Revision, Snapshot};
 use serde_json::Value;
 
-use crate::Encoding;
+use crate::{markdown, uri, Encoding};
 
 /// The hints of one answer, kept by key for the gestures on them.
 #[derive(Debug)]
 pub(crate) struct Set {
-    revision: Revision,
+    /// What the hints' positions and edits convert against.
+    snapshot: Snapshot,
+    /// Every open document's synced revision when the hints were asked for.
+    revisions: Vec<(uri::Key, Revision)>,
     /// In server order.
     hints: Vec<Stored>,
 }
 
 /// One installed hint as the server sent it.
 #[derive(Debug)]
-struct Stored {
+pub(crate) struct Stored {
     key: intel::inlay::Key,
     hint: lsp_types::InlayHint,
+    /// Sent back verbatim by `inlayHint/resolve`: its `data` belongs to the server.
+    raw: Value,
+    /// A resolve reply has been absorbed.
+    resolved: bool,
 }
 
 /// One entry that decoded and lies in the clipped span, at its offset in the request snapshot.
 pub(crate) struct Fetched {
     offset: u32,
     hint: lsp_types::InlayHint,
+    raw: Value,
 }
 
 impl Set {
     /// The set for an answer at `snapshot`, and its hints for the editor, in server order. A hint
     /// matching one of `previous` by position, kind and label texts keeps that hint's key, first
     /// unused match first, so repeated identical hints keep theirs in order; every other hint
-    /// gets the next key from `counter`. `previous` must be at the same revision.
+    /// gets the next key from `counter`. `previous` must be at the same revision. `revisions`
+    /// holds every open document's synced revision when the hints were asked for.
     pub(crate) fn install(
         snapshot: &Snapshot,
+        revisions: Vec<(uri::Key, Revision)>,
         fetched: Vec<Fetched>,
         previous: Option<Set>,
         counter: &mut u64,
@@ -69,11 +83,14 @@ impl Set {
                 hints.push(Stored {
                     key,
                     hint: fetched.hint,
+                    raw: fetched.raw,
+                    resolved: false,
                 });
             }
         }
         let set = Set {
-            revision: snapshot.revision(),
+            snapshot: snapshot.clone(),
+            revisions,
             hints,
         };
         (set, placed)
@@ -81,7 +98,90 @@ impl Set {
 
     /// The revision the set was fetched at.
     pub(crate) fn revision(&self) -> Revision {
-        self.revision
+        self.snapshot.revision()
+    }
+
+    /// The text the hints were fetched against.
+    pub(crate) fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    /// Every open document's synced revision when the hints were asked for.
+    pub(crate) fn revisions(&self) -> &[(uri::Key, Revision)] {
+        &self.revisions
+    }
+
+    /// The hint under `key`.
+    pub(crate) fn get(&self, key: intel::inlay::Key) -> Option<&Stored> {
+        self.hints.iter().find(|stored| stored.key == key)
+    }
+
+    /// The hint under `key`, to absorb a resolve into.
+    pub(crate) fn get_mut(&mut self, key: intel::inlay::Key) -> Option<&mut Stored> {
+        self.hints.iter_mut().find(|stored| stored.key == key)
+    }
+}
+
+impl Stored {
+    /// The tooltip for a gesture on `part`, lowered to the hover card's subset: the part's own,
+    /// else the hint's. Whitespace-only tooltips count as none.
+    pub(crate) fn tooltip(&self, part: u32) -> Option<String> {
+        let own = self
+            .part(part)
+            .and_then(|part| part.tooltip.as_ref())
+            .and_then(part_tooltip);
+        own.or_else(|| self.hint.tooltip.as_ref().and_then(hint_tooltip))
+    }
+
+    /// The location of label part `part`, if it has one.
+    pub(crate) fn location(&self, part: u32) -> Option<&lsp_types::Location> {
+        self.part(part)?.location.as_ref()
+    }
+
+    /// The edits that insert the hint into the text; empty when it has none.
+    pub(crate) fn text_edits(&self) -> &[lsp_types::TextEdit] {
+        self.hint.text_edits.as_deref().unwrap_or_default()
+    }
+
+    /// Whether a resolve could still add a tooltip: the server keeps `data` on the hint for that.
+    pub(crate) fn resolvable(&self) -> bool {
+        !self.resolved && self.hint.data.is_some()
+    }
+
+    /// The hint as the server sent it, for `inlayHint/resolve`.
+    pub(crate) fn raw(&self) -> &Value {
+        &self.raw
+    }
+
+    /// Takes the tooltips of `resolved` that this hint lacks. The fetched label owns the parts: a
+    /// resolve may restructure the label, so part tooltips are taken only from the same label.
+    /// Links and text edits never change after install.
+    pub(crate) fn absorb(&mut self, resolved: lsp_types::InlayHint) {
+        self.resolved = true;
+        if self.hint.tooltip.is_none() {
+            self.hint.tooltip = resolved.tooltip;
+        }
+        if let (InlayHintLabel::LabelParts(mine), InlayHintLabel::LabelParts(theirs)) =
+            (&mut self.hint.label, resolved.label)
+        {
+            let same = mine.len() == theirs.len()
+                && mine.iter().zip(&theirs).all(|(a, b)| a.value == b.value);
+            if same {
+                for (mine, theirs) in mine.iter_mut().zip(theirs) {
+                    if mine.tooltip.is_none() {
+                        mine.tooltip = theirs.tooltip;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Label part `part`; a string label has none.
+    fn part(&self, part: u32) -> Option<&lsp_types::InlayHintLabelPart> {
+        match &self.hint.label {
+            InlayHintLabel::LabelParts(parts) => parts.get(part as usize),
+            InlayHintLabel::String(_) => None,
+        }
     }
 }
 
@@ -107,13 +207,13 @@ pub(crate) fn decode(
     entries
         .into_iter()
         .filter_map(|raw| {
-            let hint: lsp_types::InlayHint = serde_json::from_value(raw).ok()?;
+            let hint: lsp_types::InlayHint = serde_json::from_value(raw.clone()).ok()?;
             let line = hint.position.line;
             if line < first || line > last || line >= snapshot.line_count() {
                 return None;
             }
             let offset = encoding.offset(snapshot, hint.position);
-            Some(Fetched { offset, hint })
+            Some(Fetched { offset, hint, raw })
         })
         .collect()
 }
@@ -195,4 +295,28 @@ fn label_texts(label: &InlayHintLabel) -> Vec<&str> {
 /// Same position, kind and label texts: the same hint, refetched.
 fn same_hint(a: &lsp_types::InlayHint, b: &lsp_types::InlayHint) -> bool {
     a.position == b.position && a.kind == b.kind && label_texts(&a.label) == label_texts(&b.label)
+}
+
+/// The spec makes a bare string tooltip plain text.
+fn hint_tooltip(tooltip: &InlayHintTooltip) -> Option<String> {
+    match tooltip {
+        InlayHintTooltip::String(text) => card(&MarkupKind::PlainText, text),
+        InlayHintTooltip::MarkupContent(content) => card(&content.kind, &content.value),
+    }
+}
+
+fn part_tooltip(tooltip: &InlayHintLabelPartTooltip) -> Option<String> {
+    match tooltip {
+        InlayHintLabelPartTooltip::String(text) => card(&MarkupKind::PlainText, text),
+        InlayHintLabelPartTooltip::MarkupContent(content) => card(&content.kind, &content.value),
+    }
+}
+
+/// `text` in the hover card's markdown subset, or `None` when nothing would show.
+fn card(kind: &MarkupKind, text: &str) -> Option<String> {
+    let markdown = match kind {
+        MarkupKind::Markdown => markdown::to_hover(text),
+        MarkupKind::PlainText => escape_markdown(text),
+    };
+    (!markdown.trim().is_empty()).then_some(markdown)
 }

@@ -60,6 +60,9 @@ pub enum Change {
     /// The server's hints changed: fetch them again. Stamped with the synced revision, but valid
     /// whatever the editor's revision.
     InlayRefresh,
+    /// The tooltip for the ticket's hint gesture, in the hover card's markdown subset; `None`
+    /// means there is nothing to show.
+    InlayTooltip(Option<String>),
 }
 
 /// Where a definition lives, relative to the requesting document.

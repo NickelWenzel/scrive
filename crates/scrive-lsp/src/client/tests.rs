@@ -3188,7 +3188,11 @@ fn rename_declines_before_initialize_and_without_a_provider() {
 /// Server capabilities with utf-16 positions (the default), incremental sync, hover, and inlay
 /// hints whose tooltips resolve lazily.
 fn inlay_capabilities() -> Value {
-    json!({"textDocumentSync": 2, "hoverProvider": true, "inlayHintProvider": {"resolveProvider": true}})
+    json!({
+        "textDocumentSync": 2,
+        "hoverProvider": true,
+        "inlayHintProvider": {"resolveProvider": true},
+    })
 }
 
 /// `let a = f(1);` / `let b = a;`: `a` ends at 5, `1` starts at 10, `b` ends at 19; 25 bytes, 3
@@ -3323,7 +3327,10 @@ fn initialize_advertises_inlay_hints_with_lazy_tooltips_and_refresh() {
     let initialize = serde_json::to_value(&initialize).expect("serializes");
     assert_eq!(
         initialize.pointer("/params/capabilities/textDocument/inlayHint"),
-        Some(&json!({"dynamicRegistration": false, "resolveSupport": {"properties": ["tooltip", "label.tooltip"]}})),
+        Some(&json!({
+            "dynamicRegistration": false,
+            "resolveSupport": {"properties": ["tooltip", "label.tooltip"]},
+        })),
         "locations and edits come inline; only tooltips resolve",
     );
     assert_eq!(
@@ -3724,7 +3731,8 @@ fn one_malformed_inlay_hint_does_not_lose_the_set() {
             {"position": {"line": 0, "character": 5}, "label": ": i32", "kind": 1},
             {"position": "nowhere", "label": "x"},
             {"position": {"line": 0, "character": 10}, "label": [
-                {"value": "T", "location": {"uri": "file:///bad path.rs", "range": span_on(0, 0, 1)}},
+                {"value": "T",
+                    "location": {"uri": "file:///bad path.rs", "range": span_on(0, 0, 1)}},
             ]},
             {"label": "no position"},
             7,
@@ -3910,4 +3918,476 @@ fn initialized_sends_no_inlay_refresh_without_a_provider() {
             {"textDocumentSync": 2}}})))
         .expect("initialize answer is accepted");
     assert!(output.updates.is_empty(), "nothing to refetch");
+}
+
+/// The stamp and markdown of an inlay tooltip update.
+fn tooltip(update: &Update) -> (update::Stamp, Option<String>) {
+    let Update::Document(document) = update else {
+        panic!("expected a document update, got {update:?}")
+    };
+    match document.change() {
+        update::Change::InlayTooltip(markdown) => (document.stamp(), markdown.clone()),
+        other => panic!("expected an inlay tooltip, got {other:?}"),
+    }
+}
+
+/// A running client with [`INLAY_TEXT`] open, its three fixture hints fetched by request 2.
+fn hinted(capabilities: Value) -> (Client, Document, Counter, Vec<inlay::Placed>) {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, capabilities);
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([type_hint(), parameter_hint(), insertable_hint()]),
+    );
+    (client, doc, tickets, hints)
+}
+
+/// Capabilities without lazy tooltips: hover and inlay hints, nothing to resolve.
+fn resolveless_capabilities() -> Value {
+    json!({"textDocumentSync": 2, "hoverProvider": true, "inlayHintProvider": true})
+}
+
+/// `inlayHint/resolve` with `id` for the raw `hint`.
+fn resolve_wire(id: i64, hint: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "inlayHint/resolve", "params": hint})
+}
+
+/// The hover with `id` at `type_hint`'s `i32` location in `core.rs`.
+fn location_hover_wire(id: i64) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/hover", "params": {
+        "textDocument": {"uri": "file:///w/core.rs"},
+        "position": {"line": 3, "character": 4},
+    }})
+}
+
+/// The hover reply for `i32`.
+fn i32_hover(id: i64) -> Message {
+    reply(
+        id,
+        json!({"contents": {"kind": "markdown", "value": "```rust\nstruct i32\n```"}}),
+    )
+}
+
+/// A one-part type hint after `a` whose part links to `range` in `uri`.
+fn linked_hint(uri: &str, range: Value) -> Value {
+    json!({"position": {"line": 0, "character": 5}, "kind": 1, "label": [
+        {"value": "T", "location": {"uri": uri, "range": range}},
+    ]})
+}
+
+/// A tooltip resolves the hint once; the resolved tooltip answers, and later hovers are
+/// answered from the stored hint without asking again.
+#[test]
+fn inlay_tooltip_resolves_then_answers_from_the_stored_hint() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let key = hints[0].hint().key();
+    let gesture = inlay::Interaction::tooltip(tickets.issue(doc.revision()), key, 0);
+    assert_eq!(
+        wire(&client.interact(&doc.snapshot(), &gesture).messages),
+        vec![resolve_wire(3, type_hint())],
+        "the hint goes back verbatim",
+    );
+    let mut resolved = type_hint();
+    resolved["tooltip"] = json!({"kind": "markdown", "value": "**i32** is 32 bits"});
+    let output = client.receive(reply(3, resolved)).expect("the reply is accepted");
+    let (stamp, markdown) = tooltip(only(&output));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(gesture.ticket()),
+        "the tooltip answers the gesture"
+    );
+    assert_eq!(
+        markdown.as_deref(),
+        Some("**i32** is 32 bits"),
+        "the resolved tooltip, in the card's subset"
+    );
+    let again = inlay::Interaction::tooltip(tickets.issue(doc.revision()), key, 0);
+    let output = client.interact(&doc.snapshot(), &again);
+    assert!(output.messages.is_empty(), "a resolved hint is not resolved again");
+    assert_eq!(
+        tooltip(only(&output)).1.as_deref(),
+        Some("**i32** is 32 bits"),
+        "answered from the stored hint"
+    );
+}
+
+/// A resolve over the same label adds its part tooltips, and the part's own tooltip answers.
+#[test]
+fn resolve_with_the_same_label_adds_part_tooltips() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let gesture =
+        inlay::Interaction::tooltip(tickets.issue(doc.revision()), hints[0].hint().key(), 1);
+    let _ = client.interact(&doc.snapshot(), &gesture);
+    let mut resolved = type_hint();
+    resolved["label"][1]["tooltip"] = json!("the type");
+    let output = client.receive(reply(3, resolved)).expect("the reply is accepted");
+    assert_eq!(
+        tooltip(only(&output)).1.as_deref(),
+        Some("the type"),
+        "the part's own tooltip"
+    );
+}
+
+/// A resolve that reshapes the label contributes only its hint-level tooltip: the parts, their
+/// links included, stay as fetched.
+#[test]
+fn resolve_that_restructures_the_label_keeps_the_fetched_parts() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let key = hints[0].hint().key();
+    let gesture = inlay::Interaction::tooltip(tickets.issue(doc.revision()), key, 1);
+    let _ = client.interact(&doc.snapshot(), &gesture);
+    let mut resolved = type_hint();
+    resolved["label"] =
+        json!([{"value": ": "}, {"value": "i"}, {"value": "32", "tooltip": "part"}]);
+    resolved["tooltip"] = json!("whole");
+    let output = client.receive(reply(3, resolved)).expect("the reply is accepted");
+    assert_eq!(
+        tooltip(only(&output)).1.as_deref(),
+        Some("whole"),
+        "the hint's tooltip, not the reshaped part's"
+    );
+    let jump = inlay::Interaction::jump(tickets.issue(doc.revision()), key, 1);
+    let (_, target) = defined(&client.interact(&doc.snapshot(), &jump));
+    let Some(update::Target::Unopened(unopened)) = target else {
+        panic!("expected an unopened target, got {target:?}")
+    };
+    assert_eq!(unopened.uri().as_str(), "file:///w/core.rs", "the fetched part's link");
+}
+
+/// A resolve that answers after an edit is dropped, and the moved set answers nothing.
+#[test]
+fn resolve_reply_after_an_edit_is_dropped() {
+    let (mut client, mut doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let key = hints[0].hint().key();
+    let gesture = inlay::Interaction::tooltip(tickets.issue(doc.revision()), key, 0);
+    let _ = client.interact(&doc.snapshot(), &gesture);
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(25, "x")]);
+    let mut resolved = type_hint();
+    resolved["tooltip"] = json!("late");
+    assert_silent(
+        &client.receive(reply(3, resolved)).expect("the reply is accepted"),
+        "a reply behind the synced revision",
+    );
+    let later = inlay::Interaction::tooltip(tickets.issue(doc.revision()), key, 0);
+    let output = client.interact(&doc.snapshot(), &later);
+    assert_eq!(tooltip(only(&output)).1, None, "the set is from an old revision");
+}
+
+/// A resolve that brings no tooltip falls through to the hover at the part's location.
+#[test]
+fn resolve_without_a_tooltip_falls_back_to_the_location_hover() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let gesture =
+        inlay::Interaction::tooltip(tickets.issue(doc.revision()), hints[0].hint().key(), 1);
+    let _ = client.interact(&doc.snapshot(), &gesture);
+    let output = client.receive(reply(3, type_hint())).expect("the reply is accepted");
+    assert_eq!(
+        wire(&output.messages),
+        vec![location_hover_wire(4)],
+        "the hover at the part's location"
+    );
+    assert!(output.updates.is_empty(), "nothing is answered yet");
+    let output = client.receive(i32_hover(4)).expect("the reply is accepted");
+    let (stamp, markdown) = tooltip(only(&output));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(gesture.ticket()),
+        "the hover answers the gesture"
+    );
+    assert_eq!(markdown.as_deref(), Some("`struct i32`"), "the hover's card");
+}
+
+/// Without lazy tooltips a part's location is hovered at once, even in a file nobody opened.
+#[test]
+fn inlay_tooltip_hovers_at_a_part_location_in_an_unopened_file() {
+    let (mut client, doc, mut tickets, hints) = hinted(resolveless_capabilities());
+    let gesture =
+        inlay::Interaction::tooltip(tickets.issue(doc.revision()), hints[0].hint().key(), 1);
+    assert_eq!(
+        wire(&client.interact(&doc.snapshot(), &gesture).messages),
+        vec![location_hover_wire(3)],
+        "the location goes out as the server sent it",
+    );
+    let output = client.receive(i32_hover(3)).expect("the reply is accepted");
+    assert_eq!(
+        tooltip(only(&output)).1.as_deref(),
+        Some("`struct i32`"),
+        "the hover's card"
+    );
+}
+
+/// With no tooltip, nothing to resolve and no location, the answer is `None` at once.
+#[test]
+fn inlay_tooltip_without_any_source_answers_none_at_once() {
+    let (mut client, doc, mut tickets, hints) = hinted(resolveless_capabilities());
+    let gesture =
+        inlay::Interaction::tooltip(tickets.issue(doc.revision()), hints[1].hint().key(), 0);
+    let output = client.interact(&doc.snapshot(), &gesture);
+    assert_eq!(tooltip(only(&output)).1, None, "nothing to show");
+}
+
+/// A server without hover gets no location hover.
+#[test]
+fn no_location_hover_without_a_hover_provider() {
+    let (mut client, doc, mut tickets, hints) =
+        hinted(json!({"textDocumentSync": 2, "inlayHintProvider": true}));
+    let gesture =
+        inlay::Interaction::tooltip(tickets.issue(doc.revision()), hints[0].hint().key(), 1);
+    let output = client.interact(&doc.snapshot(), &gesture);
+    assert_eq!(tooltip(only(&output)).1, None, "nothing to ask");
+}
+
+/// A location in another open document that moved since the fetch is not hovered.
+#[test]
+fn location_hover_into_a_moved_open_document_declines() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, resolveless_capabilities());
+    let mut callee = document(CALLEE);
+    open_as(&mut client, &callee, "file:///b.rs");
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([linked_hint("file:///b.rs", span_on(0, 3, 8))]),
+    );
+    type_ops(&mut client, &mut callee, vec![EditOp::insert(0, "\n")]);
+    let gesture =
+        inlay::Interaction::tooltip(tickets.issue(doc.revision()), hints[0].hint().key(), 0);
+    let output = client.interact(&doc.snapshot(), &gesture);
+    assert_eq!(tooltip(only(&output)).1, None, "the location moved");
+}
+
+/// A failed resolve answers no tooltip and leaves the hint resolvable for the next hover.
+#[test]
+fn failed_resolve_answers_no_tooltip_and_retries_on_the_next_hover() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let key = hints[0].hint().key();
+    let gesture = inlay::Interaction::tooltip(tickets.issue(doc.revision()), key, 0);
+    let _ = client.interact(&doc.snapshot(), &gesture);
+    let output = client.receive(failure(3, -32603)).expect("an intel failure is no error");
+    assert_eq!(tooltip(only(&output)).1, None, "the failure settles the gesture");
+    let again = inlay::Interaction::tooltip(tickets.issue(doc.revision()), key, 0);
+    assert_eq!(
+        wire(&client.interact(&doc.snapshot(), &again).messages),
+        vec![resolve_wire(4, type_hint())],
+        "the hint is resolved again",
+    );
+}
+
+/// A new tooltip gesture cancels the resolve in flight.
+#[test]
+fn new_inlay_tooltip_supersedes_the_one_in_flight() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let key = hints[0].hint().key();
+    let first = inlay::Interaction::tooltip(tickets.issue(doc.revision()), key, 0);
+    let _ = client.interact(&doc.snapshot(), &first);
+    let second = inlay::Interaction::tooltip(tickets.issue(doc.revision()), key, 0);
+    assert_eq!(
+        wire(&client.interact(&doc.snapshot(), &second).messages),
+        vec![cancel_request(3), resolve_wire(4, type_hint())],
+        "the old resolve is cancelled before the new one goes out",
+    );
+}
+
+/// A label part linking into the requesting document jumps there, without asking the server.
+#[test]
+fn label_jump_into_the_same_document_is_a_local_target() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([linked_hint("file:///a.rs", span_on(1, 4, 5))]),
+    );
+    let gesture = inlay::Interaction::jump(tickets.issue(doc.revision()), hints[0].hint().key(), 0);
+    let (stamp, target) = defined(&client.interact(&doc.snapshot(), &gesture));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(gesture.ticket()),
+        "stamped with the gesture's ticket"
+    );
+    assert_eq!(target, Some(update::Target::Local(18..19)), "over `b`");
+}
+
+/// A label part linking into another open document jumps there at its synced revision.
+#[test]
+fn label_jump_into_another_open_document_is_an_open_target() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let callee = document(CALLEE);
+    open_as(&mut client, &callee, "file:///b.rs");
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([linked_hint("file:///b.rs", span_on(0, 3, 8))]),
+    );
+    let gesture = inlay::Interaction::jump(tickets.issue(doc.revision()), hints[0].hint().key(), 0);
+    let (_, target) = defined(&client.interact(&doc.snapshot(), &gesture));
+    let Some(update::Target::Open(open)) = target else {
+        panic!("expected an open target, got {target:?}")
+    };
+    assert_eq!(open.doc_id(), callee.doc_id(), "the callee's document");
+    assert_eq!(open.revision(), callee.revision(), "at its synced revision");
+    assert_eq!(open.span(), 3..8, "over `greet`");
+}
+
+/// A link into an open document that moved since the fetch points at text the server never
+/// saw, so the jump is dropped.
+#[test]
+fn label_jump_into_an_open_document_that_moved_is_dropped() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let mut callee = document(CALLEE);
+    open_as(&mut client, &callee, "file:///b.rs");
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([linked_hint("file:///b.rs", span_on(0, 3, 8))]),
+    );
+    type_ops(&mut client, &mut callee, vec![EditOp::insert(0, "\n")]);
+    let gesture = inlay::Interaction::jump(tickets.issue(doc.revision()), hints[0].hint().key(), 0);
+    let (_, target) = defined(&client.interact(&doc.snapshot(), &gesture));
+    assert_eq!(target, None, "the moved target is dropped");
+}
+
+/// A document opened after the fetch has no recorded revision, so a jump into it is dropped.
+#[test]
+fn label_jump_into_a_document_opened_after_the_fetch_is_dropped() {
+    let mut tickets = Counter::new();
+    let (mut client, doc) = hinting(INLAY_TEXT, inlay_capabilities());
+    let hints = fetch(
+        &mut client,
+        &mut tickets,
+        &doc,
+        2,
+        json!([linked_hint("file:///b.rs", span_on(0, 3, 8))]),
+    );
+    open_as(&mut client, &document(CALLEE), "file:///b.rs");
+    let gesture = inlay::Interaction::jump(tickets.issue(doc.revision()), hints[0].hint().key(), 0);
+    let (_, target) = defined(&client.interact(&doc.snapshot(), &gesture));
+    assert_eq!(target, None, "the late-opened target is dropped");
+}
+
+/// A link into a file nobody opened keeps the server's range for the host to convert.
+#[test]
+fn label_jump_into_an_unopened_file_is_an_unopened_target() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let gesture = inlay::Interaction::jump(tickets.issue(doc.revision()), hints[0].hint().key(), 1);
+    let (_, target) = defined(&client.interact(&doc.snapshot(), &gesture));
+    let Some(update::Target::Unopened(unopened)) = target else {
+        panic!("expected an unopened target, got {target:?}")
+    };
+    assert_eq!(unopened.uri().as_str(), "file:///w/core.rs", "the file");
+    assert_eq!(
+        unopened.span("a\nb\nc\nlet i32\n"),
+        10..13,
+        "converted against the file's text"
+    );
+}
+
+/// A part without a location jumps nowhere.
+#[test]
+fn jump_on_a_part_without_a_location_answers_none() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let gesture = inlay::Interaction::jump(tickets.issue(doc.revision()), hints[0].hint().key(), 0);
+    let (_, target) = defined(&client.interact(&doc.snapshot(), &gesture));
+    assert_eq!(target, None, "`: ` has no location");
+}
+
+/// An insert answers the hint's text edits, trimmed by hygiene, without asking the server.
+#[test]
+fn inlay_insert_answers_the_hint_edits_through_hygiene() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let gesture =
+        inlay::Interaction::insert(tickets.issue(doc.revision()), hints[2].hint().key(), 19);
+    let output = client.interact(&doc.snapshot(), &gesture);
+    let (stamp, ops) = edits(only(&output));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(gesture.ticket()),
+        "stamped with the gesture's ticket"
+    );
+    assert_eq!(ops, vec![EditOp::insert(19, ": i32")], "the trimmed insert after `b`");
+}
+
+/// An insert on a hint without edits answers an empty batch, which settles the gesture.
+#[test]
+fn inlay_insert_without_edits_declines_with_no_edits() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let gesture =
+        inlay::Interaction::insert(tickets.issue(doc.revision()), hints[1].hint().key(), 10);
+    let output = client.interact(&doc.snapshot(), &gesture);
+    assert!(edits(only(&output)).1.is_empty(), "no edits");
+}
+
+/// Once the text moved past the set, every gesture gets its empty answer without asking.
+#[test]
+fn interactions_on_a_moved_set_decline() {
+    let (mut client, mut doc, mut tickets, hints) = hinted(inlay_capabilities());
+    type_ops(&mut client, &mut doc, vec![EditOp::insert(25, "x")]);
+    let mut ticket = || tickets.issue(doc.revision());
+    let tooltip_gesture = inlay::Interaction::tooltip(ticket(), hints[0].hint().key(), 0);
+    let jump = inlay::Interaction::jump(ticket(), hints[0].hint().key(), 1);
+    let insert = inlay::Interaction::insert(ticket(), hints[2].hint().key(), 19);
+    assert_eq!(
+        tooltip(only(&client.interact(&doc.snapshot(), &tooltip_gesture))).1,
+        None,
+        "no tooltip"
+    );
+    assert_eq!(
+        defined(&client.interact(&doc.snapshot(), &jump)).1,
+        None,
+        "no target"
+    );
+    assert!(
+        edits(only(&client.interact(&doc.snapshot(), &insert))).1.is_empty(),
+        "no edits"
+    );
+}
+
+/// A key no fetch minted gets the empty answer.
+#[test]
+fn interaction_with_an_unknown_key_declines() {
+    let (mut client, doc, mut tickets, _) = hinted(inlay_capabilities());
+    let gesture =
+        inlay::Interaction::tooltip(tickets.issue(doc.revision()), inlay::Key::new(u64::MAX), 0);
+    let output = client.interact(&doc.snapshot(), &gesture);
+    assert_eq!(tooltip(only(&output)).1, None, "an unknown hint");
+}
+
+/// Once the server is shutting down, gestures get their empty answer.
+#[test]
+fn interactions_decline_once_the_server_is_shutting_down() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let _ = client.shutdown();
+    let gesture = inlay::Interaction::jump(tickets.issue(doc.revision()), hints[0].hint().key(), 1);
+    assert_eq!(
+        defined(&client.interact(&doc.snapshot(), &gesture)).1,
+        None,
+        "no target"
+    );
+}
+
+/// Closing a document forgets its hints: a reopened document answers no gesture on them.
+#[test]
+fn close_forgets_the_inlay_set() {
+    let (mut client, doc, mut tickets, hints) = hinted(inlay_capabilities());
+    let _ = client.close(doc.doc_id());
+    open_as(&mut client, &doc, "file:///a.rs");
+    let gesture = inlay::Interaction::jump(tickets.issue(doc.revision()), hints[0].hint().key(), 1);
+    assert_eq!(
+        defined(&client.interact(&doc.snapshot(), &gesture)).1,
+        None,
+        "the set went with the close"
+    );
 }

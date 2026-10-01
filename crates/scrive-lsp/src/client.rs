@@ -16,22 +16,20 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams,
     DocumentFormattingParams, FormattingOptions, GotoDefinitionParams, HoverParams,
-    InlayHintParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams, RenameParams,
-    SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
-    WorkspaceFolder,
+    InitializeParams, InitializeResult, InitializedParams, InlayHintParams,
+    PublishDiagnosticsParams, RenameParams, SignatureHelpParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextDocumentSyncKind,
+    Uri, VersionedTextDocumentIdentifier, WorkspaceFolder,
 };
 use scrive_core::{
-    document, intel, Bias, CompletionRequest, CompletionTrigger, DefinitionRequest, DocId, FormatRequest,
-    HoverRequest, RenameRequest, Revision, SignatureRequest, Snapshot, Ticket,
+    document, intel, Bias, CompletionRequest, CompletionTrigger, DefinitionRequest, DocId,
+    FormatRequest, HoverRequest, RenameRequest, Revision, SignatureRequest, Snapshot, Ticket,
 };
 use serde_json::Value;
 
 use crate::message::{self, Message};
 use crate::update::{self, jump, Update};
-use crate::{
-    completion, diagnostics, edits, hover, inlay, signature, uri, workspace, Encoding,
-};
+use crate::{completion, diagnostics, edits, hover, inlay, signature, uri, workspace, Encoding};
 
 /// JSON-RPC's "method not found": a server request this client does not implement.
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -197,6 +195,7 @@ enum Kind {
     Rename,
     Format,
     Inlays,
+    Tooltip,
 }
 
 /// What a pending request asked, with what its reply needs.
@@ -213,6 +212,18 @@ enum Query {
     Format { tab_size: u32 },
     /// The inlay hints over `span`.
     Inlays { span: Range<u32> },
+    /// `inlayHint/resolve` of the hint under `key`, for the tooltip of `part`. `hint` is the raw
+    /// hint as the server sent it.
+    Resolve {
+        key: intel::inlay::Key,
+        part: u32,
+        hint: Value,
+    },
+    /// `textDocument/hover` at a label part's location, in any document, for a hint tooltip.
+    LocationHover {
+        uri: Uri,
+        position: lsp_types::Position,
+    },
 }
 
 impl Client {
@@ -584,6 +595,80 @@ impl Client {
         self.send(doc_id, ticket, query, None)
     }
 
+    /// Answers a gesture on an inlay hint from the document's last hint answer.
+    ///
+    /// - A tooltip answers [`update::Change::InlayTooltip`]: the tooltip the hint already has,
+    ///   else one `inlayHint/resolve` when the server resolves, else the hover at the hovered
+    ///   part's location, else `None`.
+    /// - A jump answers [`update::Change::Definition`] with the part's location as a target.
+    /// - An insert answers [`update::Change::Edits`] with the hint's text edits.
+    ///
+    /// Each answers under the gesture's ticket. When the ticket, the synced text and the hint
+    /// answer are not all at one revision, the hint is unknown, or the server is not running, the
+    /// gesture is declined with its empty answer: no tooltip, no target, or no edits. A gesture
+    /// for a document that is not registered gets nothing.
+    pub fn interact(
+        &mut self,
+        snapshot: &Snapshot,
+        interaction: &intel::inlay::Interaction,
+    ) -> Output {
+        let doc_id = snapshot.doc_id();
+        let ticket = interaction.ticket();
+        let key = interaction.key();
+        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
+            return Output::default();
+        };
+        let current = ticket.revision() == snapshot.revision()
+            && snapshot.revision() == tracked.synced.revision();
+        let set = tracked
+            .inlays
+            .as_ref()
+            .filter(|set| current && set.revision() == ticket.revision());
+        let (Some(set), State::Running(server)) = (set, &self.state) else {
+            return Output::answer(doc_id, ticket, declined(interaction));
+        };
+        let Some(stored) = set.get(key) else {
+            return Output::answer(doc_id, ticket, declined(interaction));
+        };
+        match interaction.gesture() {
+            intel::inlay::interaction::Gesture::Tooltip { part } => {
+                if let Some(markdown) = stored.tooltip(part) {
+                    return Output::answer(
+                        doc_id,
+                        ticket,
+                        update::Change::InlayTooltip(Some(markdown)),
+                    );
+                }
+                if server.inlay == Some(capabilities::Resolve::Supported) && stored.resolvable() {
+                    let hint = stored.raw().clone();
+                    return self.send(doc_id, ticket, Query::Resolve { key, part, hint }, None);
+                }
+                let location = stored.location(part).cloned();
+                self.hover_location(doc_id, ticket, location, None)
+            }
+            intel::inlay::interaction::Gesture::Jump { part } => {
+                let target = stored.location(part).and_then(|location| {
+                    self.target(
+                        doc_id,
+                        set.snapshot(),
+                        set.revisions(),
+                        uri::normalize(&location.uri),
+                        location.range,
+                    )
+                });
+                Output::answer(doc_id, ticket, update::Change::Definition(target))
+            }
+            intel::inlay::interaction::Gesture::Insert { .. } => {
+                let ops = edits::hygiene(
+                    edits::Text::Snapshot(set.snapshot()),
+                    self.encoding,
+                    stored.text_edits(),
+                );
+                Output::answer(doc_id, ticket, update::Change::Edits(ops))
+            }
+        }
+    }
+
     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
     /// it leads exactly from what the server has to `snapshot`, and the server syncs
     /// incrementally, the edits go out as ranges; otherwise the whole text goes out. Servers that
@@ -855,7 +940,9 @@ impl Client {
             | Query::Definition { .. }
             | Query::Rename { .. }
             | Query::Format { .. }
-            | Query::Inlays { .. }) => self.send(
+            | Query::Inlays { .. }
+            | Query::Resolve { .. }
+            | Query::LocationHover { .. }) => self.send(
                 entry.doc_id,
                 entry.latest_ticket,
                 query,
@@ -873,6 +960,10 @@ impl Client {
             Query::Rename { .. } => self.renamed(entry, value),
             Query::Format { .. } => self.formatted(entry, value),
             Query::Inlays { span } => Ok(self.inlaid(entry, span, value)),
+            Query::Resolve { key, part, .. } => {
+                Ok(self.tooltip_resolved(entry, *key, *part, value))
+            }
+            Query::LocationHover { .. } => Ok(self.location_hovered(entry, value)),
         }
     }
 
@@ -1002,12 +1093,12 @@ impl Client {
             return output;
         };
         let revisions = match query.kind() {
-            Kind::Definition | Kind::Rename => self
+            Kind::Definition | Kind::Rename | Kind::Inlays => self
                 .tracked
                 .iter()
                 .map(|t| (t.key.clone(), t.synced.revision()))
                 .collect(),
-            Kind::Completion | Kind::Signature | Kind::Hover | Kind::Format | Kind::Inlays => {
+            Kind::Completion | Kind::Signature | Kind::Hover | Kind::Format | Kind::Tooltip => {
                 Vec::new()
             }
         };
@@ -1131,12 +1222,121 @@ impl Client {
             .inlays
             .take()
             .filter(|set| set.revision() == snapshot.revision());
-        let (set, placed) = inlay::Set::install(snapshot, fetched, previous, next_inlay);
+        let (set, placed) = inlay::Set::install(
+            snapshot,
+            entry.revisions.clone(),
+            fetched,
+            previous,
+            next_inlay,
+        );
         tracked.inlays = Some(set);
         Output::answer(
             entry.doc_id,
             entry.latest_ticket,
             update::Change::Inlays(Some(placed)),
+        )
+    }
+
+    /// Adds the resolved hint's tooltips to the stored hint, then answers from it, or falls back
+    /// to the hover at the part's location.
+    fn tooltip_resolved(
+        &mut self,
+        entry: &Pending,
+        key: intel::inlay::Key,
+        part: u32,
+        value: Value,
+    ) -> Output {
+        let Ok(resolved) = serde_json::from_value::<lsp_types::InlayHint>(value) else {
+            return entry.failed();
+        };
+        let revision = entry.latest_ticket.revision();
+        let stored = self
+            .tracked
+            .iter_mut()
+            .find(|t| t.doc_id == entry.doc_id)
+            .and_then(|t| t.inlays.as_mut())
+            .filter(|set| set.revision() == revision)
+            .and_then(|set| set.get_mut(key));
+        let Some(stored) = stored else {
+            return Output::answer(
+                entry.doc_id,
+                entry.latest_ticket,
+                update::Change::InlayTooltip(None),
+            );
+        };
+        stored.absorb(resolved);
+        if let Some(markdown) = stored.tooltip(part) {
+            return Output::answer(
+                entry.doc_id,
+                entry.latest_ticket,
+                update::Change::InlayTooltip(Some(markdown)),
+            );
+        }
+        let location = stored.location(part).cloned();
+        self.hover_location(
+            entry.doc_id,
+            entry.latest_ticket,
+            location,
+            entry.reissued_for,
+        )
+    }
+
+    /// Asks for the hover at a hint part's `location`, or answers no tooltip when there is none,
+    /// the server has no hover, or the location is in another open document that moved since
+    /// the hints were fetched.
+    fn hover_location(
+        &mut self,
+        doc_id: DocId,
+        ticket: Ticket,
+        location: Option<lsp_types::Location>,
+        reissued_for: Option<Ticket>,
+    ) -> Output {
+        let none = || Output::answer(doc_id, ticket, update::Change::InlayTooltip(None));
+        let Some(location) = location else {
+            return none();
+        };
+        if !matches!(&self.state, State::Running(server) if server.hover) {
+            return none();
+        }
+        let Some(set) = self
+            .tracked
+            .iter()
+            .find(|t| t.doc_id == doc_id)
+            .and_then(|t| t.inlays.as_ref())
+        else {
+            return none();
+        };
+        let key = uri::normalize(&location.uri);
+        // The requesting document needs no check: its set is at the synced revision.
+        let moved = self
+            .tracked
+            .iter()
+            .find(|t| t.key == key && t.doc_id != doc_id)
+            .is_some_and(|other| {
+                revision_of(set.revisions(), &key) != Some(other.synced.revision())
+            });
+        if moved {
+            return none();
+        }
+        let query = Query::LocationHover {
+            uri: location.uri,
+            position: location.range.start,
+        };
+        self.send(doc_id, ticket, query, reissued_for)
+    }
+
+    /// Answers the ticket with the hover at a label part's location, as tooltip markdown.
+    fn location_hovered(&self, entry: &Pending, value: Value) -> Output {
+        let Ok(reply) = serde_json::from_value::<Option<lsp_types::Hover>>(value) else {
+            return entry.failed();
+        };
+        let markdown = reply
+            .map(|reply| hover::contents(reply.contents))
+            .filter(|markdown| !markdown.trim().is_empty());
+        Output::answer(
+            entry.doc_id,
+            entry.latest_ticket,
+            update::Change::InlayTooltip(markdown),
         )
     }
 
@@ -1506,6 +1706,11 @@ impl Pending {
                 self.latest_ticket,
                 update::Change::Inlays(None),
             ),
+            Query::Resolve { .. } | Query::LocationHover { .. } => Output::answer(
+                self.doc_id,
+                self.latest_ticket,
+                update::Change::InlayTooltip(None),
+            ),
             // `settled` reports command failures as errors before they get here.
             Query::Definition { .. } | Query::Rename { .. } | Query::Format { .. } => {
                 Output::default()
@@ -1518,7 +1723,9 @@ impl Kind {
     /// Whether the user asked for this request, so its failure is reported rather than settled.
     fn is_command(self) -> bool {
         match self {
-            Kind::Completion | Kind::Signature | Kind::Hover | Kind::Inlays => false,
+            Kind::Completion | Kind::Signature | Kind::Hover | Kind::Inlays | Kind::Tooltip => {
+                false
+            }
             Kind::Definition | Kind::Rename | Kind::Format => true,
         }
     }
@@ -1534,6 +1741,7 @@ impl Query {
             Query::Rename { .. } => Kind::Rename,
             Query::Format { .. } => Kind::Format,
             Query::Inlays { .. } => Kind::Inlays,
+            Query::Resolve { .. } | Query::LocationHover { .. } => Kind::Tooltip,
         }
     }
 
@@ -1548,6 +1756,8 @@ impl Query {
             Query::Rename { .. } => lsp_types::request::Rename::METHOD,
             Query::Format { .. } => lsp_types::request::Formatting::METHOD,
             Query::Inlays { .. } => lsp_types::request::InlayHintRequest::METHOD,
+            Query::Resolve { .. } => lsp_types::request::InlayHintResolveRequest::METHOD,
+            Query::LocationHover { .. } => lsp_types::request::HoverRequest::METHOD,
         }
     }
 
@@ -1558,8 +1768,9 @@ impl Query {
             Query::Signature(query) => query.caret,
             Query::Hover(query) => query.offset,
             Query::Definition { offset } | Query::Rename { offset, .. } => *offset,
-            // Formatting covers the whole document and asks at no caret.
-            Query::Format { .. } => 0,
+            // Formatting, resolves and location hovers ask at no caret in the requesting
+            // document.
+            Query::Format { .. } | Query::Resolve { .. } | Query::LocationHover { .. } => 0,
             // A fetch covers a span; its start stands in for the caret.
             Query::Inlays { span } => span.start,
         }
@@ -1573,6 +1784,7 @@ impl Query {
         encoding: Encoding,
         snapshot: &Snapshot,
     ) -> message::Request {
+        use lsp_types::request::Request;
         match self {
             Query::Completion(query) => message::Request::new::<lsp_types::request::Completion>(
                 id,
@@ -1656,6 +1868,28 @@ impl Query {
                     range: encoding.range(snapshot, span.clone()),
                 },
             ),
+            Query::Resolve { hint, .. } => message::Request {
+                id,
+                method: lsp_types::request::InlayHintResolveRequest::METHOD.to_owned(),
+                params: Some(hint.clone()),
+            },
+            // The location is the server's own, in its own document and encoding, so it goes
+            // out unconverted.
+            Query::LocationHover {
+                uri: target,
+                position,
+            } => message::Request::new::<lsp_types::request::HoverRequest>(
+                id,
+                HoverParams {
+                    text_document_position_params: TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: target.clone(),
+                        },
+                        position: *position,
+                    },
+                    work_done_progress_params: Default::default(),
+                },
+            ),
         }
     }
 }
@@ -1675,6 +1909,15 @@ fn cancel(id: message::Id) -> Message {
         method: "$/cancelRequest".to_owned(),
         params: Some(serde_json::json!({ "id": id })),
     })
+}
+
+/// The empty answer to a gesture that cannot be served.
+fn declined(interaction: &intel::inlay::Interaction) -> update::Change {
+    match interaction.gesture() {
+        intel::inlay::interaction::Gesture::Tooltip { .. } => update::Change::InlayTooltip(None),
+        intel::inlay::interaction::Gesture::Jump { .. } => update::Change::Definition(None),
+        intel::inlay::interaction::Gesture::Insert { .. } => update::Change::Edits(Vec::new()),
+    }
 }
 
 /// The synced revision `key` was at when `revisions` were recorded, if it was open then.
