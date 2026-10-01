@@ -75,9 +75,11 @@ pub enum ColumnDir {
     Up,
     /// Extend/shrink the box one row down.
     Down,
-    /// Move the active column one cell left.
+    /// Move the active column one character left, or one cell past the
+    /// line's end.
     Left,
-    /// Move the active column one cell right (may go past a line's end).
+    /// Move the active column one character right, or one cell past the
+    /// line's end (it may go past it).
     Right,
 }
 

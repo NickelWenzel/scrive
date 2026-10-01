@@ -897,7 +897,7 @@ impl Document {
             let corner = self.caret_corner(&rows);
             ColumnSelection { anchor: corner, active: corner }
         });
-        col.active = Self::step_corner(rows.folds(), col.active, dir);
+        col.active = Self::step_corner(&rows, col.active, dir);
         self.column = Some(col);
         self.selections = Self::column_box(&rows, col);
     }
@@ -1035,9 +1035,11 @@ impl Document {
 
     /// Step a box corner one unit in `dir`, in display space: vertical steps
     /// walk display rows — a collapsed fold is hopped in one step — and clamp
-    /// to the document; the left cell saturates at 0; the right cell is
-    /// unbounded so it can reach past short lines.
-    fn step_corner(folds: &FoldMap, c: CellCorner, dir: ColumnDir) -> CellCorner {
+    /// to the document; left and right steps go by caret stop within the
+    /// row's content and by cell past it, saturating at 0 on the left and
+    /// unbounded on the right so the box can reach past short lines.
+    fn step_corner(rows: &Rows<'_>, c: CellCorner, dir: ColumnDir) -> CellCorner {
+        let folds = rows.folds();
         let d = folds.to_display_row(BufferRow(c.row)).index();
         let row_at = |d: u32| folds.to_buffer_row(DisplayRow(d)).0;
         match dir {
@@ -1045,8 +1047,8 @@ impl Document {
             ColumnDir::Down => {
                 CellCorner { row: row_at((d + 1).min(folds.max_display_row().index())), cell: c.cell }
             }
-            ColumnDir::Left => CellCorner { row: c.row, cell: c.cell.saturating_sub(1) },
-            ColumnDir::Right => CellCorner { row: c.row, cell: c.cell + 1 },
+            ColumnDir::Left => CellCorner { row: c.row, cell: rows.layout(BufferRow(c.row)).step_left(c.cell) },
+            ColumnDir::Right => CellCorner { row: c.row, cell: rows.layout(BufferRow(c.row)).step_right(c.cell) },
         }
     }
 
@@ -6452,6 +6454,49 @@ mod tests {
             assert!(d.remove_inlay(key, offset), "remove_inlay finds it at its shown offset");
             assert_eq!(d.inlays_in(0..d.buffer().len()).count(), before - 1, "exactly one hint goes");
         }
+    }
+
+    /// `let ab: i32 = f(n: cd); end` over `let abcdefghijklmnopqrstuvwxyz0123`.
+    fn hinted_rows() -> Document {
+        let mut d = doc("let ab = f(cd);\nlet abcdefghijklmnopqrstuvwxyz0123\n");
+        let end = hint(inlay::Kind::Other, "end", 3).padding(inlay::Padding { left: true, right: false });
+        install(&mut d, vec![(6, type_hint(": i32", 1)), (11, param_hint("n:", 2)), (15, end)]);
+        d
+    }
+
+    fn box_ranges(d: &Document) -> Vec<(u32, u32)> {
+        d.selections().all().iter().map(|s| (s.start(), s.end())).collect()
+    }
+
+    /// A box corner crosses a hint in one press, and steps back over it in
+    /// one press too.
+    #[test]
+    fn column_select_crosses_a_hint_in_one_step() {
+        use crate::movement::ColumnDir::{Left, Right, Up};
+        let mut d = hinted_rows();
+        caret(&mut d, 21);
+        d.column_select(Up);
+        d.column_select(Right);
+        d.column_select(Right);
+        assert_eq!(box_ranges(&d), vec![(5, 7), (21, 28)], "two presses reach cell 12, past `: i32`");
+        d.column_select(Left);
+        assert_eq!(box_ranges(&d), vec![(5, 6), (21, 22)], "one press back lands before the hint");
+    }
+
+    /// Past the line end, and past its end-of-line hint, the corner steps
+    /// one cell at a time.
+    #[test]
+    fn column_select_keeps_stepping_by_cell_past_the_line_end() {
+        use crate::movement::ColumnDir::{Left, Right, Up};
+        let mut d = hinted_rows();
+        caret(&mut d, 39);
+        d.column_select(Up);
+        let steps = [(Right, 43), (Right, 44), (Left, 43), (Left, 39)];
+        for (dir, head) in steps {
+            d.column_select(dir);
+            assert_eq!(box_ranges(&d)[1], (39, head), "{dir:?}: row 1 follows the corner");
+        }
+        assert_eq!(box_ranges(&d)[0], (15, 15), "row 0 clamps to its line end");
     }
 
     /// Offsets past the end or inside a char are clipped before anchoring.

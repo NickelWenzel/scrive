@@ -394,6 +394,57 @@ impl<'a> RowLayout<'a> {
         self.hit_unhinted(dc - passed, bias)
     }
 
+    /// The box corner cell one step right of `cell`: the next caret stop
+    /// while inside the line's content, one cell at a time past it.
+    pub(crate) fn step_right(&self, cell: u32) -> u32 {
+        let width = self.width();
+        if cell >= width {
+            return cell + 1;
+        }
+        let col = self.hit(cell as f32, Bias::Left);
+        let here = self.stop_cell(col);
+        if here > cell {
+            return here;
+        }
+        self.next_stop(col).map_or(width, |next| self.stop_cell(next))
+    }
+
+    /// The box corner cell one step left of `cell`, mirroring
+    /// [`Self::step_right`].
+    pub(crate) fn step_left(&self, cell: u32) -> u32 {
+        if cell > self.width() {
+            return cell - 1;
+        }
+        let col = self.hit(cell as f32, Bias::Left);
+        let here = self.stop_cell(col);
+        if here < cell {
+            return here;
+        }
+        self.prev_stop(col).map_or(0, |prev| self.stop_cell(prev))
+    }
+
+    fn stop_cell(&self, col: u32) -> u32 {
+        virtual_cell(self.caret_cell(col).cells())
+    }
+
+    /// The next landable column after `col` on this row, hopping a collapsed
+    /// inline gap.
+    fn next_stop(&self, col: u32) -> Option<u32> {
+        let ch = self.line[col as usize..].chars().next()?;
+        let next = self.row_start + col + ch.len_utf8() as u32;
+        let landed = self.spans.iter().find(|s| s.fold.hides_caret_at(next)).map_or(next, |s| s.fold.right_edge());
+        Some(landed - self.row_start)
+    }
+
+    /// The previous landable column before `col` on this row, hopping a
+    /// collapsed inline gap.
+    fn prev_stop(&self, col: u32) -> Option<u32> {
+        let ch = self.line[..col as usize].chars().next_back()?;
+        let prev = self.row_start + col - ch.len_utf8() as u32;
+        let landed = self.spans.iter().find(|s| s.fold.hides_caret_at(prev)).map_or(prev, |s| s.fold.left_edge());
+        Some(landed - self.row_start)
+    }
+
     /// [`Self::hit`] on the row without its hints: `dc` is a whole display
     /// cell with every hint left of it taken out.
     fn hit_unhinted(&self, dc: u32, bias: Bias) -> u32 {
@@ -414,8 +465,9 @@ impl<'a> RowLayout<'a> {
     }
 
     /// The row's rendered display width in cells (tab-expanded, collapsed),
-    /// including the inlay hints at the line end. A collapsed block's inline tail begins [`FOLD_PLACEHOLDER_CELLS`] past
-    /// this — see [`HeaderLayout::tail_cell`].
+    /// including the inlay hints at the line end. A collapsed block's inline
+    /// tail begins [`FOLD_PLACEHOLDER_CELLS`] past this — see
+    /// [`HeaderLayout::tail_cell`].
     #[must_use]
     pub fn width(&self) -> u32 {
         self.display_cell(self.line.len() as u32, Edge::Start)
@@ -1431,6 +1483,37 @@ mod tests {
         let got: Vec<(u32, u32)> = layout.inlays().map(|i| (i.offset, i.width)).collect();
         assert_eq!(got, vec![(at + 1, 8), (at + 1, 23)], "both after X, in server order");
         assert_eq!(layout.display_cell(at + 1, Edge::Start), at + 1 + 8 + 23, "f renders past both");
+    }
+
+    /// A box corner steps by caret stop within the content, crossing a hint,
+    /// a tab or a chip in one press, and by cell past the line end.
+    #[test]
+    fn box_steps_go_by_caret_stop_then_by_cell() {
+        let doc = main_doc();
+        let layout = doc.rows().layout(BufferRow(0));
+        let table = [
+            (5, 6, 4),
+            (6, 12, 5),
+            (9, 12, 6),
+            (12, 13, 6),
+            (15, 19, 14),
+            (16, 19, 15),
+            (22, 23, 21),
+            (23, 27, 22),
+            (27, 28, 23),
+            (28, 29, 27),
+        ];
+        for (from, right, left) in table {
+            assert_eq!((layout.step_right(from), layout.step_left(from)), (right, left), "from cell {from}: Right, Left");
+        }
+        assert_eq!(layout.step_left(0), 0, "the left edge saturates");
+
+        let doc = doc_with_folds("\tx[ab]y", &[2]);
+        let layout = doc.rows().layout(BufferRow(0));
+        let rights: Vec<u32> = std::iter::successors(Some(0), |&c| Some(layout.step_right(c))).take(7).collect();
+        assert_eq!(rights, vec![0, 4, 5, 6, 9, 10, 11], "over the tab, onto the chip's edge, across the chip");
+        let lefts: Vec<u32> = std::iter::successors(Some(10), |&c| Some(layout.step_left(c))).take(6).collect();
+        assert_eq!(lefts, vec![10, 9, 6, 5, 4, 0], "and back");
     }
 
     /// One `Rows` queries the inlay store once per row, whatever asks.
