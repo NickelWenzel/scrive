@@ -53,8 +53,9 @@ Three crates, with every dependency pointing one way:
   exposed as trait seams the integrating application implements.
 - **Language servers** (the `lsp` feature) — one client per server, many
   documents per client: incremental sync (including undo), diagnostics,
-  completion, signature help, hover, goto definition, rename across files, and
-  formatting. Late replies are dropped, never applied to text that moved.
+  completion, signature help, hover, goto definition, rename across files,
+  formatting, and inlay hints. Late replies are dropped, never applied to text
+  that moved.
 - **Diagnostics** — squiggles, a diagnostic hover, and scrollbar overview marks.
 
 Every derived position — a caret, a find match, a diagnostic, a snippet stop — is
@@ -124,9 +125,11 @@ let (mut client, initialize) = lsp::Client::builder().root(root).build();
 let mut outgoing = vec![initialize];
 outgoing.extend(editor.open_lsp(&mut client, &file, "rust")?);
 
-// After every editor update: sync, and send what it returns.
+// After every editor update: sync, send what it returns, and route its jump.
 let task = editor.update(event, now).map(Message::Editor);
-let outgoing = editor.sync_lsp(&mut client);
+let synced = editor.sync_lsp(&mut client);
+let mut outgoing = synced.messages;
+// synced.jump: a hint's label part in another tab — call that editor's jump().
 
 // For every message from the server.
 let output = client.receive(message)?;
@@ -140,6 +143,11 @@ for update in output.updates {
     }
 }
 ```
+
+Inlay hints are opt-in per editor: `.inlay_hints(true)`, or `set_inlay_hints` at
+runtime. The editor schedules the fetches itself, and `sync_lsp` sends them.
+Hovering a hint shows its tooltip, Ctrl+click on a part jumps, and a
+double-click inserts the hint's text. The library binds no toggle key.
 
 `scrive-lsp` does no I/O and builds for wasm32. `examples/lsp` runs two tabs
 against a scripted in-process server and shows the traffic.
@@ -157,9 +165,12 @@ cargo run -p scrive-iced --features lsp --example rust_analyzer -- path/to/file.
 `scratch` opens a real editor over a sample Rust document — type, select, find
 (Ctrl+F), fold, and undo/redo. `lsp` shows the traffic panel next to the
 editor. Press F12 on `greet`, F2 to rename it across both files, or Shift+Alt+F
-to format. `rust_analyzer` is native only and needs rust-analyzer on `PATH`; it
-talks to the server over stdio, and the status bar shows its messages. Its
+to format. Its main.rs shows inlay hints: Ctrl+click `name:` to jump to the
+parameter, double-click `: String` to insert it, and Ctrl+I to turn them off and
+on. `rust_analyzer` is native only and needs rust-analyzer on `PATH`; it talks
+to the server over stdio, and the status bar shows its messages. Its
 `cargo check` diagnostics refresh when you save with Ctrl+S (Cmd+S on macOS).
+It shows rust-analyzer's inlay hints; Ctrl+I toggles them.
 
 ## Web (wasm32)
 

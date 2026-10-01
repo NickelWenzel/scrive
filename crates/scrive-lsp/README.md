@@ -31,6 +31,8 @@ Payload types come from `lsp-types`, re-exported as `scrive_lsp::lsp_types`.
   rejects the whole rename.
 - **Formatting**, diffed down to the lines that changed, so carets and decorations elsewhere stay
   put.
+- **Inlay hints** for a byte span, refetched when the server asks; tooltips resolved on demand; a
+  label part's location as a jump; a hint's text edits as an edit batch.
 - **The lifecycle**: `initialize`, `initialized`, `shutdown`, `exit`. Opens made before the
   handshake are sent once it completes.
 - **Server requests** (`workspace/configuration`, `client/registerCapability`,
@@ -43,13 +45,15 @@ Enable `scrive-iced`'s `lsp` feature: it re-exports this crate as `scrive_iced::
 
 - `open_lsp` registers the editor's document with a client.
 - `sync_lsp`, called after every `update`, mirrors edits and sends the requests the editor
-  recorded.
+  recorded, including the inlay hint fetches and the gestures on hints.
 - `apply_lsp` applies one `Update::Document` to the editor it is for.
 - `save_lsp`, called after writing the document to disk, syncs and sends `didSave`.
 - `jump` selects a definition that another editor's `apply_lsp` returned.
 - `close_lsp` unregisters the document.
 
-Each returns the messages to send. `crates/scrive-iced/examples/lsp` wires two tabs to one client
+`open_lsp` and `close_lsp` return the messages to send; the others return `update::Applied`, the
+messages plus a jump into another document for the host to route (`jump` wraps it in a `Result`).
+`crates/scrive-iced/examples/lsp` wires two tabs to one client
 against a scripted server:
 
 ```bash
@@ -66,9 +70,11 @@ that `build()` returns. It registers each document with `open`, turns on the doc
 ranged edits when the log chains from what the server has, and the whole text otherwise.
 
 Requests take the request types from `scrive_core::intel` (`CompletionRequest`,
-`SignatureRequest`, `HoverRequest`, `DefinitionRequest`, `RenameRequest`, `FormatRequest`). Every
-message from the server goes to `receive`, which returns an `Output`: messages for the transport,
-plus updates.
+`SignatureRequest`, `HoverRequest`, `DefinitionRequest`, `RenameRequest`, `FormatRequest`).
+`Client::inlays(&Snapshot, &inlay::Request)` fetches inlay hints and
+`Client::interact(&Snapshot, &inlay::Interaction)` answers a gesture on one, with the request types
+from `scrive_core::intel::inlay`. Every message from the server goes to `receive`, which returns an
+`Output`: messages for the transport, plus updates.
 
 - `Update::Document` is bound for one open document. `update::Document::into_parts()` yields its
   document id, its stamp (a request ticket or a document revision) and the change. Checking the
@@ -77,6 +83,7 @@ plus updates.
   returns the edited file.
 - A definition in a file that is not open arrives as `update::jump::Unopened`:
   `Unopened::span(&text)` finds it in the file's text once the host has read it.
+- `Change::InlayRefresh` asks the host to fetch the document's inlay hints again.
 - `Update::Notification` is a server notification the client does not consume.
 
 `close` and `shutdown` end a document's and the connection's lifetime.
@@ -84,5 +91,5 @@ plus updates.
 ## What it does not do
 
 It has no transport and does no I/O, and it keeps no clock and spawns no threads. It does not
-cover references, code actions, semantic tokens, inlay hints, `prepareRename`, range and on-type
-formatting, or file operations, and an editor talks to one server.
+cover references, code actions, semantic tokens, label-part commands, `prepareRename`, range and
+on-type formatting, or file operations, and an editor talks to one server.
