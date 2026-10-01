@@ -37,6 +37,7 @@
 //! criterion benches.
 
 use crate::{Diagnostic, Document, FindQuery, Motion, SelectionSet, Severity};
+use crate::intel::inlay;
 
 /// One foldable block: 3 lines, a `mark` token for find, `fn` for a caret target.
 const BLOCK: &str = "fn f() {\n    mark = 0\n}\n";
@@ -417,4 +418,52 @@ fn diagnostic_overview_is_diag_count_independent() {
         meter_of(&mut d, |d| d.overview_marks(&bounds, &mut sev, &mut find))
     };
     assert_budget("overview: marks, k diagnostics", Budget::Constant, cell(s), cell(b));
+}
+
+// ── INLAY HINTS. The hints live in their own store and ride the windowed
+//    mover, so typing next to one costs the same whatever the set's size, and
+//    never re-sorts a store. Installing a set is one sort, charged per hint. ──
+
+/// A `k`-block document with a type hint after each block's `fn`.
+fn hinted(k: usize) -> Document {
+    let mut d = build(k);
+    let placed: Vec<inlay::Placed> = (0..k).map(|i| inlay::Placed::new(block_start(i) + 2, type_hint(i))).collect();
+    let revision = d.revision();
+    let _ = d.set_inlays(revision, placed);
+    d
+}
+
+fn type_hint(i: usize) -> inlay::Hint {
+    let label = vec![inlay::Part::new(": u8", inlay::Link::None)];
+    inlay::Hint::new(inlay::Kind::Type, label, inlay::Key::new(i as u64)).expect("a visible label")
+}
+
+#[test]
+fn typing_next_to_a_hint_is_hint_count_independent() {
+    use crate::decorations::DECORATION_SORTS;
+    let (s, b) = (1000usize, 2000usize);
+    let cell = |k: usize| {
+        let mut d = hinted(k);
+        d.set_selections(SelectionSet::new(block_start(k / 2) + 2));
+        let sorts = DECORATION_SORTS.with(std::cell::Cell::get);
+        let work = meter_of(&mut d, |d| d.type_char('x'));
+        assert_eq!(DECORATION_SORTS.with(std::cell::Cell::get), sorts, "a keystroke never re-sorts a store");
+        work
+    };
+    assert_budget("inlays: type at a hint, k hints", Budget::Constant, cell(s), cell(b));
+}
+
+#[test]
+fn installing_hints_is_linear() {
+    const BLOCKS: usize = 2000;
+    let (s, b) = (1000usize, 2000usize);
+    let cell = |k: usize| {
+        let mut d = build(BLOCKS);
+        let placed: Vec<inlay::Placed> = (0..k).map(|i| inlay::Placed::new(block_start(i) + 2, type_hint(i))).collect();
+        let revision = d.revision();
+        meter_of(&mut d, |d| {
+            let _ = d.set_inlays(revision, placed);
+        })
+    };
+    assert_budget("inlays: install, k hints", Budget::Linear, cell(s), cell(b));
 }
