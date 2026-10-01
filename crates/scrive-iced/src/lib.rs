@@ -57,7 +57,7 @@ pub mod metrics;
 pub mod popup;
 
 pub use code_editor::{CodeEditor, Event};
-pub use editor::{default_autoscroll_margin, Action, Editor, SCROLLBAR_WIDTH};
+pub use editor::{default_autoscroll_margin, Action, Editor, Wake, SCROLLBAR_WIDTH};
 pub use metrics::Metrics;
 
 /// The Language Server Protocol bridge, re-exported so a host names one crate:

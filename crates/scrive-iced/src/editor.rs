@@ -393,6 +393,28 @@ pub enum Action {
         /// `true` = unfold (`Ctrl+Shift+]`), `false` = fold (`Ctrl+Shift+[`).
         unfold: bool,
     },
+    /// The wait requested through [`Editor::wake_after`] with this generation
+    /// is over. Published once per generation.
+    Wake(u64),
+}
+
+/// A request to be woken, for [`Editor::wake_after`]: once `delay` has
+/// passed, the widget publishes [`Action::Wake`] with `generation`.
+///
+/// The delay counts from the first frame that sees a generation, on the
+/// widget's own clock, so a request made outside `update` (an answer from a
+/// server) fires neither early nor late. A new generation restarts the delay.
+/// `cap` bounds the wait across a run of generations: counted from the first
+/// generation seen since the last wake, the widget wakes after at most `cap`
+/// however often the generation changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wake {
+    /// Names this request; the woken action carries it back.
+    pub generation: u64,
+    /// How long after the widget first sees this generation it wakes.
+    pub delay: Duration,
+    /// The longest wait across a run of generations, if any.
+    pub cap: Option<Duration>,
 }
 
 impl Action {
@@ -432,6 +454,7 @@ impl Action {
                 | Action::Format
                 | Action::ToggleFold { .. }
                 | Action::FoldAtCarets { .. }
+                | Action::Wake(_)
                 // These verbs reveal through the core's request_reveal —
                 // bumped only when something actually changed, so a no-op F8 /
                 // bracket jump / edge add-caret / Ctrl+D never yanks the viewport
@@ -561,6 +584,15 @@ struct State {
     /// position, so a host that renders another document here (a tab switch)
     /// would otherwise hand it the old document's scroll, drags and hover.
     doc: Option<DocId>,
+    /// The `wake_after` generation the widget last stamped, and the instant
+    /// it fires.
+    wake: Option<(u64, Instant)>,
+    /// When the widget first saw a generation since its last wake; the cap
+    /// counts from here, so a run of generations still wakes.
+    wake_first_seen: Option<Instant>,
+    /// The generation already published, so a frame that sees it again stays
+    /// quiet.
+    wake_fired: Option<u64>,
 }
 
 impl Default for State {
@@ -592,6 +624,9 @@ impl Default for State {
             fold_preview: None,
             hover_chip: None,
             doc: None,
+            wake: None,
+            wake_first_seen: None,
+            wake_fired: None,
         }
     }
 }
@@ -666,6 +701,8 @@ pub struct Editor<'a, Message> {
     /// The word an in-flight async hover request is about, if any
     /// (app-supplied). A pointer move that stays inside it keeps the request.
     hover_pending: Option<Range<u32>>,
+    /// The pending [`Editor::wake_after`] request, if any.
+    wake: Option<Wake>,
     font: Font,
     size: f32,
     line_height: f32,
@@ -684,6 +721,7 @@ impl<'a, Message> Editor<'a, Message> {
             signature: None,
             hover: None,
             hover_pending: None,
+            wake: None,
             font: crate::DEFAULT_FONT,
             size: DEFAULT_SIZE,
             line_height: default_line_height(DEFAULT_SIZE),
@@ -726,6 +764,19 @@ impl<'a, Message> Editor<'a, Message> {
     #[must_use]
     pub fn hover_pending(mut self, word: Option<Range<u32>>) -> Self {
         self.hover_pending = word;
+        self
+    }
+
+    /// Ask to be woken: [`Action::Wake`] is published once the [`Wake`]'s
+    /// delay has passed. Pass the same request every frame until it is
+    /// answered; a new generation restarts the delay, and `None` cancels it.
+    ///
+    /// The widget keeps time from the `RedrawRequested` frames it receives, so
+    /// a widget that is not in the view tree (a hidden tab) never wakes, and a
+    /// minimised or occluded window may not wake until it is shown again.
+    #[must_use]
+    pub fn wake_after(mut self, wake: Option<Wake>) -> Self {
+        self.wake = wake;
         self
     }
 
@@ -2572,6 +2623,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     let until = BLINK_MS - elapsed % BLINK_MS;
                     shell.request_redraw_at(*now + Duration::from_millis(until as u64));
                 }
+                self.drive_wake(state, *now, shell);
                 // Hover idle timer: a move armed a re-arm — stamp the target
                 // instant here (accurate `now`) and schedule a redraw for it. When
                 // that redraw arrives with no intervening move, fire the query.
@@ -2724,6 +2776,41 @@ impl<Message> Editor<'_, Message> {
         let size = popup::extent(list, geo.advance(), geo.line_h());
         let origin = popup::place(anchor_x, row_top, row_bottom, size, geo.bounds());
         (origin, size)
+    }
+
+    /// Advance the `wake_after` timer on a frame at `now`: stamp a generation
+    /// the first time it is seen, then wake once its instant has passed. Runs
+    /// focused or not.
+    fn drive_wake(&self, state: &mut State, now: Instant, shell: &mut Shell<'_, Message>) {
+        let Some(wake) = self.wake else {
+            state.wake = None;
+            state.wake_first_seen = None;
+            state.wake_fired = None;
+            return;
+        };
+        if state.wake_fired == Some(wake.generation) {
+            return;
+        }
+        // Restamp before checking: a generation first seen on a late frame
+        // still waits its whole delay.
+        let at = match state.wake {
+            Some((generation, at)) if generation == wake.generation => at,
+            _ => {
+                let first_seen = *state.wake_first_seen.get_or_insert(now);
+                let at = now + wake.delay;
+                let at = wake.cap.map_or(at, |cap| at.min(first_seen + cap));
+                state.wake = Some((wake.generation, at));
+                at
+            }
+        };
+        if now >= at {
+            state.wake = None;
+            state.wake_first_seen = None;
+            state.wake_fired = Some(wake.generation);
+            shell.publish((self.on_action)(Action::Wake(wake.generation)));
+        } else {
+            shell.request_redraw_at(at);
+        }
     }
 
     /// Geometry + wrapped content for the hover popup — one source of truth,
@@ -4997,6 +5084,38 @@ mod tests {
         }))
     }
 
+    /// What one `pump_editor` call left: the published actions and the widget
+    /// cache.
+    struct Pumped {
+        actions: Vec<Action>,
+        cache: iced_runtime::user_interface::Cache,
+    }
+
+    /// Run `events` through a one-editor UI built from `editor` with the
+    /// pointer at `at`, keeping the widget state in `cache` across calls.
+    fn pump_editor(
+        editor: Editor<'_, Action>,
+        cache: iced_runtime::user_interface::Cache,
+        renderer: &mut iced::Renderer,
+        at: Point,
+        events: &[iced::Event],
+    ) -> Pumped {
+        use iced::advanced::shell;
+        use iced_runtime::user_interface::UserInterface;
+        let element: iced::Element<'_, Action, iced::Theme, iced::Renderer> = editor.into();
+        let mut ui = UserInterface::build(element, Size::new(500.0, 320.0), cache, renderer);
+        let mut bus = shell::Bus::new();
+        let _ = ui.update(
+            &iced::window::Headless,
+            &shell::Waker::noop(),
+            events,
+            mouse::Cursor::Available(at),
+            renderer,
+            &mut bus,
+        );
+        Pumped { actions: bus.into_iter().collect(), cache: ui.into_cache() }
+    }
+
     /// Run `events` through a one-editor UI over `doc` with the pointer at `at`
     /// and `pending` as the in-flight hover word, keeping the widget state in
     /// `cache` across calls. Returns the published actions and the cache.
@@ -5008,21 +5127,131 @@ mod tests {
         at: Point,
         events: &[iced::Event],
     ) -> (Vec<Action>, iced_runtime::user_interface::Cache) {
-        use iced::advanced::shell;
-        use iced_runtime::user_interface::UserInterface;
-        let element: iced::Element<'_, Action, iced::Theme, iced::Renderer> =
-            Editor::new(doc, |a| a).hover_pending(pending).into();
-        let mut ui = UserInterface::build(element, Size::new(500.0, 320.0), cache, renderer);
-        let mut bus = shell::Bus::new();
-        let _ = ui.update(
-            &iced::window::Headless,
-            &shell::Waker::noop(),
-            events,
-            mouse::Cursor::Available(at),
-            renderer,
-            &mut bus,
-        );
-        (bus.into_iter().collect(), ui.into_cache())
+        let p = pump_editor(Editor::new(doc, |a| a).hover_pending(pending), cache, renderer, at, events);
+        (p.actions, p.cache)
+    }
+
+    /// A frame at `t0 + ms`.
+    fn frame(t0: Instant, ms: u64) -> iced::Event {
+        iced::Event::Window(window::Event::RedrawRequested(t0 + Duration::from_millis(ms)))
+    }
+
+    /// The generations woken among `actions`.
+    fn wakes(actions: &[Action]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Wake(g) => Some(*g),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Pump one frame at each of `times` (ms), handing the widget
+    /// `request(ms)` on that frame, and list `(ms, generation)` for every wake.
+    fn wake_log(times: impl IntoIterator<Item = u64>, request: impl Fn(u64) -> Option<Wake>) -> Vec<(u64, u64)> {
+        let doc = Document::new("x\n").expect("doc fits");
+        let mut r = headless_renderer();
+        let t0 = Instant::now();
+        let mut cache = iced_runtime::user_interface::Cache::new();
+        let mut log = Vec::new();
+        for ms in times {
+            let ed = Editor::new(&doc, |a| a).wake_after(request(ms));
+            let p = pump_editor(ed, cache, &mut r, Point::new(200.0, 5.0), &[frame(t0, ms)]);
+            cache = p.cache;
+            log.extend(wakes(&p.actions).into_iter().map(|g| (ms, g)));
+        }
+        log
+    }
+
+    /// A wake `delay` ms long with `generation` and an optional cap.
+    fn wake(generation: u64, delay: u64, cap: Option<u64>) -> Option<Wake> {
+        Some(Wake { generation, delay: Duration::from_millis(delay), cap: cap.map(Duration::from_millis) })
+    }
+
+    /// A request fires once, on the first frame at or past its delay, and a
+    /// frame that still passes it afterwards stays quiet.
+    #[test]
+    fn a_wake_fires_once_after_its_delay() {
+        let log = wake_log([0, 299, 300, 400], |_| wake(1, 300, None));
+        assert_eq!(log, vec![(300, 1)], "one wake, at 300 ms");
+    }
+
+    /// Passing a new generation restarts the delay from the frame that first
+    /// sees it, and the superseded generation never wakes.
+    #[test]
+    fn a_new_generation_restarts_the_delay() {
+        let log = wake_log([0, 200, 300, 499, 500], |ms| if ms < 200 { wake(1, 300, None) } else { wake(2, 300, None) });
+        assert_eq!(log, vec![(500, 2)], "generation 2 wakes 300 ms after 200");
+    }
+
+    /// A request made while the widget was idle counts its delay from the
+    /// first frame that sees it, not from some earlier clock.
+    #[test]
+    fn a_wake_counts_its_delay_from_the_first_frame_that_sees_it() {
+        let log = wake_log([0, 10_000, 10_299, 10_300], |ms| if ms < 10_000 { None } else { wake(1, 300, None) });
+        assert_eq!(log, vec![(10_300, 1)], "the wait starts at 10 000 ms, so it ends at 10 300");
+    }
+
+    /// A capped wait wakes at its cap while every frame passes a new
+    /// generation, instead of restarting forever.
+    #[test]
+    fn a_capped_wake_fires_at_the_max_wait_while_generations_keep_changing() {
+        let log = wake_log((0..=20).map(|i| i * 16), |ms| wake(ms / 16, 75, Some(300)));
+        assert_eq!(log, vec![(304, 19)], "the first frame at or past 300 ms wakes");
+    }
+
+    /// A second of continuous scrolling, a new generation per frame, wakes
+    /// once per cap: about three times, not never and not per frame.
+    #[test]
+    fn a_one_second_scroll_drag_wakes_about_three_times() {
+        let log = wake_log((0..=62).map(|i| i * 16), |ms| wake(ms / 16, 75, Some(300)));
+        let at: Vec<u64> = log.iter().map(|&(ms, _)| ms).collect();
+        assert_eq!(at, vec![304, 624, 944], "each wake restarts the max-wait clock");
+    }
+
+    /// Cancelling with `None` restarts the max-wait clock, so a later run of
+    /// capped generations waits its whole cap.
+    #[test]
+    fn wake_after_none_restarts_the_max_wait_clock() {
+        let log = wake_log((0..=40).map(|i| i * 16), |ms| if ms == 208 { None } else { wake(ms / 16, 75, Some(300)) });
+        let first = log.first().map(|&(ms, _)| ms);
+        assert_eq!(first, Some(528), "the cap counts from 224, not 0: {log:?}");
+    }
+
+    /// The timer runs while the editor is unfocused: a wake belongs to the
+    /// host, not to the caret.
+    #[test]
+    fn a_wake_fires_while_the_editor_is_unfocused() {
+        let doc = Document::new("x\n").expect("doc fits");
+        let mut r = headless_renderer();
+        let outside = Point::new(600.0, 5.0);
+        let press = iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+        let ed = Editor::new(&doc, |a| a).wake_after(wake(1, 0, None));
+        let p = pump_editor(ed, iced_runtime::user_interface::Cache::new(), &mut r, outside, &[press, frame(Instant::now(), 0)]);
+        assert_eq!(wakes(&p.actions), vec![1], "a press outside unfocuses, and the wake still fires");
+    }
+
+    /// Rendering another document in the same tree position drops the old
+    /// document's pending wake.
+    #[test]
+    fn rendering_another_document_resets_the_wake_timer() {
+        use iced::advanced::widget::Tree;
+        let a = Document::new("one\n").expect("doc fits");
+        let b = Document::new("two\n").expect("doc fits");
+        let on_a = Editor::new(&a, |x: Action| x);
+        let mut tree = Tree::new(&on_a as &dyn Widget<Action, iced::Theme, iced::Renderer>);
+        {
+            let st = tree.state.downcast_mut::<State>();
+            let now = Instant::now();
+            st.wake = Some((3, now));
+            st.wake_first_seen = Some(now);
+            st.wake_fired = Some(2);
+        }
+        let mut on_b = Editor::new(&b, |x: Action| x);
+        Widget::<Action, iced::Theme, iced::Renderer>::diff(&mut on_b, &mut tree);
+        let st = tree.state.downcast_ref::<State>();
+        assert_eq!((st.wake, st.wake_first_seen, st.wake_fired), (None, None, None), "the wake belongs to the old document");
     }
 
     /// A document whose first row is one 240-char word, so any x in the code

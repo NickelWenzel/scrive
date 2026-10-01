@@ -910,6 +910,7 @@ impl CodeEditor {
                 self.pending_format_request = Some(FormatRequest::new(ticket, default_indent_size()));
                 Task::none()
             }
+            Event::Editor(Action::Wake(_)) => Task::none(),
             Event::Editor(action) => {
                 self.apply(action);
                 Task::none()
@@ -1519,7 +1520,8 @@ impl CodeEditor {
             | Action::Rename
             | Action::Format
             | Action::ToggleFold { .. }
-            | Action::FoldAtCarets { .. } => {}
+            | Action::FoldAtCarets { .. }
+            | Action::Wake(_) => {}
         }
         self.after_edit(comp_event);
         // Dirty only on an actual text change — a bare caret move / selection must
