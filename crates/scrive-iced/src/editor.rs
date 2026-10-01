@@ -38,7 +38,7 @@ use scrive_core::{
     HighlightSpan, HoverInfo, Motion, Point as BufPoint, PopupList, RevealMode, RowLayout, Severity,
     SignatureInfo, HOVER_IDLE_DELAY_MS,
 };
-use scrive_core::row_layout::{Edge, Rows};
+use scrive_core::row_layout::{self, Edge, Rows};
 
 use crate::geo::{Geo, ScrollAnchor, CHIP_PILL_RADIUS, TEXT_PAD};
 use crate::popup;
@@ -198,6 +198,10 @@ const FOLD_BOX_SCAN_ROWS: u32 = 512;
 /// text-color tint visible enough to trace a symbol, quiet enough to read past.
 /// Suppressed while find is live (its amber wash owns the screen then).
 const OCCURRENCE_MATCH: Color = Color::from_rgba8(0xf7, 0xf1, 0xff, 0.09);
+
+/// Alpha of an inlay hint's label over the text colour: readable on its pill
+/// and on a selection wash, and never mistaken for buffer text.
+const INLAY_TEXT_A: f32 = 0.6;
 /// Diagnostic squiggle geometry (field-calibrated): the wave's half-period
 /// (zero-to-zero), amplitude, and stroke, in px.
 const SQUIGGLE_HALF_PERIOD: f32 = 2.0;
@@ -2933,6 +2937,24 @@ impl<Message> Editor<'_, Message> {
         range_covered_by(self.doc.selections().all(), start, end)
     }
 
+    /// Whether offset `p` lies strictly inside some selection (`start < p <
+    /// end`): exactly when a hint there is washed, so its pill would island in
+    /// the wash.
+    fn hint_selected(&self, p: u32) -> bool {
+        p > 0 && range_covered_by(self.doc.selections().all(), p - 1, p + 1)
+    }
+
+    /// The pill behind `inlay`'s label on the row at `row_top`, or `None` where
+    /// a selection wash already backs it.
+    fn inlay_pill(&self, inlay: &row_layout::Inlay<'_>, geo: &Geo, row_top: f32) -> Option<Rectangle> {
+        if self.hint_selected(inlay.offset) {
+            return None;
+        }
+        let first = inlay.cell + u32::from(inlay.padding.left);
+        let label = inlay.width - u32::from(inlay.padding.left) - u32::from(inlay.padding.right);
+        Some(geo.inlay_pill(geo.cell_x(first as f32), geo.cell_x((first + label) as f32), row_top))
+    }
+
     fn draw_selection(&self, renderer: &mut iced::Renderer, rows: &Rows<'_>, geo: &Geo, start: u32, end: u32, color: Color) {
         let buffer = self.doc.buffer();
         let fold_map = rows.folds();
@@ -3116,12 +3138,14 @@ impl<Message> Editor<'_, Message> {
         rows.hit(row, geo.x_cell(pos.x), scrive_core::Bias::Left)
     }
 
-    /// Draw a row that has inline (single-line) folds: its highlight spans with a
-    /// per-fold horizontal collapse — the bytes between each pair's brackets hide,
-    /// later cells shift left, and a `…` chip fills the gap.
-    /// The delimiters keep their span color; the closer stays a real position.
-    /// All cell math comes from the core's one [`RowLayout`] owner.
-    #[allow(clippy::too_many_arguments)]
+    /// Draw a row that has inline (single-line) folds or inlay hints: its
+    /// highlight spans with a per-fold horizontal collapse — the bytes between
+    /// each pair's brackets hide, later cells shift left, and a `…` chip fills
+    /// the gap — and each hint's label on the cells reserved for it, pushing
+    /// the text after it right. The delimiters keep their span color; the
+    /// closer stays a real position. All cell math comes from the core's one
+    /// [`RowLayout`] owner.
+    #[allow(clippy::too_many_arguments)] // the row's text, spans and layout plus the frame's colors and clip
     fn draw_row_inline(
         &self,
         renderer: &mut iced::Renderer,
@@ -3135,28 +3159,32 @@ impl<Message> Editor<'_, Message> {
         clip: Rectangle,
     ) {
         let advance = geo.advance();
-        let seg = |renderer: &mut iced::Renderer, text: &str, start_col: u32, color: Color| {
-            if text.is_empty() || row_layout.glyph_hidden(start_col) {
-                return;
+        let hint_cols: Vec<u32> = row_layout.inlays().map(|inlay| inlay.offset - row_layout.row_start()).collect();
+        let seg = |renderer: &mut iced::Renderer, cols: Range<u32>, color: Color| {
+            for run in split_at_columns(cols, &hint_cols) {
+                if row_layout.glyph_hidden(run.start) {
+                    continue;
+                }
+                let x = origin.x + row_layout.display_cell(run.start, Edge::Start) as f32 * advance;
+                let text = &line[run.start as usize..run.end as usize];
+                let phase = display_map::expand(line, run.start, TAB);
+                self.draw_line(renderer, expand_tabs(text, phase), Point::new(x, origin.y), color, Alignment::Left, clip);
             }
-            let x = origin.x + row_layout.display_cell(start_col, Edge::Start) as f32 * advance;
-            self.draw_line(renderer, expand_tabs(text, display_map::expand(line, start_col, TAB)), Point::new(x, origin.y), color, Alignment::Left, clip);
         };
         match spans {
             Some(spans) if !spans.is_empty() => {
                 for s in spans {
                     let fg = s.style.fg;
-                    let text = &line[s.range.start as usize..s.range.end as usize];
-                    seg(renderer, text, s.range.start, Color::from_rgb8(fg.r, fg.g, fg.b));
+                    seg(renderer, s.range.clone(), Color::from_rgb8(fg.r, fg.g, fg.b));
                 }
             }
             _ => {
                 let mut cursor = 0u32;
                 for chip in row_layout.chips() {
-                    seg(renderer, &line[cursor as usize..=chip.open_col as usize], cursor, text_color);
+                    seg(renderer, cursor..chip.open_col + 1, text_color);
                     cursor = chip.close_col;
                 }
-                seg(renderer, &line[cursor as usize..], cursor, text_color);
+                seg(renderer, cursor..line.len() as u32, text_color);
             }
         }
         // The `…` chip between each pair's brackets, centered on the collapsed gap.
@@ -3180,6 +3208,20 @@ impl<Message> Editor<'_, Message> {
                 dim
             };
             self.draw_line(renderer, "…".to_string(), Point::new(mid, origin.y), dots, Alignment::Center, clip);
+        }
+        // Padding cells stay editor background, per the LSP spec's
+        // `paddingLeft` / `paddingRight`.
+        let label_color = Color { a: INLAY_TEXT_A, ..text_color };
+        for inlay in row_layout.inlays() {
+            if let Some(pill) = self.inlay_pill(inlay, geo, origin.y) {
+                fill_rounded(renderer, pill, POPUP_SELECT, CHIP_PILL_RADIUS);
+            }
+            let mut cell = inlay.cell + u32::from(inlay.padding.left);
+            for part in inlay.hint.parts() {
+                let text = part.text();
+                self.draw_line(renderer, text.to_owned(), Point::new(origin.x + cell as f32 * advance, origin.y), label_color, Alignment::Left, clip);
+                cell += text.chars().count() as u32;
+            }
         }
     }
 
@@ -3523,6 +3565,23 @@ fn expand_tabs(run: &str, start_cell: u32) -> String {
         }
     }
     out
+}
+
+/// `range` cut at every column of `cols` (sorted, duplicates allowed) strictly
+/// inside it: the runs a highlight span paints as, so the text after a hint
+/// starts past the hint.
+fn split_at_columns(range: Range<u32>, cols: &[u32]) -> impl Iterator<Item = Range<u32>> + '_ {
+    let mut from = range.start;
+    cols.iter()
+        .copied()
+        .filter(move |&c| c > range.start && c < range.end)
+        .chain(std::iter::once(range.end))
+        .filter_map(move |c| {
+            if c <= from {
+                return None;
+            }
+            Some(std::mem::replace(&mut from, c)..c)
+        })
 }
 
 /// Map a key event to an [`Action`], or `None` if it isn't an editor input.
@@ -3974,6 +4033,7 @@ impl<'a, Message: 'a> From<Editor<'a, Message>>
 mod tests {
     use super::*;
     use iced::advanced::widget::operation;
+    use scrive_core::intel::inlay;
 
     #[test]
     fn digit_count_is_right() {
@@ -4453,6 +4513,73 @@ mod tests {
             0.0,
             ScrollAnchor::TOP,
         )
+    }
+
+    /// `text` with `hints` installed at the current revision, each `(offset,
+    /// kind, label, padding)`. The one place the tests build hints.
+    fn hinted(text: &str, hints: &[(u32, inlay::Kind, &str, inlay::Padding)]) -> Document {
+        let mut doc = Document::new(text).expect("doc fits");
+        let placed = hints
+            .iter()
+            .enumerate()
+            .map(|(i, &(offset, kind, label, padding))| {
+                let hint = inlay::Hint::new(kind, vec![inlay::Part::new(label, inlay::Link::None)], inlay::Key::new(i as u64))
+                    .expect("non-empty label")
+                    .padding(padding);
+                inlay::Placed::new(offset, hint)
+            })
+            .collect();
+        let outcome = doc.set_inlays(doc.revision(), placed);
+        assert!(matches!(outcome, inlay::Outcome::Applied { .. }), "installed at the current revision");
+        doc
+    }
+
+    /// `ab cd\nef\n` with three hints on row 0:
+    /// T = type `: i32` at 2 (Suffix on `ab`, width 5),
+    /// P = parameter `n:` + right padding at 3 (Prefix on `cd`, width 3),
+    /// E = type `: T` at 5, the line end (Suffix on `cd`, width 3).
+    fn fixture() -> Document {
+        hinted(
+            "ab cd\nef\n",
+            &[
+                (2, inlay::Kind::Type, ": i32", inlay::Padding::default()),
+                (3, inlay::Kind::Parameter, "n:", inlay::Padding { left: false, right: true }),
+                (5, inlay::Kind::Type, ": T", inlay::Padding::default()),
+            ],
+        )
+    }
+
+    /// Replace the selections with one from `anchor` to `head`.
+    fn select(doc: &mut Document, anchor: u32, head: u32) {
+        let mut set = scrive_core::SelectionSet::new(0);
+        set.set_single(scrive_core::Selection::from_anchor(scrive_core::SelectionId(0), anchor, head));
+        doc.set_selections(set);
+    }
+
+    /// A span is cut at each hint column strictly inside it; columns at its ends
+    /// and repeated columns cut nothing extra.
+    #[test]
+    fn split_at_columns_cuts_a_run_at_each_inner_column() {
+        let runs: Vec<_> = split_at_columns(0..5, &[0, 2, 3, 3, 5]).collect();
+        assert_eq!(runs, vec![0..2, 2..3, 3..5], "cut at 2 and 3 only");
+        assert_eq!(split_at_columns(2..2, &[2]).count(), 0, "an empty span paints nothing");
+    }
+
+    /// A pill is dropped only where a selection strictly contains the hint's
+    /// offset; a hint at a selection's edge keeps its pill (it is not washed).
+    #[test]
+    fn a_hint_pill_is_dropped_only_strictly_inside_a_selection() {
+        let mut doc = fixture();
+        let pills = |doc: &Document| {
+            let ed = Editor::new(doc, |_: Action| ());
+            let rows = doc.rows();
+            let layout = rows.layout(BufferRow(0));
+            layout.inlays().map(|inlay| ed.inlay_pill(inlay, &test_geo(), 0.0).is_some()).collect::<Vec<_>>()
+        };
+        select(&mut doc, 2, 3);
+        assert_eq!(pills(&doc), vec![true, true, true], "boundary hints keep their pills");
+        select(&mut doc, 1, 4);
+        assert_eq!(pills(&doc), vec![false, false, true], "T and P are washed; E is outside");
     }
 
     #[test]

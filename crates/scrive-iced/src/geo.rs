@@ -180,6 +180,14 @@ impl Geo {
         }
     }
 
+    /// The rounded pill behind an inlay hint's label, spanning screen x
+    /// `x0..x1` (the label's cells, padding excluded) on the row at `row_top`,
+    /// inset vertically like [`Self::chip_pill`] so the two placeholders line
+    /// up.
+    pub(crate) fn inlay_pill(&self, x0: f32, x1: f32, row_top: f32) -> Rectangle {
+        Rectangle { x: x0, y: row_top + 2.0, width: x1 - x0, height: self.line_h - 4.0 }
+    }
+
     /// The rounded halo box around an inline bracket span `[x0, x1]` (screen
     /// x of opener/closer) on the row at `row_top` — the ONE halo formula, so
     /// every drawn bracket halo has identical padding and rounding.
