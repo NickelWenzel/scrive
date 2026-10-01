@@ -38,6 +38,7 @@ use scrive_core::{
     HighlightSpan, HoverInfo, Motion, Point as BufPoint, PopupList, RevealMode, RowLayout, Severity,
     SignatureInfo, HOVER_IDLE_DELAY_MS,
 };
+use scrive_core::row_layout::{Edge, Rows};
 
 use crate::geo::{Geo, ScrollAnchor, CHIP_PILL_RADIUS, TEXT_PAD};
 use crate::popup;
@@ -795,14 +796,12 @@ impl<'a, Message> Editor<'a, Message> {
     /// The screen x of buffer `offset` — the one fold-aware horizontal
     /// projection. Tab expansion, inline-fold collapse, chip-center clipping,
     /// and collapsed-tail following all come from the core's one owner
-    /// ([`FoldMap::display_position`]); the pixel affix is [`Geo::cell_x`]'s.
-    /// An offset genuinely hidden inside a fold (callers never pass one —
-    /// carets, selection endpoints on visible rows, and popup anchors are
-    /// visible by construction) falls back to the text origin.
-    fn offset_screen_x(&self, fold_map: &FoldMap, geo: &Geo, offset: u32) -> f32 {
-        let cells = fold_map
-            .display_position(self.doc.buffer(), offset, TAB)
-            .map_or(0.0, |p| p.x.cells());
+    /// ([`Rows::position`], on the `edge` side of any hints); the pixel affix
+    /// is [`Geo::cell_x`]'s. An offset genuinely hidden inside a fold (callers
+    /// never pass one — carets, selection endpoints on visible rows, and popup
+    /// anchors are visible by construction) falls back to the text origin.
+    fn offset_screen_x(&self, rows: &Rows<'_>, geo: &Geo, offset: u32, edge: Edge) -> f32 {
+        let cells = rows.position(offset, edge).map_or(0.0, |p| p.x.cells());
         geo.cell_x(cells)
     }
 
@@ -812,16 +811,16 @@ impl<'a, Message> Editor<'a, Message> {
     /// display-space by construction, so a panel anchors at the display row and
     /// cannot sit too low below a fold; each panel keeps its own flip/clamp
     /// choice on top.
-    fn popup_anchor(&self, fold_map: &FoldMap, geo: &Geo, offset: u32) -> (f32, f32, f32) {
-        let top = match fold_map.display_position(self.doc.buffer(), offset, TAB) {
+    fn popup_anchor(&self, rows: &Rows<'_>, geo: &Geo, offset: u32, edge: Edge) -> (f32, f32, f32) {
+        let top = match rows.position(offset, edge) {
             Some(p) => geo.row_y(p.row),
             // Hidden offset (callers don't pass one): clip to its fold's header row.
             None => {
                 let row = self.doc.buffer().offset_to_point(offset).row;
-                geo.row_y(fold_map.to_display_row(BufferRow(row)))
+                geo.row_y(rows.folds().to_display_row(BufferRow(row)))
             }
         };
-        (self.offset_screen_x(fold_map, geo, offset), top, top + geo.line_h())
+        (self.offset_screen_x(rows, geo, offset, edge), top, top + geo.line_h())
     }
 
     /// The document's memoized fold-aware row converter — O(1) unless the
@@ -840,10 +839,11 @@ impl<'a, Message> Editor<'a, Message> {
     fn any_caret_on_screen(
         &self,
         buffer: &scrive_core::Buffer,
-        fold_map: &FoldMap,
+        rows: &Rows<'_>,
         top_rows: f64,
         viewport_rows: f64,
     ) -> bool {
+        let fold_map = rows.folds();
         let first_buf = fold_map.to_buffer_row(fold_map.display_row_at(top_rows)).0;
         let last_buf = fold_map.to_buffer_row(fold_map.display_row_at(top_rows + viewport_rows)).0;
         let vis_start = buffer.point_to_offset(BufPoint { row: first_buf, col: 0 });
@@ -852,9 +852,7 @@ impl<'a, Message> Editor<'a, Message> {
         // The partially-scrolled top row still counts as visible (floor it).
         let band = top_rows.floor()..(top_rows + viewport_rows);
         sels[visible_selection_span(sels, vis_start, vis_end)].iter().any(|s| {
-            fold_map
-                .display_position(buffer, s.head(), TAB)
-                .is_some_and(|p| band.contains(&f64::from(p.row.index())))
+            rows.position(s.head(), Edge::Caret).is_some_and(|p| band.contains(&f64::from(p.row.index())))
         })
     }
 
@@ -873,7 +871,8 @@ impl<'a, Message> Editor<'a, Message> {
     /// inline pair bounds its bracket span. `None` for an all-blank block or a pair
     /// whose header is itself hidden inside an outer collapsed fold. (Collapsed folds
     /// use [`collapsed_chip_rect`](Self::collapsed_chip_rect) instead.)
-    fn collapsible_box_rect(&self, fold_map: &FoldMap, geo: &Geo, open: u32, close: u32, header: u32, last: u32) -> Option<Rectangle> {
+    fn collapsible_box_rect(&self, rows: &Rows<'_>, geo: &Geo, open: u32, close: u32, header: u32, last: u32) -> Option<Rectangle> {
+        let fold_map = rows.folds();
         let buffer = self.doc.buffer();
         let code_left = geo.code_left();
         if fold_map.is_folded(BufferRow(header)) {
@@ -895,7 +894,7 @@ impl<'a, Message> Editor<'a, Message> {
                     continue;
                 }
                 lo = lo.min(line_indent_cells(&l));
-                hi = hi.max(fold_map.row_layout(buffer, BufferRow(r), TAB).width());
+                hi = hi.max(rows.layout(BufferRow(r)).width());
             }
             if lo == u32::MAX {
                 return None;
@@ -906,8 +905,8 @@ impl<'a, Message> Editor<'a, Message> {
             Some(Rectangle { x: x0, y: y - 1.0, width: (x1 - x0).max(geo.advance()), height: (yl + geo.line_h()) - y + 1.0 })
         } else {
             // Inline: the bracket span on the one row (shared cell projection).
-            let xo = self.offset_screen_x(fold_map, geo, open);
-            let xc = self.offset_screen_x(fold_map, geo, close);
+            let xo = self.offset_screen_x(rows, geo, open, Edge::Start);
+            let xc = self.offset_screen_x(rows, geo, close, Edge::Start);
             Some(geo.inline_halo(xo.min(xc), xo.max(xc), y))
         }
     }
@@ -918,8 +917,8 @@ impl<'a, Message> Editor<'a, Message> {
     /// instead, [`collapsed_chip_at`](Self::collapsed_chip_at)). Keying on pixel
     /// containment — not byte range — keeps the finger and click confined to the
     /// boxes you can see. The caller picks the innermost by `close - open`.
-    fn armed_boxes(&self, geo: &Geo, pos: Point) -> Vec<(u32, u32, Rectangle)> {
-        let fold_map = self.fold_map();
+    fn armed_boxes(&self, rows: &Rows<'_>, geo: &Geo, pos: Point) -> Vec<(u32, u32, Rectangle)> {
+        let fold_map = rows.folds();
         let display = fold_map.display_row_at(geo.rows_from_top(pos.y));
         let pr = fold_map.to_buffer_row(display).0;
         // Windowed: a pair spanning `pr` is headed at a row <= pr; query only
@@ -931,7 +930,7 @@ impl<'a, Message> Editor<'a, Message> {
             .into_iter()
             .filter(|&(_, _, header, last)| pr >= header && pr <= last) // cheap row pre-filter
             .filter_map(|(open, close, header, last)| {
-                let rect = self.collapsible_box_rect(&fold_map, geo, open, close, header, last)?;
+                let rect = self.collapsible_box_rect(rows, geo, open, close, header, last)?;
                 rect.contains(pos).then_some((open, close, rect))
             })
             .collect()
@@ -957,16 +956,15 @@ impl<'a, Message> Editor<'a, Message> {
     /// only the visible rows, never every line, per frame / layout / wheel tick).
     /// If the adaptive feel fails the field gate, the fallback is a document-owned
     /// line-width index (exact global max, 4 B/line).
-    fn max_line_px(&self, advance: f32, line_h: f32, bounds: Rectangle, scroll_rows: f64) -> f32 {
-        let buffer = self.doc.buffer();
-        let fold_map = self.fold_map();
+    fn max_line_px(&self, rows: &Rows<'_>, advance: f32, line_h: f32, bounds: Rectangle, scroll_rows: f64) -> f32 {
+        let fold_map = rows.folds();
         let window = fold_map
             .display_window(scroll_rows, scroll_rows + f64::from(bounds.height) / f64::from(line_h));
         fold_map
             .visible_rows(window)
-            .map(|vr| match fold_map.header_layout(buffer, vr.buffer_row, TAB) {
+            .map(|vr| match rows.header(vr.buffer_row) {
                 Some(hl) => hl.width(),
-                None => fold_map.row_layout(buffer, vr.buffer_row, TAB).width(),
+                None => rows.layout(vr.buffer_row).width(),
             })
             .max()
             .unwrap_or(0) as f32
@@ -982,8 +980,8 @@ impl<'a, Message> Editor<'a, Message> {
 
     /// Max horizontal scroll: how far the widest line overhangs the code area (a
     /// trailing `TEXT_PAD` so the last glyph isn't flush against the edge).
-    fn max_scroll_x(&self, bounds: Rectangle, advance: f32, line_h: f32, scroll_rows: f64) -> f32 {
-        (self.max_line_px(advance, line_h, bounds, scroll_rows) + TEXT_PAD
+    fn max_scroll_x(&self, rows: &Rows<'_>, bounds: Rectangle, advance: f32, line_h: f32, scroll_rows: f64) -> f32 {
+        (self.max_line_px(rows, advance, line_h, bounds, scroll_rows) + TEXT_PAD
             - self.code_area_width(bounds, advance, line_h, scroll_rows))
         .max(0.0)
     }
@@ -1034,8 +1032,8 @@ impl<'a, Message> Editor<'a, Message> {
     /// track spans the code area (gutter edge → vertical-scrollbar edge), so the
     /// two bars meet at the corner without overlapping. The mirror of
     /// `scrollbar()` on the X axis.
-    fn hscrollbar(&self, bounds: Rectangle, advance: f32, line_h: f32, scroll_x: f32, scroll_rows: f64) -> Option<HScrollbar> {
-        let max_scroll = self.max_scroll_x(bounds, advance, line_h, scroll_rows);
+    fn hscrollbar(&self, rows: &Rows<'_>, bounds: Rectangle, advance: f32, line_h: f32, scroll_x: f32, scroll_rows: f64) -> Option<HScrollbar> {
+        let max_scroll = self.max_scroll_x(rows, bounds, advance, line_h, scroll_rows);
         if max_scroll <= 0.0 {
             return None;
         }
@@ -1260,6 +1258,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         let size = limits.bounds();
         let state = tree.state.downcast_mut::<State>();
         self.ensure_metrics(state);
+        let rows = self.doc.rows();
         let (advance, line_h) = (state.metrics.advance, state.metrics.line_height);
         // Viewport rect for the scroll math (origin-independent — it uses widths
         // and the vertical-overflow test only).
@@ -1276,14 +1275,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         if state.autoscroll {
             let buffer = self.doc.buffer();
             let head = self.doc.selections().newest().head();
-            let fold_map = self.fold_map();
             // Both reveal axes read the one fold-aware projection: the row
             // in display space, the cell inline-collapse-aware — a caret past a
             // collapsed chip or riding a fold's tail reveals where it renders.
             // A HIDDEN caret (inside a fold) reveals nothing — jump verbs
             // unfold their targets first; anything else holds the viewport
             // rather than scrolling to a fake row 0.
-            if let Some(p) = fold_map.display_position(buffer, head, TAB) {
+            if let Some(p) = rows.position(head, Edge::Caret) {
                 // Row units end to end (the ScrollAnchor model): the caret's
                 // display row is exact, the viewport is a small row count.
                 let caret_row = f64::from(p.row.index());
@@ -1303,7 +1301,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                         f64::from(default_autoscroll_margin()),
                     )
                 };
-                let rows = match mode {
+                let target_rows = match mode {
                     // Find/diagnostic jumps center the target row.
                     RevealMode::Center => caret_row + 0.5 - viewport_rows / 2.0,
                     // Ctrl+D: jump to the just-added cursor even if others show.
@@ -1314,10 +1312,10 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     // the user can already see one (as mainstream editors do). A
                     // lone off-screen caret has none on screen and falls through
                     // to fit it, so single-cursor typing/moves are unchanged.
-                    RevealMode::Fit if self.any_caret_on_screen(buffer, &fold_map, cur, viewport_rows) => cur,
+                    RevealMode::Fit if self.any_caret_on_screen(buffer, &rows, cur, viewport_rows) => cur,
                     RevealMode::Fit => fit(),
                 };
-                state.scroll = ScrollAnchor::from_rows(rows, line_h);
+                state.scroll = ScrollAnchor::from_rows(target_rows, line_h);
                 // Horizontal (both reveal classes): keep cells [col−1,
                 // col+2] inside the code area, minimally; a band wider than
                 // the viewport is the reveal_fit no-op case.
@@ -1340,7 +1338,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             line_h,
         );
         state.scroll_x =
-            state.scroll_x.clamp(0.0, self.max_scroll_x(vp, advance, line_h, state.scroll.rows(line_h)));
+            state.scroll_x.clamp(0.0, self.max_scroll_x(&rows, vp, advance, line_h, state.scroll.rows(line_h)));
         tree.size = size;
     }
 
@@ -1399,7 +1397,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         // Folds: rows hidden inside a fold are not produced. `first`/`last`
         // are DISPLAY rows (the visible window); the render iterates display rows
         // and maps each back to its buffer row.
-        let fold_map = self.fold_map();
+        let rows = self.doc.rows();
+        let fold_map = rows.folds();
         // The visible display-row window — floor/ceil/clamp policy lives with
         // the fold map; the widget only supplies fractional rows from pixels.
         let window = fold_map
@@ -1419,8 +1418,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         // projection (tab expansion, inline collapse, chip-center clipping,
         // collapsed-tail following), culled to the visible display window. `None`
         // if the offset is genuinely hidden (in a fold's gap) or scrolled out.
-        let offset_xy = |off: u32| -> Option<(f32, f32)> {
-            let p = fold_map.display_position(buffer, off, TAB)?;
+        let offset_xy = |off: u32, edge: Edge| -> Option<(f32, f32)> {
+            let p = rows.position(off, edge)?;
             window.contains(&p.row.index()).then(|| (geo.cell_x(p.x.cells()), geo.row_y(p.row)))
         };
 
@@ -1508,7 +1507,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         let sels = self.doc.selections().all();
         for sel in &sels[visible_selection_span(sels, vis_start, vis_end)] {
             if !sel.is_empty() {
-                self.draw_selection(renderer, &geo, sel.start(), sel.end(), selection_color);
+                self.draw_selection(renderer, &rows, &geo, sel.start(), sel.end(), selection_color);
             }
         }
         // Word-under-caret occurrence wash — highlight every occurrence of the
@@ -1517,7 +1516,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         if self.doc.find_query().is_none() {
             // The visible window bounds the scan, so it stays O(viewport).
             for span in self.doc.caret_word_occurrences(vis_start..vis_end) {
-                self.draw_selection(renderer, &geo, span.start, span.end, OCCURRENCE_MATCH);
+                self.draw_selection(renderer, &rows, &geo, span.start, span.end, OCCURRENCE_MATCH);
             }
         }
         // Find-in-selection: shade the scope UNDER the match washes, so an
@@ -1527,12 +1526,12 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         if let Some(scope) = self.doc.find_scope() {
             let (s, e) = (scope.start.max(vis_start), scope.end.min(vis_end));
             if s < e {
-                self.draw_selection(renderer, &geo, s, e, FIND_SCOPE);
+                self.draw_selection(renderer, &rows, &geo, s, e, FIND_SCOPE);
             }
         }
         for (span, is_active) in self.doc.find_matches_in(vis_start..vis_end) {
             let color = if is_active { FIND_MATCH_ACTIVE } else { FIND_MATCH };
-            self.draw_selection(renderer, &geo, span.start, span.end, color);
+            self.draw_selection(renderer, &rows, &geo, span.start, span.end, color);
         }
 
         // Indentation guides (on by default): monochrome 1 px vertical lines at
@@ -1602,7 +1601,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             let spans = self.doc.highlight_line_spans(row);
             // Rows with an inline (single-line) fold draw collapsed — the interior
             // between the brackets hides behind a `…` chip, the rest shifts left.
-            let row_layout = fold_map.row_layout(buffer, BufferRow(row), TAB);
+            let row_layout = rows.layout(BufferRow(row));
             if !row_layout.is_plain() {
                 self.draw_row_inline(renderer, &line, spans, origin, &geo, &row_layout, dim, text_color, code_clip);
             } else {
@@ -1622,9 +1621,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 // closing tail. Every cell comes from the core's one
                 // `HeaderLayout` owner, so the painted glyphs, caret placement,
                 // hit-testing, and selection washes agree by construction.
-                let hl = fold_map
-                    .header_layout(buffer, BufferRow(row), TAB)
-                    .expect("is_fold_header rows have a header layout");
+                let hl = rows.header(BufferRow(row)).expect("is_fold_header rows have a header layout");
                 let mid = geo.cell_x(hl.gap_center());
                 // Where the selection runs through the fold, the wash now spans the
                 // gap (see `draw_wash_row`), so drop the idle pill — else it islands
@@ -1676,7 +1673,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             } else {
                 buffer.len() + 1 // sentinel: a bracket at the final byte is inside
             };
-            let row_layout = fold_map.row_layout(buffer, BufferRow(row), TAB);
+            let row_layout = rows.layout(BufferRow(row));
             for br in self.doc.brackets().in_range_iter(row_start..row_end) {
                 let col = br.offset - row_start;
                 let Some(ch) = buffer.char_at(br.offset) else { continue };
@@ -1705,7 +1702,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 // Route through `offset_xy` so a matched bracket on a collapsed
                 // fold's closing tail (the `}` inline on the header line) gets boxed
                 // too, not just the visible opening bracket.
-                let Some((x, y)) = offset_xy(off) else { continue };
+                let Some((x, y)) = offset_xy(off, Edge::Start) else { continue };
                 fill_border(renderer, Rectangle { x, y, width: advance, height: line_h }, match_box, 1.0);
             }
         }
@@ -1752,8 +1749,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 }
                 // Fold-aware endpoints: a diagnostic spanning a collapsed
                 // inline fold underlines the shifted glyphs, not the raw columns.
-                let x0 = self.offset_screen_x(&fold_map, &geo, row_start);
-                let x1 = self.offset_screen_x(&fold_map, &geo, row_end).max(x0 + advance);
+                let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
+                let x0 = self.offset_screen_x(&rows, &geo, row_start, from);
+                let x1 = self.offset_screen_x(&rows, &geo, row_end, if row == ep_row { to } else { Edge::Start }).max(x0 + advance);
                 let baseline = row_y + line_h - SQUIGGLE_AMPLITUDE - 0.5;
                 squiggle_spans(x0, x1, baseline, |rect| fill(renderer, rect, color));
             }
@@ -1786,7 +1784,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 // what folds"); the innermost box the pointer is actually over is
                 // bright + washed (the Ctrl+Click target), drawn last so it wins.
                 let active = self
-                    .armed_boxes(&geo, pos)
+                    .armed_boxes(&rows, &geo, pos)
                     .into_iter()
                     .min_by_key(|&(o, c, _)| c - o)
                     .map(|(o, ..)| o);
@@ -1801,7 +1799,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     if last_row < first_buf || header > last_buf {
                         continue; // wholly off-screen
                     }
-                    let Some(rect) = self.collapsible_box_rect(&fold_map, &geo, open, close, header, last_row) else {
+                    let Some(rect) = self.collapsible_box_rect(&rows, &geo, open, close, header, last_row) else {
                         continue;
                     };
                     if active == Some(open) {
@@ -1824,7 +1822,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         // span (`collapsed_chip_rect`); only the visual is this tight.
         if !state.modifiers.command() {
             if let Some(opener) = state.hover_chip {
-                if let Some(pill) = self.chip_pill_rect(&fold_map, &geo, opener) {
+                if let Some(pill) = self.chip_pill_rect(&rows, &geo, opener) {
                     fill_rounded(renderer, pill, Color { a: CHIP_HOVER_A, ..text_color }, CHIP_PILL_RADIUS);
                 }
             }
@@ -1840,7 +1838,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             // the per-frame cost of a document-scale multi-cursor set to O(visible).
             let sels = self.doc.selections().all();
             for sel in &sels[visible_selection_span(sels, vis_start, vis_end)] {
-                if let Some((x, y)) = offset_xy(sel.head()) {
+                let edge = if sel.is_empty() {
+                    Edge::Caret
+                } else if sel.head() == sel.end() {
+                    Edge::End
+                } else {
+                    Edge::Start
+                };
+                if let Some((x, y)) = offset_xy(sel.head(), edge) {
                     let r = Rectangle { x: x - CARET_WIDTH / 2.0, y: y + 1.0, width: CARET_WIDTH, height: line_h - 2.0 };
                     fill(renderer, r, text_color);
                 }
@@ -1955,7 +1960,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         // Horizontal scrollbar thumb (bottom edge, only on horizontal overflow) —
         // the same translucent thumb as the vertical bar, no overview markers. Its
         // track stops at the vertical bar, so the two meet at the corner cleanly.
-        if let Some(hb) = self.hscrollbar(bounds, advance, line_h, scroll_x, state.scroll.rows(line_h)) {
+        if let Some(hb) = self.hscrollbar(&rows, bounds, advance, line_h, scroll_x, state.scroll.rows(line_h)) {
             let thumb = if state.hscrollbar_grab.is_some() { SCROLLBAR_THUMB_ACTIVE } else { SCROLLBAR_THUMB };
             fill(renderer, Rectangle { x: hb.thumb_x, y: hb.y, width: hb.thumb_w, height: SCROLLBAR_WIDTH }, thumb);
         }
@@ -2001,6 +2006,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         let state = tree.state.downcast_mut::<State>();
         self.ensure_metrics(state);
         let (advance, line_h) = (state.metrics.advance, state.metrics.line_height);
+        let rows = self.doc.rows();
 
         // Report the visible range to the app — the view reports its viewport to
         // the model: highlighting runs only down to what is on screen,
@@ -2068,7 +2074,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 }
                 // Same for the bottom horizontal bar (checked after the vertical
                 // one, which owns the corner).
-                if let Some(hb) = self.hscrollbar(bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h)) {
+                if let Some(hb) = self.hscrollbar(&rows, bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h)) {
                     if hb.contains_y(pos.y) {
                         let grab = if hb.thumb_contains_x(pos.x) {
                             pos.x - hb.thumb_x
@@ -2100,7 +2106,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 // reads as toggling the collapsed span. (Ctrl is the collapse gesture,
                 // below; a modified click falls through to selection.)
                 if !state.modifiers.command() && !state.modifiers.shift() && !state.modifiers.alt() {
-                    if let Some(opener) = self.collapsed_chip_at(&geo, pos) {
+                    if let Some(opener) = self.collapsed_chip_at(&rows, &geo, pos) {
                         shell.publish((self.on_action)(Action::ToggleFold { opener }));
                         shell.capture_event();
                         return;
@@ -2111,7 +2117,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 // adds carets, Shift extends; plain Ctrl is otherwise just a caret.
                 if SHOW_CTRL_COLLAPSE_AFFORDANCE && state.modifiers.command() && !state.modifiers.shift() && !state.modifiers.alt() {
                     let target = self
-                        .armed_boxes(&geo, pos)
+                        .armed_boxes(&rows, &geo, pos)
                         .into_iter()
                         .min_by_key(|&(o, c, _)| c - o)
                         .map(|(o, ..)| o);
@@ -2121,7 +2127,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                         return;
                     }
                 }
-                let offset = self.hit_test(&geo, pos);
+                let offset = self.hit_test(&rows, &geo, pos);
                 // Alt+Click adds a caret. Otherwise the click count (iced
                 // `mouse::Click`) selects a caret / word / line; a single click
                 // also arms a drag-select anchored here (extended on CursorMoved).
@@ -2189,7 +2195,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 // Track the collapsed chip under the (non-Ctrl) pointer for the
                 // immediate plain-hover expand highlight — repaint only when it changes.
                 let chip = (!state.modifiers.command())
-                    .then(|| cursor.position_over(bounds).and_then(|p| self.collapsed_chip_at(&geo, p)))
+                    .then(|| cursor.position_over(bounds).and_then(|p| self.collapsed_chip_at(&rows, &geo, p)))
                     .flatten();
                 if chip != state.hover_chip {
                     state.hover_chip = chip;
@@ -2223,7 +2229,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 } else if let Some(grab) = state.hscrollbar_grab {
                     // Bottom-bar thumb drag — the X-axis mirror of the above.
                     if let (Some(hb), Some(pos)) = (
-                        self.hscrollbar(bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h)),
+                        self.hscrollbar(&rows, bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h)),
                         cursor.position(),
                     ) {
                         state.scroll_x = hb.scroll_for_thumb_left(pos.x - grab);
@@ -2237,7 +2243,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     shell.publish((self.on_action)(Action::ColumnDrag { anchor, active }));
                     shell.capture_event();
                 } else if let (Some(drag), Some(pos)) = (state.drag, cursor.position()) {
-                    let head = self.hit_test(&geo, pos);
+                    let head = self.hit_test(&rows, &geo, pos);
                     state.autoscroll = true;
                     shell.publish((self.on_action)(Action::DragSelect {
                         granularity: drag.granularity,
@@ -2255,7 +2261,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     // over the open hover's word, keep it; otherwise dismiss and
                     // re-arm the timer for the new position (accurate `now` stamped
                     // on the next RedrawRequested).
-                    let off = self.hit_test(&geo, pos);
+                    let off = self.hit_test(&rows, &geo, pos);
                     // Keep the hover open while the pointer is over its word OR over
                     // the hover box itself — so it can be moved into and scrolled —
                     // and keep an unanswered request while the pointer stays on
@@ -2348,7 +2354,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 // Predominant-axis lock: the larger-magnitude delta wins, so a
                 // trackpad flick doesn't drift diagonally.
                 if dx.abs() > dy.abs() {
-                    let max_x = self.max_scroll_x(bounds, advance, line_h, state.scroll.rows(line_h));
+                    let max_x = self.max_scroll_x(&rows, bounds, advance, line_h, state.scroll.rows(line_h));
                     state.scroll_x = (state.scroll_x - dx).clamp(0.0, max_x);
                 } else {
                     // Row-space wheel step: shift by dy/line_h rows, then
@@ -2584,7 +2590,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                             // hidden content — a widget-drawn panel. Otherwise
                             // the pointer's word drives the app hover query.
                             let geo = self.geo(state, bounds);
-                            if let Some(opener) = self.collapsed_chip_at(&geo, pos) {
+                            if let Some(opener) = self.collapsed_chip_at(&rows, &geo, pos) {
                                 if state.fold_preview != Some(opener) {
                                     state.fold_preview = Some(opener);
                                     shell.request_redraw();
@@ -2594,7 +2600,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                                     shell.publish((self.on_action)(Action::HoverDismiss));
                                 }
                             } else {
-                                let off = self.hit_test(&geo, pos);
+                                let off = self.hit_test(&rows, &geo, pos);
                                 state.hover_queried = true;
                                 shell.publish((self.on_action)(Action::HoverQuery(off)));
                             }
@@ -2627,10 +2633,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         }
         let line_h = state.metrics.line_height;
         let geo = self.geo(state, bounds);
+        let rows = self.doc.rows();
         // Ctrl held over a collapsible → the finger cursor (Ctrl+Click folds it).
         if SHOW_CTRL_COLLAPSE_AFFORDANCE && state.modifiers.command() {
             if let Some(p) = cursor.position_over(bounds).filter(|p| !geo.in_gutter(p.x)) {
-                if !self.armed_boxes(&geo, p).is_empty() {
+                if !self.armed_boxes(&rows, &geo, p).is_empty() {
                     return mouse::Interaction::Pointer;
                 }
             }
@@ -2639,7 +2646,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         // expands it).
         if !state.modifiers.command() {
             if let Some(p) = cursor.position_over(bounds).filter(|p| !geo.in_gutter(p.x)) {
-                if self.collapsed_chip_at(&geo, p).is_some() {
+                if self.collapsed_chip_at(&rows, &geo, p).is_some() {
                     return mouse::Interaction::Pointer;
                 }
             }
@@ -2666,7 +2673,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 if !geo.in_gutter(p.x)
                     && !self.scrollbar(bounds, line_h, state.scroll.rows(line_h)).is_some_and(|sb| sb.contains_x(p.x))
                     && !self
-                        .hscrollbar(bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h))
+                        .hscrollbar(&rows, bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h))
                         .is_some_and(|hb| hb.contains_y(p.y)) =>
             {
                 mouse::Interaction::Text
@@ -2712,10 +2719,9 @@ impl<Message> Editor<'_, Message> {
     /// The completion popup's top-left and size for the current caret/metrics —
     /// shared by `draw_popup` and mouse hit-testing so they agree on where it is.
     fn popup_layout(&self, list: &PopupList, geo: &Geo) -> (Point, Size) {
-        let fold_map = self.fold_map();
         // The anchor (the completed word's start) shares the caret's row, so the
         // shared display-space anchor covers both x and y.
-        let (anchor_x, row_top, row_bottom) = self.popup_anchor(&fold_map, geo, list.anchor);
+        let (anchor_x, row_top, row_bottom) = self.popup_anchor(&self.doc.rows(), geo, list.anchor, Edge::Start);
         let size = popup::extent(list, geo.advance(), geo.line_h());
         let origin = popup::place(anchor_x, row_top, row_bottom, size, geo.bounds());
         (origin, size)
@@ -2743,10 +2749,9 @@ impl<Message> Editor<'_, Message> {
         let width = inner_w + 2.0 * pad_x + sb_w;
         let height = visible as f32 * line_h + 2.0 * pad_y;
 
-        let fold_map = self.fold_map();
         // The shared display-space anchor; the hover keeps its own
         // above-first flip below.
-        let (word_x, word_top, word_bottom) = self.popup_anchor(&fold_map, geo, info.range.start);
+        let (word_x, word_top, word_bottom) = self.popup_anchor(&self.doc.rows(), geo, info.range.start, Edge::Start);
         let y = if word_top - height >= bounds.y { word_top - height } else { word_bottom };
         let x = word_x.clamp(bounds.x, (bounds.x + bounds.width - width).max(bounds.x));
 
@@ -2825,11 +2830,10 @@ impl<Message> Editor<'_, Message> {
         text_color: Color,
     ) {
         let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
-        let fold_map = self.fold_map();
         let head = self.doc.selections().newest().head();
         // The shared display-space anchor; the signature keeps its own
         // above-first flip below.
-        let (caret_x, caret_top, caret_bottom) = self.popup_anchor(&fold_map, geo, head);
+        let (caret_x, caret_top, caret_bottom) = self.popup_anchor(&self.doc.rows(), geo, head, Edge::Caret);
 
         let dim = Color { a: 0.7, ..text_color };
         let active = Color::from_rgb8(0x66, 0xd9, 0xef); // cyan — the active param
@@ -2934,14 +2938,14 @@ impl<Message> Editor<'_, Message> {
         range_covered_by(self.doc.selections().all(), start, end)
     }
 
-    fn draw_selection(&self, renderer: &mut iced::Renderer, geo: &Geo, start: u32, end: u32, color: Color) {
+    fn draw_selection(&self, renderer: &mut iced::Renderer, rows: &Rows<'_>, geo: &Geo, start: u32, end: u32, color: Color) {
         let buffer = self.doc.buffer();
-        let fold_map = self.fold_map();
+        let fold_map = rows.folds();
         let (a, b) = (buffer.offset_to_point(start), buffer.offset_to_point(end));
         // Single-row selection — the common case (a bare caret, a word
         // occurrence, a find match): wash it directly, no window walk.
         if a.row == b.row {
-            self.draw_wash_row(renderer, &fold_map, geo, a.row, a, b, start, end, color);
+            self.draw_wash_row(renderer, rows, geo, a.row, a, b, start, end, color);
             return;
         }
         // Multi-row: iterate the VISIBLE DISPLAY rows, never the selection's
@@ -2959,11 +2963,11 @@ impl<Message> Editor<'_, Message> {
         let sel = a.row..=b.row;
         for vr in fold_map.visible_rows(window) {
             if sel.contains(&vr.buffer_row.0) {
-                self.draw_wash_row(renderer, &fold_map, geo, vr.buffer_row.0, a, b, start, end, color);
+                self.draw_wash_row(renderer, rows, geo, vr.buffer_row.0, a, b, start, end, color);
             }
             if let Some(tail) = vr.last_folded {
                 if sel.contains(&tail.0) {
-                    self.draw_fold_tail_wash(renderer, &fold_map, geo, tail.0, a, b, color);
+                    self.draw_fold_tail_wash(renderer, rows, geo, tail.0, a, b, color);
                 }
             }
         }
@@ -2973,12 +2977,13 @@ impl<Message> Editor<'_, Message> {
     /// to [`draw_fold_tail_wash`] (its `}` tail rides a header line); otherwise
     /// fill the selected span, endpoints via the one `offset_screen_x` projection.
     #[allow(clippy::too_many_arguments)] // a renderer-side wash genuinely needs all of them
-    fn draw_wash_row(&self, renderer: &mut iced::Renderer, fold_map: &FoldMap, geo: &Geo, row: u32, a: BufPoint, b: BufPoint, start: u32, end: u32, color: Color) {
+    fn draw_wash_row(&self, renderer: &mut iced::Renderer, rows: &Rows<'_>, geo: &Geo, row: u32, a: BufPoint, b: BufPoint, start: u32, end: u32, color: Color) {
         // The choke point every washed row flows through — count it so the draw
         // budget trips if a caller ever washes O(document) rows.
         draw_budget::bump_rows(1);
+        let fold_map = rows.folds();
         if fold_map.is_folded(BufferRow(row)) {
-            self.draw_fold_tail_wash(renderer, fold_map, geo, row, a, b, color);
+            self.draw_fold_tail_wash(renderer, rows, geo, row, a, b, color);
             return;
         }
         let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
@@ -2987,10 +2992,11 @@ impl<Message> Editor<'_, Message> {
         if y + line_h < bounds.y || y > bounds.y + bounds.height {
             return;
         }
-        let x0 = if row == a.row { self.offset_screen_x(fold_map, geo, start) } else { geo.cell_x(0.0) };
+        let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
+        let x0 = if row == a.row { self.offset_screen_x(rows, geo, start, from) } else { geo.cell_x(0.0) };
         let x1 = if row == b.row {
-            self.offset_screen_x(fold_map, geo, end)
-        } else if let Some(hl) = fold_map.header_layout(buffer, BufferRow(row), TAB) {
+            self.offset_screen_x(rows, geo, end, to)
+        } else if let Some(hl) = rows.header(BufferRow(row)) {
             // A collapsed block header the selection runs THROUGH (it continues into
             // the folded interior below): wash straight across the ` … ` placeholder
             // gap so the collapsed `head … tail` line has no unwashed hole. The tail
@@ -2998,7 +3004,7 @@ impl<Message> Editor<'_, Message> {
             geo.cell_x(hl.tail_cell() as f32)
         } else {
             let line_end = buffer.point_to_offset(scrive_core::Point::new(row, buffer.line_len(row)));
-            self.offset_screen_x(fold_map, geo, line_end) + advance * 0.5
+            self.offset_screen_x(rows, geo, line_end, Edge::Start) + advance * 0.5
         };
         fill(renderer, Rectangle { x: x0, y, width: (x1 - x0).max(1.0), height: line_h }, color);
     }
@@ -3009,14 +3015,15 @@ impl<Message> Editor<'_, Message> {
     /// scrolled off. Split out so both the windowed loop and the single-row path
     /// reuse the exact same tail projection.
     #[allow(clippy::too_many_arguments)] // a renderer-side wash genuinely needs all of them
-    fn draw_fold_tail_wash(&self, renderer: &mut iced::Renderer, fold_map: &FoldMap, geo: &Geo, tail_row: u32, a: BufPoint, b: BufPoint, color: Color) {
+    fn draw_fold_tail_wash(&self, renderer: &mut iced::Renderer, rows: &Rows<'_>, geo: &Geo, tail_row: u32, a: BufPoint, b: BufPoint, color: Color) {
         draw_budget::bump_rows(1); // choke point — counted for the draw budget
+        let fold_map = rows.folds();
         let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
         let buffer = self.doc.buffer();
         // Hidden interior rows show nothing — only a collapsed fold's closing
         // (tail) row rides a header line.
         let Some(hdr) = fold_map.header_of_tail(BufferRow(tail_row)) else { return };
-        let Some(hl) = fold_map.header_layout(buffer, hdr, TAB) else { return };
+        let Some(hl) = rows.header(hdr) else { return };
         let lead = hl.tail_start_col();
         let sel_a = if tail_row == a.row { a.col } else { 0 };
         let sel_b = if tail_row == b.row { b.col } else { buffer.line_len(tail_row) };
@@ -3065,13 +3072,13 @@ impl<Message> Editor<'_, Message> {
 
     /// Pixel → buffer offset: the y half resolves through the ONE row-inversion
     /// policy ([`FoldMap::display_row_at`]), the x half through the ONE
-    /// cell-inversion owner ([`FoldMap::hit_row`]: collapsed header gap/tail
+    /// cell-inversion owner ([`Rows::hit`]: collapsed header gap/tail
     /// resolution, chip clicks, tab snapping). The widget's only contribution is
     /// px → (fractional row, fractional cell) via [`Geo`].
-    fn hit_test(&self, geo: &Geo, pos: Point) -> u32 {
-        let fold_map = self.fold_map();
+    fn hit_test(&self, rows: &Rows<'_>, geo: &Geo, pos: Point) -> u32 {
+        let fold_map = rows.folds();
         let row = fold_map.to_buffer_row(fold_map.display_row_at(geo.rows_from_top(pos.y)));
-        fold_map.hit_row(self.doc.buffer(), row, geo.x_cell(pos.x), scrive_core::Bias::Left, TAB)
+        rows.hit(row, geo.x_cell(pos.x), scrive_core::Bias::Left)
     }
 
     /// Draw a row that has inline (single-line) folds: its highlight spans with a
@@ -3146,7 +3153,8 @@ impl<Message> Editor<'_, Message> {
     /// the highlight, the finger, the click, and the hover preview all measure against
     /// it, so they agree. `None` if `opener` isn't collapsed or its line is itself
     /// hidden inside an outer collapsed fold.
-    fn collapsed_chip_rect(&self, fold_map: &FoldMap, geo: &Geo, opener: u32) -> Option<Rectangle> {
+    fn collapsed_chip_rect(&self, rows: &Rows<'_>, geo: &Geo, opener: u32) -> Option<Rectangle> {
+        let fold_map = rows.folds();
         if !self.doc.folds().is_folded(opener) {
             return None;
         }
@@ -3165,7 +3173,7 @@ impl<Message> Editor<'_, Message> {
             // `}`. End at the CLOSER's cell, NOT `hl.width()` (the whole tail line):
             // text typed after the `}` on the last line is outside the collapsed
             // region and must not join the fold's hover / expand target.
-            let hl = fold_map.header_layout(buffer, BufferRow(header), TAB)?;
+            let hl = rows.header(BufferRow(header))?;
             let x0 = geo.cell_x((hl.head_cells() as f32 - 1.0).max(0.0)) - 2.0;
             let last_start = buffer.point_to_offset(BufPoint { row: last, col: 0 });
             let close_cell = hl.tail_col_cell(close - last_start).unwrap_or_else(|| hl.tail_cell());
@@ -3183,8 +3191,8 @@ impl<Message> Editor<'_, Message> {
             // `inline_fold_at` is an O(log F) offset-keyed descent, so a hover /
             // preview frame costs O(log F), never an O(F) decode of every inline fold.
             fold_map.inline_fold_at(opener)?;
-            let xo = self.offset_screen_x(fold_map, geo, opener);
-            let xc = self.offset_screen_x(fold_map, geo, close);
+            let xo = self.offset_screen_x(rows, geo, opener, Edge::Start);
+            let xc = self.offset_screen_x(rows, geo, close, Edge::Start);
             Some(geo.inline_halo(xo.min(xc), xo.max(xc), y))
         }
     }
@@ -3195,7 +3203,8 @@ impl<Message> Editor<'_, Message> {
     /// from the same owners the painter reads (`gap_center` / `chips` /
     /// [`Geo::chip_pill`]). `None` when the fold has no on-screen pill (not
     /// collapsed, hidden inside an outer fold, or nested away).
-    fn chip_pill_rect(&self, fold_map: &FoldMap, geo: &Geo, opener: u32) -> Option<Rectangle> {
+    fn chip_pill_rect(&self, rows: &Rows<'_>, geo: &Geo, opener: u32) -> Option<Rectangle> {
+        let fold_map = rows.folds();
         if !self.doc.folds().is_folded(opener) {
             return None;
         }
@@ -3209,10 +3218,10 @@ impl<Message> Editor<'_, Message> {
         }
         let y = geo.row_y(fold_map.to_display_row(BufferRow(header)));
         let mid = if last > header {
-            geo.cell_x(fold_map.header_layout(buffer, BufferRow(header), TAB)?.gap_center())
+            geo.cell_x(rows.header(BufferRow(header))?.gap_center())
         } else {
             let row_start = buffer.point_to_offset(BufPoint { row: header, col: 0 });
-            let layout = fold_map.row_layout(buffer, BufferRow(header), TAB);
+            let layout = rows.layout(BufferRow(header));
             let chip = layout.chips().find(|c| c.open_col == opener - row_start)?;
             geo.cell_x(chip.center)
         };
@@ -3221,8 +3230,8 @@ impl<Message> Editor<'_, Message> {
 
     /// The collapsed fold whose `…` chip is under `pos` — the plain-hover expand
     /// target. Chips are disjoint on screen, so the first match wins.
-    fn collapsed_chip_at(&self, geo: &Geo, pos: Point) -> Option<u32> {
-        let fold_map = self.fold_map();
+    fn collapsed_chip_at(&self, rows: &Rows<'_>, geo: &Geo, pos: Point) -> Option<u32> {
+        let fold_map = rows.folds();
         // A `…` chip renders only on its fold's header (opener) row, so only a
         // pair headed on the pointer's display row can sit under `pos`. Resolve
         // that one buffer row and test just the pairs headed there
@@ -3235,7 +3244,7 @@ impl<Message> Editor<'_, Message> {
             .foldable_pairs_in_rows(row..row + 1)
             .into_iter()
             .map(|(open, ..)| open)
-            .find(|&o| self.collapsed_chip_rect(&fold_map, geo, o).is_some_and(|r| r.contains(pos)))
+            .find(|&o| self.collapsed_chip_rect(rows, geo, o).is_some_and(|r| r.contains(pos)))
     }
 
     /// Draw the hover preview of a collapsed fold's hidden content: a floating
@@ -3295,7 +3304,7 @@ impl<Message> Editor<'_, Message> {
         // opens under the thing the pointer is on (a mid-line inline chip
         // included, not the row's end). Flip above when it would overflow the
         // bottom, and clamp horizontally.
-        let Some(chip) = self.collapsed_chip_rect(&fold_map, geo, opener) else {
+        let Some(chip) = self.collapsed_chip_rect(&self.doc.rows(), geo, opener) else {
             return; // no chip on screen (nested away) ⇒ nothing to anchor to
         };
         let code_left = geo.code_left();
@@ -4405,16 +4414,16 @@ mod tests {
         let doc = folded_doc(); // block collapsed; header at buffer row 1
         let ed = Editor::new(&doc, |_: Action| ());
         let geo = test_geo();
-        let fm = ed.fold_map();
+        let rows = doc.rows();
         let opener = doc.buffer().text().find('{').unwrap() as u32;
         // Hover the exact chip rect the painter uses.
-        let rect = ed.collapsed_chip_rect(&fm, &geo, opener).expect("collapsed header has a chip");
+        let rect = ed.collapsed_chip_rect(&rows, &geo, opener).expect("collapsed header has a chip");
         let center = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
-        assert_eq!(ed.collapsed_chip_at(&geo, center), Some(opener), "hover over the chip finds it");
+        assert_eq!(ed.collapsed_chip_at(&rows, &geo, center), Some(opener), "hover over the chip finds it");
         // A point far right of the chip on the same row is off it.
-        assert_eq!(ed.collapsed_chip_at(&geo, Point::new(rect.x + rect.width + 200.0, center.y)), None);
+        assert_eq!(ed.collapsed_chip_at(&rows, &geo, Point::new(rect.x + rect.width + 200.0, center.y)), None);
         // A point on display row 0 ("x", no fold) resolves a fold-less row.
-        assert_eq!(ed.collapsed_chip_at(&geo, Point::new(center.x, 5.0)), None);
+        assert_eq!(ed.collapsed_chip_at(&rows, &geo, Point::new(center.x, 5.0)), None);
     }
 
     #[test]
@@ -4428,12 +4437,12 @@ mod tests {
         assert!(doc.toggle_fold_opener(opener)); // block: `{` row 1 … `}` row 4
         let ed = Editor::new(&doc, |_: Action| ());
         let geo = test_geo();
-        let fm = ed.fold_map();
-        let rect = ed.collapsed_chip_rect(&fm, &geo, opener).expect("collapsed header has a chip");
+        let rows = doc.rows();
+        let rect = ed.collapsed_chip_rect(&rows, &geo, opener).expect("collapsed header has a chip");
         let cy = rect.y + rect.height / 2.0;
         // The `…` chip is still the expand target.
         assert_eq!(
-            ed.collapsed_chip_at(&geo, Point::new(rect.x + rect.width / 2.0, cy)),
+            ed.collapsed_chip_at(&rows, &geo, Point::new(rect.x + rect.width / 2.0, cy)),
             Some(opener),
         );
         // The box ends at the closer: `a {`(3) + ` … `(4) + `}`(1) ≈ 8 cells, far
@@ -4445,7 +4454,7 @@ mod tests {
             rect.width
         );
         assert_eq!(
-            ed.collapsed_chip_at(&geo, Point::new(geo.cell_x(16.0), cy)),
+            ed.collapsed_chip_at(&rows, &geo, Point::new(geo.cell_x(16.0), cy)),
             None,
             "text after the closing brace is not part of the fold's hover area"
         );
@@ -4528,11 +4537,11 @@ mod tests {
         doc.set_selections(set);
         let ed = Editor::new(&doc, |_: Action| ());
         let geo = test_geo();
-        let fm = ed.fold_map();
+        let rows = doc.rows();
 
         // The one shared anchor must be display-space: row 2 × 10 px, NOT buffer
         // row 5 × 10 px — so a popup below a fold sits at the right height.
-        let (x, top, bottom) = ed.popup_anchor(&fm, &geo, head);
+        let (x, top, bottom) = ed.popup_anchor(&rows, &geo, head, Edge::Caret);
         assert_eq!((top, bottom), (20.0, 30.0), "display row 2, not buffer row 5");
         assert_eq!(x, 56.0, "gutter 50 + TEXT_PAD 6 + col 0");
 
@@ -4560,7 +4569,7 @@ mod tests {
         assert!(doc.toggle_fold_opener(block_open));
         let ed = Editor::new(&doc, |_: Action| ());
         let geo = test_geo();
-        let fm = ed.fold_map();
+        let rows = doc.rows();
         let buffer = doc.buffer();
         let tail = buffer.point_to_offset(BufPoint::new(2, 0)); // the real `}`
         let after = buffer.point_to_offset(BufPoint::new(3, 2)); // below the fold
@@ -4568,9 +4577,9 @@ mod tests {
         // hit-test the same pixel back. Fails against either a fold-blind x
         // or a buffer-space chip compare.
         for off in [0, inline_open + 1, close, block_open, tail, after] {
-            let p = fm.display_position(buffer, off, TAB).expect("landable offset");
-            let pos = Point::new(ed.offset_screen_x(&fm, &geo, off), geo.row_y(p.row) + 5.0);
-            assert_eq!(ed.hit_test(&geo, pos), off, "offset {off} round-trips");
+            let p = rows.position(off, Edge::Caret).expect("landable offset");
+            let pos = Point::new(ed.offset_screen_x(&rows, &geo, off, Edge::Caret), geo.row_y(p.row) + 5.0);
+            assert_eq!(ed.hit_test(&rows, &geo, pos), off, "offset {off} round-trips");
         }
     }
 
@@ -4617,13 +4626,13 @@ mod tests {
         let vp = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
         let text = "f() {\n    a_very_long_interior_line_wwwwwwwwwwwwwww\n}\nshort\n";
         let mut doc = Document::new(text).unwrap();
-        let unfolded = Editor::new(&doc, |_: Action| ()).max_line_px(10.0, 20.0, vp, 0.0);
+        let unfolded = Editor::new(&doc, |_: Action| ()).max_line_px(&doc.rows(), 10.0, 20.0, vp, 0.0);
         let opener = text.find('{').unwrap() as u32;
         assert!(doc.toggle_fold_opener(opener));
         let ed = Editor::new(&doc, |_: Action| ());
-        let folded = ed.max_line_px(10.0, 20.0, vp, 0.0);
-        let fm = ed.fold_map();
-        let hl = fm.header_layout(doc.buffer(), BufferRow(0), TAB).unwrap();
+        let rows = doc.rows();
+        let folded = ed.max_line_px(&rows, 10.0, 20.0, vp, 0.0);
+        let hl = rows.header(BufferRow(0)).unwrap();
         assert_eq!(folded, hl.width() as f32 * 10.0);
         assert!(folded < unfolded, "collapsing the widest line shrinks the h-range");
     }
@@ -4640,10 +4649,11 @@ mod tests {
         text.push('\n');
         let doc = Document::new(&text).unwrap();
         let ed = Editor::new(&doc, |_: Action| ());
+        let rows = doc.rows();
         let two_rows = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 40.0 };
-        assert_eq!(ed.max_line_px(10.0, 20.0, two_rows, 0.0), 2.0 * 10.0, "only visible rows count");
+        assert_eq!(ed.max_line_px(&rows, 10.0, 20.0, two_rows, 0.0), 2.0 * 10.0, "only visible rows count");
         // Scrolled down 2 rows to the wide line, the range adapts up.
-        assert_eq!(ed.max_line_px(10.0, 20.0, two_rows, 2.0), 200.0 * 10.0);
+        assert_eq!(ed.max_line_px(&rows, 10.0, 20.0, two_rows, 2.0), 200.0 * 10.0);
     }
 
     /// A headless tiny-skia renderer with the icon font loaded, as the
