@@ -911,6 +911,7 @@ impl CodeEditor {
                 Task::none()
             }
             Event::Editor(Action::Wake(_)) => Task::none(),
+            Event::Editor(Action::InlayHover { .. } | Action::InlayJump { .. } | Action::InlayInsert { .. }) => Task::none(),
             Event::Editor(action) => {
                 self.apply(action);
                 Task::none()
@@ -1521,7 +1522,10 @@ impl CodeEditor {
             | Action::Format
             | Action::ToggleFold { .. }
             | Action::FoldAtCarets { .. }
-            | Action::Wake(_) => {}
+            | Action::Wake(_)
+            | Action::InlayHover { .. }
+            | Action::InlayJump { .. }
+            | Action::InlayInsert { .. } => {}
         }
         self.after_edit(comp_event);
         // Dirty only on an actual text change — a bare caret move / selection must

@@ -38,6 +38,7 @@ use scrive_core::{
     HighlightSpan, HoverInfo, Motion, Point as BufPoint, PopupList, RevealMode, RowLayout, Severity,
     SignatureInfo, HOVER_IDLE_DELAY_MS,
 };
+use scrive_core::intel::inlay;
 use scrive_core::row_layout::{self, Edge, Rows};
 
 use crate::geo::{Geo, ScrollAnchor, CHIP_PILL_RADIUS, TEXT_PAD};
@@ -222,6 +223,12 @@ fn blink_on(elapsed_ms: u128) -> bool {
     (elapsed_ms / BLINK_MS).is_multiple_of(2)
 }
 
+/// Whether `modifiers` hold the link chord: Ctrl (Cmd on macOS) without Shift
+/// or Alt, which keep their own click meanings.
+fn link_chord(modifiers: Modifiers) -> bool {
+    modifiers.command() && !modifiers.shift() && !modifiers.alt()
+}
+
 /// A semantic editor action produced by the widget for the app to apply to its
 /// [`Document`] — an edit verb or a caret motion.
 #[derive(Clone, Debug, PartialEq)]
@@ -396,6 +403,28 @@ pub enum Action {
     /// The wait requested through [`Editor::wake_after`] with this generation
     /// is over. Published once per generation.
     Wake(u64),
+    /// The pointer rested on label part `part` of inlay hint `key`: show the
+    /// part's tooltip.
+    InlayHover {
+        /// The hint.
+        key: inlay::Key,
+        /// The label part under the pointer.
+        part: u32,
+    },
+    /// Ctrl+click on a label part that links somewhere: go there.
+    InlayJump {
+        /// The hint.
+        key: inlay::Key,
+        /// The linked part.
+        part: u32,
+    },
+    /// Double-click on a hint that can be inserted: apply its edits.
+    InlayInsert {
+        /// The hint.
+        key: inlay::Key,
+        /// The buffer offset the hint renders at.
+        offset: u32,
+    },
 }
 
 /// A request to be woken, for [`Editor::wake_after`]: once `delay` has
@@ -455,6 +484,9 @@ impl Action {
                 | Action::ToggleFold { .. }
                 | Action::FoldAtCarets { .. }
                 | Action::Wake(_)
+                | Action::InlayHover { .. }
+                | Action::InlayJump { .. }
+                | Action::InlayInsert { .. }
                 // These verbs reveal through the core's request_reveal —
                 // bumped only when something actually changed, so a no-op F8 /
                 // bracket jump / edge add-caret / Ctrl+D never yanks the viewport
@@ -490,6 +522,24 @@ struct Focus {
 struct Drag {
     granularity: Granularity,
     origin: u32,
+}
+
+/// One inlay hint label part on screen: which hint and part, its buffer row,
+/// and its display cells.
+#[derive(Clone, Debug, PartialEq)]
+struct InlayPart {
+    key: inlay::Key,
+    part: u32,
+    row: u32,
+    cells: Range<u32>,
+}
+
+/// What the open hover card describes, which decides where the pointer keeps
+/// it open: a buffer range (a word, a diagnostic), or an inlay hint part,
+/// which is not in the buffer and is known by its key.
+enum HoverTarget {
+    Range(Range<u32>),
+    Inlay { key: inlay::Key, part: u32 },
 }
 
 /// Per-widget state held in the iced widget tree.
@@ -593,6 +643,13 @@ struct State {
     /// The generation already published, so a frame that sees it again stays
     /// quiet.
     wake_fired: Option<u64>,
+    /// The hint part a tooltip query went out for. The pointer keeps that
+    /// query, and the card it opens, while it stays on this part, and the card
+    /// anchors on its cells.
+    inlay_hover: Option<InlayPart>,
+    /// The link part underlined under the held Ctrl, tracked so that
+    /// entering, leaving or switching parts repaints once.
+    inlay_link: Option<InlayPart>,
 }
 
 impl Default for State {
@@ -627,6 +684,8 @@ impl Default for State {
             wake: None,
             wake_first_seen: None,
             wake_fired: None,
+            inlay_hover: None,
+            inlay_link: None,
         }
     }
 }
@@ -698,6 +757,9 @@ pub struct Editor<'a, Message> {
     /// The open hover popup, if any (app-supplied) — a markdown box anchored
     /// at the hovered word.
     hover: Option<&'a HoverInfo>,
+    /// The open inlay tooltip, if any (app-supplied): the hint, the label part
+    /// it describes and its markdown.
+    inlay_tooltip: Option<(inlay::Key, u32, &'a str)>,
     /// The word an in-flight async hover request is about, if any
     /// (app-supplied). A pointer move that stays inside it keeps the request.
     hover_pending: Option<Range<u32>>,
@@ -720,6 +782,7 @@ impl<'a, Message> Editor<'a, Message> {
             snippet_active: false,
             signature: None,
             hover: None,
+            inlay_tooltip: None,
             hover_pending: None,
             wake: None,
             font: crate::DEFAULT_FONT,
@@ -756,6 +819,15 @@ impl<'a, Message> Editor<'a, Message> {
     #[must_use]
     pub fn hover(mut self, hover: Option<&'a HoverInfo>) -> Self {
         self.hover = hover;
+        self
+    }
+
+    /// Supply the open inlay hint tooltip: the hint, the label part it
+    /// describes and its markdown. The card anchors on that part's cells and
+    /// stays open while the pointer is on the part or the card.
+    #[must_use]
+    pub fn inlay_tooltip(mut self, tooltip: Option<(inlay::Key, u32, &'a str)>) -> Self {
+        self.inlay_tooltip = tooltip;
         self
     }
 
@@ -1885,6 +1957,15 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             }
         }
 
+        // The held Ctrl's link: underlined, like a hyperlink, in the hint label's
+        // colour.
+        if let Some(link) = &state.inlay_link {
+            let top = geo.row_y(fold_map.to_display_row(BufferRow(link.row)));
+            let x = geo.cell_x(link.cells.start as f32);
+            let width = (link.cells.end - link.cells.start) as f32 * advance;
+            fill(renderer, Rectangle { x, y: top + line_h - 2.0, width, height: 1.0 }, Color { a: INLAY_TEXT_A, ..text_color });
+        }
+
         // Carets (over the text), clipped to the viewport — only in the solid
         // half of the blink cycle, and only when focused. Centered on the
         // insertion point (x − width/2), text-colored. A caret on a collapsed
@@ -2015,9 +2096,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             fill(renderer, Rectangle { x: hb.thumb_x, y: hb.y, width: hb.thumb_w, height: SCROLLBAR_WIDTH }, thumb);
         }
 
-        // Hover popup — a markdown box at the hovered word.
-        if let Some(info) = self.hover {
-            self.draw_hover(renderer, info, &geo, text_color, state.hover_scroll);
+        // Hover popup — a markdown box at the hovered word or hint part.
+        if let Some((_, l)) = self.open_card(state, &rows, &geo) {
+            self.draw_hover(renderer, &l, &geo, text_color, state.hover_scroll);
         }
 
         // Signature-help box — above the caret, under the completion popup.
@@ -2162,6 +2243,18 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                         return;
                     }
                 }
+                // Ctrl+click on a linked label part jumps through it. On a set the
+                // text has moved past, the location is stale: the click still
+                // belongs to the link and does nothing.
+                if link_chord(state.modifiers) {
+                    if let Some((_, inlay::At::Label { key, part, link: inlay::Link::Jumps, .. })) = self.inlay_hit(&rows, &geo, pos) {
+                        if self.inlays_current() {
+                            shell.publish((self.on_action)(Action::InlayJump { key, part }));
+                        }
+                        shell.capture_event();
+                        return;
+                    }
+                }
                 // Ctrl+Click a collapsible (the Ctrl+hover affordance): collapse the
                 // innermost foldable pair under the pointer. No modifier overlap — Alt
                 // adds carets, Shift extends; plain Ctrl is otherwise just a caret.
@@ -2210,11 +2303,29 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                         mouse::click::Kind::Double => Granularity::Word,
                         mouse::click::Kind::Triple => Granularity::Line,
                     };
-                    state.drag = Some(Drag { granularity, origin: offset });
-                    let action = if granularity == Granularity::Char {
-                        Action::PlaceCaret(offset)
-                    } else {
-                        Action::DragSelect { granularity, origin: offset, head: offset }
+                    // A hint's text is not in the buffer, so a double click on it
+                    // never selects a word: it inserts the hint when it can, else
+                    // it is a plain click.
+                    let on_hint = (granularity == Granularity::Word).then(|| self.inlay_hit(&rows, &geo, pos)).flatten();
+                    let action = match on_hint {
+                        Some((_, inlay::At::Label { key, offset: at, insert: inlay::Insert::Available, .. }))
+                            if self.inlays_current() =>
+                        {
+                            state.drag = None;
+                            Action::InlayInsert { key, offset: at }
+                        }
+                        Some(_) => {
+                            state.drag = Some(Drag { granularity: Granularity::Char, origin: offset });
+                            Action::PlaceCaret(offset)
+                        }
+                        None => {
+                            state.drag = Some(Drag { granularity, origin: offset });
+                            if granularity == Granularity::Char {
+                                Action::PlaceCaret(offset)
+                            } else {
+                                Action::DragSelect { granularity, origin: offset, head: offset }
+                            }
+                        }
                     };
                     shell.publish((self.on_action)(action));
                 }
@@ -2249,6 +2360,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     .flatten();
                 if chip != state.hover_chip {
                     state.hover_chip = chip;
+                    shell.request_redraw();
+                }
+                let link = self.link_under(state, &rows, &geo, cursor.position_over(bounds));
+                if link != state.inlay_link {
+                    state.inlay_link = link;
                     shell.request_redraw();
                 }
                 // Track the gutter row under the pointer so the hovered fold
@@ -2311,18 +2427,34 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     // over the open hover's word, keep it; otherwise dismiss and
                     // re-arm the timer for the new position (accurate `now` stamped
                     // on the next RedrawRequested).
-                    let off = self.hit_test(&rows, &geo, pos);
-                    // Keep the hover open while the pointer is over its word OR over
-                    // the hover box itself — so it can be moved into and scrolled —
-                    // and keep an unanswered request while the pointer stays on
-                    // the word it asked about.
-                    let still_in = self.hover.is_some_and(|h| {
-                        (off >= h.range.start && off < h.range.end)
-                            || self.hover_layout(h, &geo).rect.contains(pos)
-                    }) || self.hover_pending.as_ref().is_some_and(|w| w.contains(&off));
+                    let hint_under = self.inlay_hit(&rows, &geo, pos);
+                    let part_under = match &hint_under {
+                        Some((_, inlay::At::Label { key, part, .. })) => Some((*key, *part)),
+                        _ => None,
+                    };
+                    // A hint cell maps to the hint's offset, but it is not the
+                    // word there.
+                    let word_off = hint_under.is_none().then(|| self.hit_test(&rows, &geo, pos));
+                    // Keep the card open while the pointer is over what it
+                    // describes (its word, or its hint part) OR over the card
+                    // itself — so it can be moved into and scrolled — and keep an
+                    // unanswered request while the pointer stays on the word or
+                    // part it asked about.
+                    let on_card = self.open_card(state, &rows, &geo).is_some_and(|(target, l)| {
+                        l.rect.contains(pos)
+                            || match target {
+                                HoverTarget::Range(range) => word_off.is_some_and(|o| range.contains(&o)),
+                                HoverTarget::Inlay { key, part } => part_under == Some((key, part)),
+                            }
+                    });
+                    let on_queried_part = state.inlay_hover.as_ref().is_some_and(|p| part_under == Some((p.key, p.part)));
+                    let on_pending_word =
+                        word_off.is_some_and(|o| self.hover_pending.as_ref().is_some_and(|w| w.contains(&o)));
+                    let still_in = on_card || on_queried_part || on_pending_word;
                     if !still_in {
-                        if self.hover.is_some() || state.hover_queried {
+                        if self.card_or_query(state) {
                             state.hover_queried = false;
+                            state.inlay_hover = None;
                             shell.publish((self.on_action)(Action::HoverDismiss));
                         }
                         state.hover_pos = Some(pos);
@@ -2336,8 +2468,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     state.hover_pos = None;
                     state.hover_at = None;
                     state.hover_scroll = 0.0;
-                    if self.hover.is_some() || state.hover_queried {
+                    if self.card_or_query(state) {
                         state.hover_queried = false;
+                        state.inlay_hover = None;
                         shell.publish((self.on_action)(Action::HoverDismiss));
                     }
                 }
@@ -2371,8 +2504,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 // Wheel over an overflowing hover scrolls its content (widget
                 // state, snapped to whole lines), captured so it never reaches
                 // the editor beneath.
-                if let (Some(info), Some(pos)) = (self.hover, cursor.position_over(bounds)) {
-                    let l = self.hover_layout(info, &geo);
+                if let (Some((_, l)), Some(pos)) = (self.open_card(state, &rows, &geo), cursor.position_over(bounds)) {
                     if l.overflow && l.rect.contains(pos) {
                         let dy = match delta {
                             mouse::ScrollDelta::Lines { y, .. } => y * line_h,
@@ -2583,6 +2715,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                     shell.request_redraw();
                 }
                 state.modifiers = *mods;
+                // Pressing or releasing Ctrl over a link repaints its underline
+                // without waiting for a mouse move.
+                let geo = self.geo(state, bounds);
+                let link = self.link_under(state, &rows, &geo, cursor.position_over(bounds));
+                if link != state.inlay_link {
+                    state.inlay_link = link;
+                    shell.request_redraw();
+                }
             }
             // Losing window focus ends every in-progress mouse gesture. If the
             // OS steals the pointer mid-drag (a UAC/consent dialog, Win+L, task
@@ -2646,14 +2786,28 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                                     state.fold_preview = Some(opener);
                                     shell.request_redraw();
                                 }
-                                if self.hover.is_some() || state.hover_queried {
+                                if self.card_or_query(state) {
                                     state.hover_queried = false;
+                                    state.inlay_hover = None;
                                     shell.publish((self.on_action)(Action::HoverDismiss));
                                 }
                             } else {
-                                let off = self.hit_test(&rows, &geo, pos);
-                                state.hover_queried = true;
-                                shell.publish((self.on_action)(Action::HoverQuery(off)));
+                                match self.inlay_hit(&rows, &geo, pos) {
+                                    Some((row, inlay::At::Label { key, part, cells, .. })) if self.inlays_current() => {
+                                        state.hover_queried = true;
+                                        state.inlay_hover = Some(InlayPart { key, part, row, cells });
+                                        shell.publish((self.on_action)(Action::InlayHover { key, part }));
+                                    }
+                                    // Padding is background, and a moved set's labels
+                                    // describe text that is gone; neither is the word
+                                    // beneath.
+                                    Some(_) => {}
+                                    None => {
+                                        let off = self.hit_test(&rows, &geo, pos);
+                                        state.hover_queried = true;
+                                        shell.publish((self.on_action)(Action::HoverQuery(off)));
+                                    }
+                                }
                             }
                         }
                     }
@@ -2681,6 +2835,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
         // as the cursor drifts off the band (the grab tracks the raw cursor).
         if state.scrollbar_grab.is_some() || state.hscrollbar_grab.is_some() {
             return mouse::Interaction::default();
+        }
+        if state.inlay_link.is_some() {
+            return mouse::Interaction::Pointer;
         }
         let line_h = state.metrics.line_height;
         let geo = self.geo(state, bounds);
@@ -2813,16 +2970,17 @@ impl<Message> Editor<'_, Message> {
         }
     }
 
-    /// Geometry + wrapped content for the hover popup — one source of truth,
-    /// shared by `draw_hover` and the wheel-scroll handler. Parses the markdown,
-    /// word-wraps each source line at the box width, caps the visible height at
-    /// `HOVER_MAX_VISIBLE`, and places the box above the word (flips below when
-    /// tight).
-    fn hover_layout(&self, info: &HoverInfo, geo: &Geo) -> HoverLayout {
+    /// Geometry + wrapped content for a hover card showing `markdown` — one
+    /// source of truth, shared by `draw_hover`, the wheel-scroll handler and
+    /// the pointer's keep-open test. Parses the markdown, word-wraps each
+    /// source line at the box width, caps the visible height at
+    /// `HOVER_MAX_VISIBLE`, and places the box above the anchor row
+    /// `(x, row_top, row_bottom)` (flips below when tight).
+    fn card_layout(&self, markdown: &str, anchor: (f32, f32, f32), geo: &Geo) -> HoverLayout {
         let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
         let pad_x = 8.0_f32; // hovers breathe more on the x axis
         let pad_y = popup::POPUP_PAD;
-        let md_lines: Vec<Vec<(String, MdStyle)>> = info.markdown.lines().map(parse_md_runs).collect();
+        let md_lines: Vec<Vec<(String, MdStyle)>> = markdown.lines().map(parse_md_runs).collect();
         let vis_len = |runs: &[(String, MdStyle)]| runs.iter().map(|(t, _)| t.chars().count()).sum::<usize>();
         let cells = md_lines.iter().map(|r| vis_len(r)).max().unwrap_or(0).clamp(popup::POPUP_MIN_CH, popup::POPUP_MAX_CH);
         let lines: Vec<Vec<(String, MdStyle)>> = md_lines.iter().flat_map(|r| wrap_runs(r, cells)).collect();
@@ -2835,9 +2993,7 @@ impl<Message> Editor<'_, Message> {
         let width = inner_w + 2.0 * pad_x + sb_w;
         let height = visible as f32 * line_h + 2.0 * pad_y;
 
-        // The shared display-space anchor; the hover keeps its own
-        // above-first flip below.
-        let (word_x, word_top, word_bottom) = self.popup_anchor(&self.doc.rows(), geo, info.range.start, Edge::Start);
+        let (word_x, word_top, word_bottom) = anchor;
         let y = if word_top - height >= bounds.y { word_top - height } else { word_bottom };
         let x = word_x.clamp(bounds.x, (bounds.x + bounds.width - width).max(bounds.x));
 
@@ -2852,20 +3008,35 @@ impl<Message> Editor<'_, Message> {
         }
     }
 
-    /// Render the hover popup — a rich-markdown box anchored at the hovered
-    /// word (above it, flips below when tight). Wraps at the box width; when the
+    /// The word card for `info`, anchored at its range's start.
+    fn hover_layout(&self, rows: &Rows<'_>, info: &HoverInfo, geo: &Geo) -> HoverLayout {
+        self.card_layout(&info.markdown, self.popup_anchor(rows, geo, info.range.start, Edge::Start), geo)
+    }
+
+    /// The open card, inlay tooltip first, with its layout. An inlay card
+    /// shows only on the part the widget queried, because only that part's
+    /// cells anchor it.
+    fn open_card(&self, state: &State, rows: &Rows<'_>, geo: &Geo) -> Option<(HoverTarget, HoverLayout)> {
+        if let Some((key, part, markdown)) = self.inlay_tooltip {
+            let spot = state.inlay_hover.as_ref().filter(|p| p.key == key && p.part == part)?;
+            let top = geo.row_y(rows.folds().to_display_row(BufferRow(spot.row)));
+            let anchor = (geo.cell_x(spot.cells.start as f32), top, top + geo.line_h());
+            return Some((HoverTarget::Inlay { key, part }, self.card_layout(markdown, anchor, geo)));
+        }
+        self.hover.map(|info| (HoverTarget::Range(info.range.clone()), self.hover_layout(rows, info, geo)))
+    }
+
+    /// Whether a card shows or a query is out: leaving the spot must then
+    /// publish `HoverDismiss`.
+    fn card_or_query(&self, state: &State) -> bool {
+        self.hover.is_some() || self.inlay_tooltip.is_some() || state.hover_queried
+    }
+
+    /// Render a hover card laid out as `l` — a rich-markdown box. When the
     /// content is taller than `HOVER_MAX_VISIBLE` it scrolls (wheel-driven
     /// `hover_scroll`, snapped to whole lines) with an auto scrollbar.
-    fn draw_hover(
-        &self,
-        renderer: &mut iced::Renderer,
-        info: &HoverInfo,
-        geo: &Geo,
-        text_color: Color,
-        hover_scroll: f32,
-    ) {
+    fn draw_hover(&self, renderer: &mut iced::Renderer, l: &HoverLayout, geo: &Geo, text_color: Color, hover_scroll: f32) {
         let (advance, line_h) = (geo.advance(), geo.line_h());
-        let l = self.hover_layout(info, geo);
         fill_panel(renderer, l.rect, POPUP_SURFACE, POPUP_BORDER, 8.0);
 
         let scroll = hover_scroll.clamp(0.0, l.max_scroll);
@@ -3236,6 +3407,36 @@ impl<Message> Editor<'_, Message> {
         let fold_map = rows.folds();
         let row = fold_map.to_buffer_row(fold_map.display_row_at(geo.rows_from_top(pos.y)));
         rows.hit(row, geo.x_cell(pos.x), scrive_core::Bias::Left)
+    }
+
+    /// The inlay hint under `pos`, if any, and the buffer row it is on.
+    /// Padding is reported as such, so callers can keep it from falling
+    /// through to the word beneath.
+    fn inlay_hit(&self, rows: &Rows<'_>, geo: &Geo, pos: Point) -> Option<(u32, inlay::At)> {
+        let folds = rows.folds();
+        let row = folds.to_buffer_row(folds.display_row_at(geo.rows_from_top(pos.y)));
+        rows.inlay_at(row, geo.x_cell(pos.x)).map(|at| (row.0, at))
+    }
+
+    /// Whether the shown hints were fetched for the current text. A moved
+    /// set's tooltips, locations and edits describe text that is gone, so its
+    /// cells take no gesture.
+    fn inlays_current(&self) -> bool {
+        self.doc.inlays_revision() == Some(self.doc.revision())
+    }
+
+    /// The linked label part the held Ctrl would follow, if the pointer is on
+    /// one. `None` during a drag, so a Ctrl-drag across a link neither
+    /// underlines nor captures, and `None` on a moved set.
+    fn link_under(&self, state: &State, rows: &Rows<'_>, geo: &Geo, pos: Option<Point>) -> Option<InlayPart> {
+        let dragging = state.drag.is_some() || state.column_drag_anchor.is_some();
+        if !link_chord(state.modifiers) || dragging || !self.inlays_current() {
+            return None;
+        }
+        match self.inlay_hit(rows, geo, pos.filter(|p| !geo.in_gutter(p.x))?)? {
+            (row, inlay::At::Label { key, part, link: inlay::Link::Jumps, cells, .. }) => Some(InlayPart { key, part, row, cells }),
+            _ => None,
+        }
     }
 
     /// Draw a row that has inline (single-line) folds or inlay hints: its
@@ -4965,7 +5166,7 @@ mod tests {
         // …the hover above-first. (The signature box calls the same
         // popup_anchor by construction.)
         let info = HoverInfo { markdown: "hi".into(), range: head..head + 4 };
-        let l = ed.hover_layout(&info, &geo);
+        let l = ed.hover_layout(&rows, &info, &geo);
         assert_eq!(l.rect.y, top - l.rect.height, "hover sits above the DISPLAY row");
     }
 
@@ -5084,11 +5285,13 @@ mod tests {
         }))
     }
 
-    /// What one `pump_editor` call left: the published actions and the widget
-    /// cache.
+    /// What one `pump_editor` call left: the published actions, the widget
+    /// cache, the pointer shape and each event's capture status.
     struct Pumped {
         actions: Vec<Action>,
         cache: iced_runtime::user_interface::Cache,
+        interaction: mouse::Interaction,
+        statuses: Vec<iced::event::Status>,
     }
 
     /// Run `events` through a one-editor UI built from `editor` with the
@@ -5101,11 +5304,11 @@ mod tests {
         events: &[iced::Event],
     ) -> Pumped {
         use iced::advanced::shell;
-        use iced_runtime::user_interface::UserInterface;
+        use iced_runtime::user_interface::{self, UserInterface};
         let element: iced::Element<'_, Action, iced::Theme, iced::Renderer> = editor.into();
         let mut ui = UserInterface::build(element, Size::new(500.0, 320.0), cache, renderer);
         let mut bus = shell::Bus::new();
-        let _ = ui.update(
+        let (ui_state, statuses) = ui.update(
             &iced::window::Headless,
             &shell::Waker::noop(),
             events,
@@ -5113,7 +5316,11 @@ mod tests {
             renderer,
             &mut bus,
         );
-        Pumped { actions: bus.into_iter().collect(), cache: ui.into_cache() }
+        let interaction = match ui_state {
+            user_interface::State::Updated { mouse_interaction, .. } => mouse_interaction,
+            user_interface::State::Outdated => mouse::Interaction::None,
+        };
+        Pumped { actions: bus.into_iter().collect(), cache: ui.into_cache(), interaction, statuses }
     }
 
     /// Run `events` through a one-editor UI over `doc` with the pointer at `at`
@@ -5252,6 +5459,212 @@ mod tests {
         Widget::<Action, iced::Theme, iced::Renderer>::diff(&mut on_b, &mut tree);
         let st = tree.state.downcast_ref::<State>();
         assert_eq!((st.wake, st.wake_first_seen, st.wake_fired), (None, None, None), "the wake belongs to the old document");
+    }
+
+    /// `let x = 1;` with a `: i32` type hint after `x` (key 1, insertable):
+    /// part 0 `": "` has no link and covers cells 5..7, part 1 `"i32"` links
+    /// and covers cells 7..10. Installed at the current revision.
+    fn hinted_doc() -> Document {
+        let mut doc = Document::new("let x = 1;\n").expect("doc fits");
+        let label = vec![inlay::Part::new(": ", inlay::Link::None), inlay::Part::new("i32", inlay::Link::Jumps)];
+        let hint = inlay::Hint::new(inlay::Kind::Type, label, inlay::Key::new(1))
+            .expect("non-empty label")
+            .insert(inlay::Insert::Available);
+        let outcome = doc.set_inlays(doc.revision(), vec![inlay::Placed::new(5, hint)]);
+        assert!(matches!(outcome, inlay::Outcome::Applied { .. }), "installed at the current revision");
+        doc
+    }
+
+    /// `foo(1)` with a parameter hint `n:` before `1` (right padding, no
+    /// edits): label cells 4..6, padding cell 6.
+    fn padded_doc() -> Document {
+        hinted("foo(1)\n", &[(4, inlay::Kind::Parameter, "n:", inlay::Padding { left: false, right: true })])
+    }
+
+    /// The screen point at the middle of display cell `cell` on row 0, in
+    /// `pump_editor`'s 500×320 frame (measured metrics, unscrolled).
+    fn cell_point(doc: &Document, cell: u32) -> Point {
+        let ed = Editor::new(doc, |a: Action| a);
+        let mut state = State::default();
+        ed.ensure_metrics(&mut state);
+        let geo = ed.geo(&state, Rectangle { x: 0.0, y: 0.0, width: 500.0, height: 320.0 });
+        Point::new(geo.cell_x(cell as f32 + 0.5), geo.line_h() / 2.0)
+    }
+
+    /// A left press.
+    fn press() -> iced::Event {
+        iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+    }
+
+    /// A left release.
+    fn release() -> iced::Event {
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+    }
+
+    /// Ctrl (Cmd on macOS) going down.
+    fn ctrl_down() -> iced::Event {
+        iced::Event::Keyboard(Keyboard::ModifiersChanged(Modifiers::COMMAND))
+    }
+
+    /// The pointer moving to `to`.
+    fn move_to(to: Point) -> iced::Event {
+        iced::Event::Mouse(mouse::Event::CursorMoved { position: to })
+    }
+
+    /// Run `events` over `doc` with a fresh widget state, pointer at `at`.
+    fn pump_fresh(doc: &Document, at: Point, events: &[iced::Event]) -> Pumped {
+        let mut r = headless_renderer();
+        pump_editor(Editor::new(doc, |a| a), iced_runtime::user_interface::Cache::new(), &mut r, at, events)
+    }
+
+    /// Whether `actions` hold any hover or inlay-hover query.
+    fn queries(actions: &[Action]) -> bool {
+        actions.iter().any(|a| matches!(a, Action::HoverQuery(_) | Action::InlayHover { .. }))
+    }
+
+    /// Resting on a hint label asks for the part's tooltip, never for the
+    /// word at the hint's offset.
+    #[test]
+    fn resting_on_a_hint_label_publishes_inlay_hover_not_hover_query() {
+        let doc = hinted_doc();
+        let at = cell_point(&doc, 8);
+        let p = pump_fresh(&doc, at, &rest_on(at));
+        assert!(p.actions.contains(&Action::InlayHover { key: inlay::Key::new(1), part: 1 }), "the i32 part: {:?}", p.actions);
+        assert!(!p.actions.iter().any(|a| matches!(a, Action::HoverQuery(_))), "no word hover");
+    }
+
+    /// Padding is background: resting there asks for nothing.
+    #[test]
+    fn resting_on_hint_padding_queries_nothing() {
+        let doc = padded_doc();
+        let at = cell_point(&doc, 6);
+        let p = pump_fresh(&doc, at, &rest_on(at));
+        assert!(!queries(&p.actions), "padding is neither a hint part nor a word: {:?}", p.actions);
+    }
+
+    /// The tooltip card, and the query before it, stay while the pointer is
+    /// on the queried part; another part dismisses them.
+    #[test]
+    fn the_inlay_card_stays_open_while_the_pointer_stays_on_its_part() {
+        let doc = hinted_doc();
+        let mut r = headless_renderer();
+        let (rest, inside, other) = (cell_point(&doc, 7), cell_point(&doc, 9), cell_point(&doc, 5));
+        let card = || Editor::new(&doc, |a| a).inlay_tooltip(Some((inlay::Key::new(1), 1, "**i32**")));
+
+        let p = pump_editor(card(), iced_runtime::user_interface::Cache::new(), &mut r, rest, &rest_on(rest));
+        let p = pump_editor(card(), p.cache, &mut r, inside, &[move_to(inside)]);
+        assert!(!p.actions.contains(&Action::HoverDismiss), "a move inside the part keeps the card");
+        let p = pump_editor(card(), p.cache, &mut r, other, &[move_to(other)]);
+        assert!(p.actions.contains(&Action::HoverDismiss), "another part dismisses it");
+
+        let p = pump_fresh(&doc, rest, &rest_on(rest));
+        let p = pump_editor(Editor::new(&doc, |a| a), p.cache, &mut r, inside, &[move_to(inside)]);
+        assert!(!p.actions.contains(&Action::HoverDismiss), "an unanswered query on the part is kept");
+    }
+
+    /// Hint hover, like word hover, arms only while the editor is focused.
+    #[test]
+    fn hint_hover_arms_only_while_focused() {
+        let doc = hinted_doc();
+        let mut r = headless_renderer();
+        let at = cell_point(&doc, 8);
+        let p = pump_fresh(&doc, Point::new(600.0, 5.0), &[press()]);
+        let p = pump_editor(Editor::new(&doc, |a| a), p.cache, &mut r, at, &rest_on(at));
+        assert!(!queries(&p.actions), "an unfocused editor asks nothing: {:?}", p.actions);
+    }
+
+    /// Ctrl+click on a linked part jumps through it and keeps the press from
+    /// placing a caret.
+    #[test]
+    fn ctrl_click_on_a_link_part_publishes_inlay_jump_and_captures() {
+        let doc = hinted_doc();
+        let p = pump_fresh(&doc, cell_point(&doc, 8), &[ctrl_down(), press()]);
+        assert!(p.actions.contains(&Action::InlayJump { key: inlay::Key::new(1), part: 1 }), "{:?}", p.actions);
+        assert!(!p.actions.iter().any(|a| matches!(a, Action::PlaceCaret(_))), "no caret");
+        assert_eq!(p.statuses.get(1), Some(&iced::event::Status::Captured), "the press is captured");
+    }
+
+    /// Ctrl+click on a part without a link is a plain click.
+    #[test]
+    fn ctrl_click_on_a_part_without_a_link_places_the_caret() {
+        let doc = hinted_doc();
+        let p = pump_fresh(&doc, cell_point(&doc, 5), &[ctrl_down(), press()]);
+        assert!(p.actions.contains(&Action::PlaceCaret(5)), "{:?}", p.actions);
+        assert!(!p.actions.iter().any(|a| matches!(a, Action::InlayJump { .. })), "no jump");
+    }
+
+    /// Holding Ctrl over a linked part shows the pointer, unless a drag is
+    /// in progress.
+    #[test]
+    fn ctrl_over_a_link_part_shows_the_pointer_except_during_a_drag() {
+        let doc = hinted_doc();
+        let mut r = headless_renderer();
+        let link = cell_point(&doc, 8);
+        let p = pump_fresh(&doc, link, &[ctrl_down(), move_to(link)]);
+        assert_eq!(p.interaction, mouse::Interaction::Pointer, "Ctrl over the link");
+
+        let p = pump_fresh(&doc, cell_point(&doc, 0), &[press()]);
+        let p = pump_editor(Editor::new(&doc, |a| a), p.cache, &mut r, link, &[ctrl_down(), move_to(link)]);
+        assert_ne!(p.interaction, mouse::Interaction::Pointer, "a drag across the link keeps the text cursor");
+    }
+
+    /// A single click on a hint places the caret at the hint's offset.
+    #[test]
+    fn a_single_click_on_a_hint_places_the_caret_at_its_offset() {
+        let doc = hinted_doc();
+        let p = pump_fresh(&doc, cell_point(&doc, 8), &[press()]);
+        assert!(p.actions.contains(&Action::PlaceCaret(5)), "{:?}", p.actions);
+    }
+
+    /// A double click on an insertable hint inserts it instead of selecting
+    /// a word.
+    #[test]
+    fn double_click_on_an_insertable_hint_publishes_inlay_insert() {
+        let doc = hinted_doc();
+        let p = pump_fresh(&doc, cell_point(&doc, 8), &[press(), release(), press()]);
+        assert_eq!(p.actions.last(), Some(&Action::InlayInsert { key: inlay::Key::new(1), offset: 5 }), "{:?}", p.actions);
+        assert!(!p.actions.iter().any(|a| matches!(a, Action::DragSelect { .. })), "no word selection");
+    }
+
+    /// A double click on a hint that can't be inserted is two plain clicks.
+    #[test]
+    fn double_click_on_a_hint_without_edits_places_the_caret_without_selecting() {
+        let doc = padded_doc();
+        let p = pump_fresh(&doc, cell_point(&doc, 4), &[press(), release(), press()]);
+        let carets = p.actions.iter().filter(|a| **a == Action::PlaceCaret(4)).count();
+        assert_eq!(carets, 2, "both presses place the caret: {:?}", p.actions);
+        assert!(!p.actions.iter().any(|a| matches!(a, Action::DragSelect { .. })), "no word selection");
+    }
+
+    /// Once the text has moved past the hint set, its cells take no gesture:
+    /// no hover, no jump (the click is still consumed), no insert, no link.
+    #[test]
+    fn gestures_on_a_stale_hint_set_do_nothing() {
+        let mut doc = hinted_doc();
+        let len = doc.buffer().len();
+        doc.edit(vec![scrive_core::EditOp::new(len..len, "\n")]).expect("edit applies");
+        let at = cell_point(&doc, 8);
+
+        let p = pump_fresh(&doc, at, &rest_on(at));
+        assert!(!queries(&p.actions), "no hover of either kind: {:?}", p.actions);
+
+        let p = pump_fresh(&doc, at, &[ctrl_down(), press()]);
+        assert!(
+            !p.actions.iter().any(|a| matches!(a, Action::InlayJump { .. } | Action::PlaceCaret(_))),
+            "no jump and no caret: {:?}",
+            p.actions
+        );
+        assert_eq!(p.statuses.get(1), Some(&iced::event::Status::Captured), "the click still belongs to the link");
+
+        let p = pump_fresh(&doc, at, &[press(), release(), press()]);
+        assert_eq!(p.actions.last(), Some(&Action::PlaceCaret(5)), "{:?}", p.actions);
+        assert!(
+            !p.actions.iter().any(|a| matches!(a, Action::InlayInsert { .. } | Action::DragSelect { .. })),
+            "no insert and no selection"
+        );
+
+        let p = pump_fresh(&doc, at, &[ctrl_down(), move_to(at)]);
+        assert_ne!(p.interaction, mouse::Interaction::Pointer, "no link on a stale set");
     }
 
     /// A document whose first row is one 240-char word, so any x in the code
