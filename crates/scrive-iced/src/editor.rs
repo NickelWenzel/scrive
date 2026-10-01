@@ -1682,7 +1682,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
                 if row_layout.glyph_hidden(col) {
                     continue;
                 }
-                let x = geo.cell_x(row_layout.display_cell(col) as f32);
+                let x = geo.cell_x(row_layout.display_cell(col, Edge::Start) as f32);
                 let color = if br.partner.is_none() {
                     UNMATCHED_BRACKET
                 } else {
@@ -3104,7 +3104,7 @@ impl<Message> Editor<'_, Message> {
             if text.is_empty() || row_layout.glyph_hidden(start_col) {
                 return;
             }
-            let x = origin.x + row_layout.display_cell(start_col) as f32 * advance;
+            let x = origin.x + row_layout.display_cell(start_col, Edge::Start) as f32 * advance;
             self.draw_line(renderer, expand_tabs(text), Point::new(x, origin.y), color, Alignment::Left, clip);
         };
         match spans {

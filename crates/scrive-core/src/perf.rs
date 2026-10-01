@@ -3,7 +3,7 @@
 //!
 //! Instrumented hot-path primitives (`Buffer::offset_to_point`/`point_to_offset`,
 //! `Patch::map_offset`/`map_many`, the bracket enclosing walk,
-//! `FoldMap::display_position`, `FoldMap::new`, every document-scale
+//! `FoldMap::renders`, `Rows::position`, `FoldMap::new`, every document-scale
 //! `sort`/`retain`/`dedup`) charge the meter by the *units of work they touch*.
 //! A matrix test runs each representative editor operation at 2× every scale
 //! dimension (document size, caret count, fold count) and asserts the meter grows

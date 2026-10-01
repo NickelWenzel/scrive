@@ -846,7 +846,7 @@ impl FoldMap {
     /// block's header line end, or an inline gap's left landable edge; `None` when
     /// visible. `O(log folds)` (regions and inline roots are sorted and disjoint),
     /// so a multi-caret fold pulls every hidden caret out in one `O(carets·log
-    /// folds)` pass instead of an `O(carets·folds)` [`Self::display_position`]
+    /// folds)` pass instead of an `O(carets·folds)` [`Rows::position`](crate::row_layout::Rows::position)
     /// probe each — the "collapse all" ejection at document scale.
     #[must_use]
     pub fn entry_edge_if_hidden(&self, buffer: &Buffer, offset: u32) -> Option<u32> {

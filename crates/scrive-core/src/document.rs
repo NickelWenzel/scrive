@@ -942,7 +942,7 @@ impl Document {
             None => {
                 let p = self.buffer.offset_to_point(head);
                 let layout = rows.layout(BufferRow(p.row));
-                CellCorner { row: p.row, cell: layout.display_cell(p.col) }
+                CellCorner { row: p.row, cell: layout.display_cell(p.col, Edge::Caret) }
             }
         }
     }

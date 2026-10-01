@@ -85,7 +85,7 @@ pub enum Edge {
 /// Where a buffer offset renders: its display row plus its horizontal
 /// [`CaretCell`]. THE owner of "where does offset O show on screen" — a caret,
 /// selection endpoint, squiggle bound, popup anchor, and autoscroll target all
-/// read the same value (see [`FoldMap::display_position`]).
+/// read the same value (see [`Rows::position`]).
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub struct DisplayPosition {
     /// The visible display row (a hidden closing tail resolves to its header's).
@@ -194,12 +194,11 @@ struct InlineSpan {
 
 /// A visible buffer row's horizontal projection: byte column ↔ display cell,
 /// with tab expansion *and* the horizontal collapse of every root inline fold
-/// on the row. Built per use by [`FoldMap::row_layout`]; holds only the row's
-/// text (a [`Cow`] — borrowed straight off the backing when the row is stored
-/// contiguously, owned only when it spans a chunk boundary) and copies of the
-/// row's folds, so it carries no derived state that could drift out of sync
-/// with the document. Like [`FoldMap`], it is cheap to rebuild and never
-/// stored.
+/// on the row. Built by [`Rows::layout`], which shares it for the view's
+/// lifetime; holds only the row's text (a [`Cow`] — borrowed straight off the
+/// backing when the row is stored contiguously, owned only when it spans a
+/// chunk boundary) and copies of the row's folds, so it carries no derived
+/// state that could drift out of sync with the document.
 pub struct RowLayout<'a> {
     line: Cow<'a, str>,
     /// Byte offset of the row's first character (column 0), for offset-space
@@ -258,11 +257,12 @@ impl<'a> RowLayout<'a> {
         (raw_cell as i32 - self.shift_at(raw_cell)).max(0) as u32
     }
 
-    /// Byte column → display cell (tab-expanded, inline-collapsed). Total and
-    /// monotone; a column hidden inside a chip maps into the chip's span (use
-    /// [`Self::caret_cell`] for caret placement, which clips to the center).
+    /// Byte column → display cell (tab-expanded, inline-collapsed), on the
+    /// `edge` side of any hints at `col`. Total and monotone; a column hidden
+    /// inside a chip maps into the chip's span (use [`Self::caret_cell`] for
+    /// caret placement, which clips to the center).
     #[must_use]
-    pub fn display_cell(&self, col: u32) -> u32 {
+    pub fn display_cell(&self, col: u32, _edge: Edge) -> u32 {
         self.cell_of(display_map::expand(&self.line, col, self.tab))
     }
 
@@ -275,7 +275,7 @@ impl<'a> RowLayout<'a> {
             Some(s) => CaretCell::ChipCenter(
                 self.cell_of(s.open_cell + 1) as f32 + INLINE_CHIP_CELLS as f32 / 2.0,
             ),
-            None => CaretCell::Cell(self.display_cell(col)),
+            None => CaretCell::Cell(self.display_cell(col, Edge::Caret)),
         }
     }
 
@@ -316,7 +316,7 @@ impl<'a> RowLayout<'a> {
     /// this — see [`HeaderLayout::tail_cell`].
     #[must_use]
     pub fn width(&self) -> u32 {
-        self.display_cell(self.line.len() as u32)
+        self.display_cell(self.line.len() as u32, Edge::Start)
     }
 
     /// The row's collapsed chips, in display order.
@@ -456,40 +456,16 @@ impl FoldMap {
     /// A fresh horizontal projection of visible buffer `row`; [`Rows::layout`]
     /// shares one per row for a view's lifetime.
     #[must_use]
-    pub fn row_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> RowLayout<'a> {
+    pub(crate) fn row_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> RowLayout<'a> {
         RowLayout::new(self, buffer, row, tab)
     }
 
     /// The `head … tail` one-line layout of `row`, iff it is a collapsed block
     /// fold's header.
     #[must_use]
-    pub fn header_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> Option<HeaderLayout<'a>> {
+    pub(crate) fn header_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> Option<HeaderLayout<'a>> {
         let last = self.fold_at_header(row)?;
         Some(HeaderLayout::new(Rc::new(self.row_layout(buffer, row, tab)), last, buffer, tab))
-    }
-
-    /// THE owner of "where does buffer `offset` render": its display row and
-    /// horizontal cell. Follows a collapsed block's closing tail to the header
-    /// row; clips a column hidden in an inline fold to its chip center. `None`
-    /// iff the offset is genuinely hidden — inside a block fold's gap, or on
-    /// the last row before the visible tail.
-    #[must_use]
-    pub fn display_position(&self, buffer: &Buffer, offset: u32, tab: u32) -> Option<DisplayPosition> {
-        #[cfg(any(test, debug_assertions))]
-        DISPLAY_POSITION_PROBES.with(|c| c.set(c.get() + 1));
-        crate::perf::charge(1); // complexity gate: one display-map probe
-        let p = buffer.offset_to_point(offset);
-        let row = BufferRow(p.row);
-        if !self.is_folded(row) {
-            let layout = self.row_layout(buffer, row, tab);
-            return Some(DisplayPosition { row: self.to_display_row(row), x: layout.caret_cell(p.col) });
-        }
-        // Hidden row: only a collapsed fold's closing tail is representable —
-        // it rides the header's display line.
-        let hdr = self.header_of_tail(row)?;
-        let layout = self.header_layout(buffer, hdr, tab)?;
-        let cell = layout.tail_col_cell(p.col)?;
-        Some(DisplayPosition { row: self.to_display_row(hdr), x: CaretCell::Cell(cell) })
     }
 
     /// Whether buffer `offset` renders anywhere: `false` only inside a
@@ -511,12 +487,12 @@ impl FoldMap {
             .is_some_and(|layout| layout.tail_col_cell(p.col).is_some())
     }
 
-    /// Inverse of [`Self::display_position`] on one visible row: a (fractional,
+    /// Inverse of [`Rows::position`] on one visible row: a (fractional,
     /// unrounded) display cell → the byte offset a click there lands on,
     /// resolving a collapsed header's gap (→ header line end) and tail
     /// (→ the last row's column) before the plain row projection.
     #[must_use]
-    pub fn hit_row(&self, buffer: &Buffer, row: BufferRow, cell: f32, bias: Bias, tab: u32) -> u32 {
+    pub(crate) fn hit_row(&self, buffer: &Buffer, row: BufferRow, cell: f32, bias: Bias, tab: u32) -> u32 {
         if let Some(layout) = self.header_layout(buffer, row, tab) {
             match layout.hit(cell, bias) {
                 HeaderHit::Tail(col) => return buffer.point_to_offset(Point::new(layout.last_row().0, col)),
@@ -664,7 +640,7 @@ mod tests {
         // col 3 (strict interior) clips to the chip center: cell 2 + 1.5.
         assert_eq!(rl.caret_cell(3), CaretCell::ChipCenter(2.0 + INLINE_CHIP_CELLS as f32 / 2.0));
         // col 7 == close: the RIGHT landable edge.
-        assert_eq!(rl.caret_cell(7), CaretCell::Cell(rl.display_cell(7)));
+        assert_eq!(rl.caret_cell(7), CaretCell::Cell(rl.display_cell(7, Edge::Caret)));
         // Glyphs: open+1's glyph hides even though its caret slot is landable.
         assert!(rl.glyph_hidden(2));
         assert!(!rl.glyph_hidden(7), "the closing bracket stays visible");
@@ -691,7 +667,7 @@ mod tests {
             if rl.glyph_hidden(col) {
                 continue; // interior columns resolve to the chip instead
             }
-            assert_eq!(rl.hit(rl.display_cell(col) as f32, Bias::Left), col, "round-trip col {col}");
+            assert_eq!(rl.hit(rl.display_cell(col, Edge::Start) as f32, Bias::Left), col, "round-trip col {col}");
         }
         // Every cell strictly on a chip resolves to just after its `[`. The
         // second chip is the discriminating case: it resolves correctly only
@@ -743,28 +719,28 @@ mod tests {
         }
     }
 
-    // ── display_position: the one offset→(row, x) owner — an offset below a
+    // ── Rows::position: the one offset→(row, x) owner — an offset below a
     //    fold resolves onto its visible display-space row ──
 
     #[test]
-    fn display_position_follows_tail_and_hides_gap() {
+    fn position_follows_tail_and_hides_gap() {
         let text = "a {\nhidden\n} tail\nafter\n";
         let block_open = text.find('{').unwrap() as u32;
         let doc = doc_with_folds(text, &[block_open]);
-        let fm = fold_map(&doc);
+        let rows = doc.rows();
         let buffer = doc.buffer();
         // An offset inside the fold's gap is unrepresentable.
         let hidden = buffer.point_to_offset(Point::new(1, 2));
-        assert_eq!(fm.display_position(buffer, hidden, 4), None);
+        assert_eq!(rows.position(hidden, Edge::Caret), None);
         // The tail `}` rides the header's display row at the tail cell.
         let tail = buffer.point_to_offset(Point::new(2, 0));
-        let p = fm.display_position(buffer, tail, 4).expect("tail is visible");
+        let p = rows.position(tail, Edge::Caret).expect("tail is visible");
         assert_eq!(p.row, DisplayRow(0));
-        let hl = fm.header_layout(buffer, BufferRow(0), 4).unwrap();
+        let hl = rows.header(BufferRow(0)).unwrap();
         assert_eq!(p.x, CaretCell::Cell(hl.tail_cell()));
         // A row below the fold is shifted up by the hidden count.
         let after = buffer.point_to_offset(Point::new(3, 0));
-        let p = fm.display_position(buffer, after, 4).expect("visible");
+        let p = rows.position(after, Edge::Caret).expect("visible");
         assert_eq!(p.row, DisplayRow(1), "rows 1..=2 hidden ⇒ row 3 displays at 1");
     }
 
@@ -804,8 +780,8 @@ mod tests {
         let fm = fold_map(&doc);
         let rl = fm.row_layout(doc.buffer(), BufferRow(0), 4);
         assert!(rl.is_plain());
-        assert_eq!(rl.display_cell(0), 0);
-        assert_eq!(rl.display_cell(1), 4, "tab expands to the stop");
+        assert_eq!(rl.display_cell(0, Edge::Start), 0);
+        assert_eq!(rl.display_cell(1, Edge::Start), 4, "tab expands to the stop");
         assert_eq!(rl.width(), 4 + "x = 1".len() as u32);
         assert_eq!(rl.hit(4.0, Bias::Left), 1);
     }

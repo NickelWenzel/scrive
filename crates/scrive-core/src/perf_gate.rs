@@ -7,7 +7,7 @@
 //! meter grows within that operation's declared budget. Coverage comes from the
 //! meter sitting on the shared *semantic* primitives every hot path flows through
 //! (`offset_to_point`, the per-query `map_offset`, the bracket enclosing-walk
-//! step, `display_position`, the document-scale `sort`/`retain`), so ANY function
+//! step, `Rows::position`, the document-scale `sort`/`retain`), so ANY function
 //! — named or not, present or future — that does superlinear work makes its
 //! operation trip here. The contracts double as documentation of what a keystroke
 //! is *allowed* to cost.
