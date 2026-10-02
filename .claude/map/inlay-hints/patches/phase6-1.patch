@@ -1,0 +1,97 @@
+diff --git a/crates/scrive-lsp/src/client.rs b/crates/scrive-lsp/src/client.rs
+index 73e7f3b..8f2369b 100644
+--- a/crates/scrive-lsp/src/client.rs
++++ b/crates/scrive-lsp/src/client.rs
+@@ -1063,7 +1063,15 @@ impl Client {
+         let locations: Option<workspace::Locations> = decode(entry.query.method(), Some(value))?;
+         let target = locations
+             .and_then(workspace::Locations::first)
+-            .and_then(|(key, range)| self.target(entry, key, range));
++            .and_then(|(key, range)| {
++                self.target(
++                    entry.doc_id,
++                    &entry.request_snapshot,
++                    &entry.revisions,
++                    key,
++                    range,
++                )
++            });
+         Ok(Output::answer(
+             entry.doc_id,
+             entry.latest_ticket,
+@@ -1071,19 +1079,20 @@ impl Client {
+         ))
+     }
+ 
+-    /// Where `range` in `key` lies relative to `entry`'s document; `None` when it is in another
+-    /// open document whose text is not the one the server answered for.
++    /// Where `range` in `key` lies relative to the `requester` document, whose positions convert
++    /// against `snapshot`; `None` when it is in another open document whose synced revision is
++    /// not the one `revisions` recorded when the server was asked.
+     fn target(
+         &self,
+-        entry: &Pending,
++        requester: DocId,
++        snapshot: &Snapshot,
++        revisions: &[(uri::Key, Revision)],
+         key: uri::Key,
+         range: lsp_types::Range,
+     ) -> Option<update::Target> {
+-        let requester = self.tracked.iter().find(|t| t.doc_id == entry.doc_id)?;
++        let requester = self.tracked.iter().find(|t| t.doc_id == requester)?;
+         if key == requester.key {
+-            return Some(update::Target::Local(
+-                self.encoding.span(&entry.request_snapshot, range),
+-            ));
++            return Some(update::Target::Local(self.encoding.span(snapshot, range)));
+         }
+         let Some(tracked) = self.tracked.iter().find(|t| t.key == key) else {
+             return Some(update::Target::Unopened(jump::Unopened::new(
+@@ -1092,7 +1101,7 @@ impl Client {
+                 self.encoding,
+             )));
+         };
+-        if entry.revision_of(&key) != Some(tracked.synced.revision()) {
++        if revision_of(revisions, &key) != Some(tracked.synced.revision()) {
+             return None;
+         }
+         Some(update::Target::Open(jump::Open::new(
+@@ -1112,7 +1121,7 @@ impl Client {
+             return Ok(Output::default());
+         };
+         for file in edit.files() {
+-            let recorded = entry.revision_of(file.key());
++            let recorded = revision_of(&entry.revisions, file.key());
+             let stale = match self.tracked.iter().find(|t| t.key == *file.key()) {
+                 Some(tracked) => {
+                     recorded != Some(tracked.synced.revision())
+@@ -1381,14 +1390,6 @@ impl Pending {
+             }
+         }
+     }
+-
+-    /// The synced revision `key` was at when the request went out, if it was open then.
+-    fn revision_of(&self, key: &uri::Key) -> Option<Revision> {
+-        self.revisions
+-            .iter()
+-            .find(|(k, _)| k == key)
+-            .map(|&(_, revision)| revision)
+-    }
+ }
+ 
+ impl Kind {
+@@ -1542,6 +1543,14 @@ fn cancel(id: message::Id) -> Message {
+     })
+ }
+ 
++/// The synced revision `key` was at when `revisions` were recorded, if it was open then.
++fn revision_of(revisions: &[(uri::Key, Revision)], key: &uri::Key) -> Option<Revision> {
++    revisions
++        .iter()
++        .find(|(k, _)| k == key)
++        .map(|&(_, revision)| revision)
++}
++
+ /// The longest registered trigger that the text before `caret` ends with. Triggers may be
+ /// longer than one character (`::`).
+ fn matched_trigger(snapshot: &Snapshot, caret: u32, triggers: &[String]) -> Option<String> {

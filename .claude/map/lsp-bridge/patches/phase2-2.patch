@@ -1,0 +1,398 @@
+diff --git a/crates/scrive-core/src/intel.rs b/crates/scrive-core/src/intel.rs
+index de0e956..1bdd130 100644
+--- a/crates/scrive-core/src/intel.rs
++++ b/crates/scrive-core/src/intel.rs
+@@ -17,3 +17,4 @@ pub mod hover;
+ pub mod providers;
+ pub mod signature;
+ pub mod snippet;
++pub mod ticket;
+diff --git a/crates/scrive-core/src/intel/completion.rs b/crates/scrive-core/src/intel/completion.rs
+index 9128651..a463483 100644
+--- a/crates/scrive-core/src/intel/completion.rs
++++ b/crates/scrive-core/src/intel/completion.rs
+@@ -35,8 +35,8 @@ pub struct PopupList {
+ }
+ 
+ impl PopupList {
+-    /// Rebuild `filtered` as the items whose label starts with `word` (folding
+-    /// ASCII case — completion labels are code identifiers), in `sort_key` order
++    /// Rebuild `filtered` as the items that [`match`](CompletionItem::matches)
++    /// `word`, in `sort_key` order
+     /// (so the provider's tiers survive), and reset the selection to the top.
+     ///
+     /// Runs on **every word char while the popup is open**, so it allocates
+@@ -47,7 +47,7 @@ impl PopupList {
+         self.filtered.clear();
+         self.filtered.extend(
+             (0..self.items.len() as u32)
+-                .filter(|&i| prefix_matches(&self.items[i as usize].label, word)),
++                .filter(|&i| self.items[i as usize].matches(word)),
+         );
+         self.filtered
+             .sort_by(|&a, &b| self.items[a as usize].sort_key.cmp(&self.items[b as usize].sort_key));
+@@ -55,15 +55,6 @@ impl PopupList {
+     }
+ }
+ 
+-/// Whether `label` begins with `prefix`, folding ASCII case only. Compares the
+-/// raw bytes (`as_bytes` never panics on a non-char-boundary split, and
+-/// `eq_ignore_ascii_case` leaves multi-byte UTF-8 exact), so no lowercased copy
+-/// is allocated — the hot completion-filter primitive.
+-fn prefix_matches(label: &str, prefix: &str) -> bool {
+-    let (l, p) = (label.as_bytes(), prefix.as_bytes());
+-    l.len() >= p.len() && l[..p.len()].eq_ignore_ascii_case(p)
+-}
+-
+ /// The completion controller. Holds only the popup state; the document, provider,
+ /// and caret are supplied by the caller per event.
+ pub struct CompletionController {
+@@ -103,13 +94,8 @@ impl CompletionController {
+     /// at most once per event.
+     pub fn on_input(&mut self, cx: &CompletionCx, word: &str, provider: &mut dyn Completions) {
+         match cx.trigger {
+-            CompletionTrigger::Typed(_) => match &mut self.state {
+-                CompletionState::Open(list) => {
+-                    list.refilter(word);
+-                    if list.filtered.is_empty() {
+-                        self.state = CompletionState::Closed;
+-                    }
+-                }
++            CompletionTrigger::Typed(_) => match self.state {
++                CompletionState::Open(_) => self.refilter(word),
+                 CompletionState::DismissedUntilBoundary => {} // stay dismissed
+                 CompletionState::Closed => {
+                     let items = provider.complete(cx);
+@@ -128,14 +114,30 @@ impl CompletionController {
+     /// Ingest an externally-produced item list — an off-thread or
+     /// language-server completion result — as if a provider had returned it:
+     /// open and filter against the live `word` (with `anchor` the word start),
+-    /// or close if nothing matches. The controller stays document-agnostic; the
+-    /// caller is responsible for staleness (only call with results computed at
+-    /// the current revision, refiltered here against the *current* word so a
+-    /// result that arrives after the user typed more still filters correctly).
++    /// or close if nothing matches. An Escape dismissal wins: a list for the
++    /// word the user dismissed stays hidden, as a provider's would. The
++    /// controller stays document-agnostic; the caller is responsible for
++    /// staleness (only call with results computed at the current revision,
++    /// refiltered here against the *current* word so a result that arrives
++    /// after the user typed more still filters correctly).
+     pub fn set_items(&mut self, items: Vec<CompletionItem>, word: &str, anchor: u32) {
++        if matches!(self.state, CompletionState::DismissedUntilBoundary) {
++            return;
++        }
+         self.set_from_items(items, word, anchor);
+     }
+ 
++    /// Narrow an open popup to the items matching the live `word`, closing it
++    /// when none do. A no-op when closed or dismissed.
++    pub fn refilter(&mut self, word: &str) {
++        if let CompletionState::Open(list) = &mut self.state {
++            list.refilter(word);
++            if list.filtered.is_empty() {
++                self.state = CompletionState::Closed;
++            }
++        }
++    }
++
+     /// Open from a fresh item list, or close if empty (either the provider
+     /// returned nothing or nothing prefix-matches the live word).
+     fn set_from_items(&mut self, items: Vec<CompletionItem>, word: &str, anchor: u32) {
+@@ -360,4 +362,38 @@ mod tests {
+         assert!(matches!(c.state(), CompletionState::Closed));
+         assert!(!c.escape(), "Escape while closed is not captured");
+     }
++
++    /// An externally produced list does not reopen a popup the user dismissed
++    /// with Escape; once a boundary clears the dismissal, it opens.
++    #[test]
++    fn set_items_respects_an_escape_dismissal() {
++        let mut stub = Stub { items: vec![kw("send", "1")], calls: 0 };
++        let mut c = CompletionController::new();
++        c.on_input(&cx("s", CompletionTrigger::Typed('s')), "s", &mut stub);
++        assert!(c.escape(), "Escape dismisses the open popup");
++        c.set_items(vec![kw("send", "1")], "s", 0);
++        assert!(
++            matches!(c.state(), CompletionState::DismissedUntilBoundary),
++            "a late list stays hidden while dismissed"
++        );
++        c.on_boundary();
++        c.set_items(vec![kw("send", "1")], "s", 0);
++        assert_eq!(labels(&c), ["send"], "after a boundary the list opens");
++    }
++
++    /// `refilter` narrows an open popup in place, closes it when nothing
++    /// matches, and leaves a closed controller closed.
++    #[test]
++    fn refilter_narrows_an_open_popup_and_closes_when_nothing_matches() {
++        let mut c = CompletionController::new();
++        c.set_items(vec![kw("send", "1"), kw("set", "2")], "s", 0);
++        c.refilter("se");
++        assert_eq!(labels(&c), ["send", "set"], "both extend 'se'");
++        c.refilter("set");
++        assert_eq!(labels(&c), ["set"], "only 'set' extends 'set'");
++        c.refilter("x");
++        assert!(matches!(c.state(), CompletionState::Closed), "nothing matches → closed");
++        c.refilter("s");
++        assert!(matches!(c.state(), CompletionState::Closed), "refilter never opens");
++    }
+ }
+diff --git a/crates/scrive-core/src/intel/providers.rs b/crates/scrive-core/src/intel/providers.rs
+index 5394a77..3c6b849 100644
+--- a/crates/scrive-core/src/intel/providers.rs
++++ b/crates/scrive-core/src/intel/providers.rs
+@@ -4,6 +4,7 @@
+ 
+ use core::ops::Range;
+ 
++use crate::transaction::EditOp;
+ use crate::{DocId, Point};
+ 
+ /// Lookback window for `CompletionCx` (and, later, signature help), in lines —
+@@ -93,7 +94,7 @@ pub enum InsertText {
+ /// One structured completion item. `#[non_exhaustive]` with a `new()` + `with_*`
+ /// builder chain, so adding a field never breaks an app that builds these:
+ /// construct with [`CompletionItem::new`], then layer on optional
+-/// detail/doc/replace/sort-key/retrigger.
++/// detail/doc/replace/sort-key/retrigger/filter/additional/signature-after.
+ #[non_exhaustive]
+ #[derive(Clone, Debug)]
+ pub struct CompletionItem {
+@@ -119,11 +120,25 @@ pub struct CompletionItem {
+     /// the transaction commits (e.g. `param=` reopens the popup in value
+     /// position).
+     pub retrigger: bool,
++    /// The text the popup filters on when it differs from the label (a
++    /// language server's `filterText`, e.g. `printf` for a `•printf(…)`
++    /// label). `None` filters on the label. See [`matches`](Self::matches).
++    pub filter: Option<String>,
++    /// Edits elsewhere in the document that accepting the item also applies
++    /// (an auto-import at the top, say), in the same coordinates as
++    /// [`replace`](Self::replace). They commit in the same transaction as the
++    /// insertion, so one undo reverts both. An edit touching the replaced word
++    /// is dropped.
++    pub additional: Vec<EditOp>,
++    /// When set, accepting the item asks for signature help as if `(` had just
++    /// been typed, for items that insert a call's opening paren.
++    pub signature_after: bool,
+ }
+ 
+ impl CompletionItem {
+     /// A minimal item: label, kind, and insertion. `sort_key` defaults to the
+-    /// label; detail/doc/replace default absent; `retrigger` false.
++    /// label; detail/doc/replace/filter default absent; `retrigger` and
++    /// `signature_after` false; no additional edits.
+     #[must_use]
+     pub fn new(label: impl Into<String>, kind: CompletionKind, insert: InsertText) -> Self {
+         let label = label.into();
+@@ -136,6 +151,9 @@ impl CompletionItem {
+             insert,
+             replace: None,
+             retrigger: false,
++            filter: None,
++            additional: Vec::new(),
++            signature_after: false,
+         }
+     }
+ 
+@@ -180,6 +198,36 @@ impl CompletionItem {
+         self.retrigger = retrigger;
+         self
+     }
++
++    /// Filter on `filter` instead of the label.
++    #[must_use]
++    pub fn with_filter(mut self, filter: impl Into<String>) -> Self {
++        self.filter = Some(filter.into());
++        self
++    }
++
++    /// Edits elsewhere that accepting the item also applies (see
++    /// [`additional`](Self::additional)).
++    #[must_use]
++    pub fn with_additional(mut self, additional: Vec<EditOp>) -> Self {
++        self.additional = additional;
++        self
++    }
++
++    /// Ask for signature help after accepting the item.
++    #[must_use]
++    pub fn with_signature_after(mut self, signature_after: bool) -> Self {
++        self.signature_after = signature_after;
++        self
++    }
++
++    /// Whether the item survives filtering by `word`: its filter text (or,
++    /// without one, its label) starts with `word`, folding ASCII case. This is
++    /// the one filtering rule every popup refilter and list reuse applies.
++    #[must_use]
++    pub fn matches(&self, word: &str) -> bool {
++        prefix_matches(self.filter.as_deref().unwrap_or(&self.label), word)
++    }
+ }
+ 
+ /// Completion-word predicate: `alphanumeric | '_' | '-'`. Deliberately **wider**
+@@ -191,6 +239,15 @@ pub fn is_completion_word_char(c: char) -> bool {
+     c.is_alphanumeric() || c == '_' || c == '-'
+ }
+ 
++/// Whether `label` begins with `prefix`, folding ASCII case only. Compares the
++/// raw bytes (`as_bytes` never panics on a non-char-boundary split, and
++/// `eq_ignore_ascii_case` leaves multi-byte UTF-8 exact), so no lowercased copy
++/// is allocated — the hot completion-filter primitive.
++fn prefix_matches(label: &str, prefix: &str) -> bool {
++    let (l, p) = (label.as_bytes(), prefix.as_bytes());
++    l.len() >= p.len() && l[..p.len()].eq_ignore_ascii_case(p)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -216,18 +273,42 @@ mod tests {
+         assert_eq!(item.sort_key, "if", "sort_key defaults to the label");
+         assert!(item.detail.is_none() && item.doc.is_none() && item.replace.is_none());
+         assert!(!item.retrigger);
++        assert!(item.filter.is_none(), "filters on the label by default");
++        assert!(item.additional.is_empty(), "no additional edits by default");
++        assert!(!item.signature_after, "no signature follow-up by default");
+ 
+         let built = CompletionItem::new("size", CompletionKind::Param, InsertText::Snippet("size=${1:8}".into()))
+             .with_detail("u8")
+             .with_doc("the block size")
+             .with_sort_key("0_size")
+             .with_replace(4..9)
+-            .with_retrigger(true);
++            .with_retrigger(true)
++            .with_filter("sz")
++            .with_additional(vec![EditOp::insert(0, "use x;\n")])
++            .with_signature_after(true);
+         assert_eq!(built.detail.as_deref(), Some("u8"));
+         assert_eq!(built.doc.as_deref(), Some("the block size"));
+         assert_eq!(built.sort_key, "0_size");
+         assert_eq!(built.replace, Some(4..9));
+         assert!(built.retrigger);
+         assert!(matches!(built.insert, InsertText::Snippet(_)));
++        assert_eq!(built.filter.as_deref(), Some("sz"));
++        assert_eq!(built.additional, vec![EditOp::insert(0, "use x;\n")]);
++        assert!(built.signature_after);
++    }
++
++    /// `matches` reads the filter text when one is set, else the label, and
++    /// folds ASCII case.
++    #[test]
++    fn matches_uses_the_filter_text_when_set() {
++        let filtered = CompletionItem::plain("•printf(…)", CompletionKind::Symbol).with_filter("printf");
++        assert!(filtered.matches("pri"), "the filter text is the prefix source");
++        assert!(filtered.matches("PRI"), "ASCII case folds");
++        assert!(!filtered.matches("•"), "the label is ignored once a filter is set");
++
++        let plain = CompletionItem::plain("foo", CompletionKind::Symbol);
++        assert!(plain.matches("FO"), "the label is the fallback prefix source");
++        assert!(plain.matches(""), "an empty word matches everything");
++        assert!(!plain.matches("x"), "a non-prefix does not match");
+     }
+ }
+diff --git a/crates/scrive-core/src/intel/ticket.rs b/crates/scrive-core/src/intel/ticket.rs
+new file mode 100644
+index 0000000..9b9ffdf
+--- /dev/null
++++ b/crates/scrive-core/src/intel/ticket.rs
+@@ -0,0 +1,68 @@
++//! Request tickets: the stamp an async language-service reply must carry to
++//! land. A ticket names one request, so two requests at the same revision are
++//! still told apart and only the newer reply lands.
++
++use crate::buffer::Revision;
++
++/// One request's identity. Only a [`Counter`] mints tickets, and the only
++/// readable part is the [`revision`](Self::revision) the request was made at.
++/// Two tickets are equal only if they name the same request.
++#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
++pub struct Ticket {
++    seq: u64,
++    revision: Revision,
++}
++
++impl Ticket {
++    /// The document revision the request was made at. A reply computed for it
++    /// is meaningful only while the document is still at this revision.
++    #[must_use]
++    pub fn revision(&self) -> Revision {
++        self.revision
++    }
++}
++
++/// Mints [`Ticket`]s that never repeat for this counter. Tickets from one
++/// counter never collide, so each editor owns one.
++#[derive(Debug, Default)]
++pub struct Counter {
++    issued: u64,
++}
++
++impl Counter {
++    /// A counter that has issued nothing.
++    #[must_use]
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Issue a fresh ticket for a request made at `revision`.
++    #[must_use]
++    pub fn issue(&mut self, revision: Revision) -> Ticket {
++        self.issued += 1;
++        Ticket {
++            seq: self.issued,
++            revision,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Two requests at one revision get different tickets that both report
++    /// that revision.
++    #[test]
++    fn tickets_at_one_revision_are_distinct() {
++        let mut counter = Counter::new();
++        let (a, b) = (counter.issue(Revision(3)), counter.issue(Revision(3)));
++        assert_ne!(a, b, "each request is its own ticket");
++        assert_eq!(
++            (a.revision(), b.revision()),
++            (Revision(3), Revision(3)),
++            "both remember the revision"
++        );
++        assert_eq!(a, a, "a ticket equals itself");
++    }
++}
+diff --git a/crates/scrive-core/src/lib.rs b/crates/scrive-core/src/lib.rs
+index 4bb3cc4..60a5d12 100644
+--- a/crates/scrive-core/src/lib.rs
++++ b/crates/scrive-core/src/lib.rs
+@@ -83,6 +83,7 @@ pub use intel::completion::{CompletionController, CompletionState, PopupList};
+ pub use intel::hover::{Hover, HoverCx, HoverInfo, HOVER_IDLE_DELAY_MS};
+ pub use intel::signature::{SignatureCx, SignatureHelp, SignatureInfo};
+ pub use intel::snippet::{CaretOutcome, Snippet, SnippetError, SnippetSession, TabOutcome, TabStop};
++pub use intel::ticket::Ticket;
+ pub use intel::providers::{
+     is_completion_word_char, CompletionCx, CompletionItem, CompletionKind, CompletionTrigger,
+     Completions, InsertText, LOOKBACK_LINES,
+diff --git a/crates/scrive-iced/src/code_editor.rs b/crates/scrive-iced/src/code_editor.rs
+index 6926433..f04a7a3 100644
+--- a/crates/scrive-iced/src/code_editor.rs
++++ b/crates/scrive-iced/src/code_editor.rs
+@@ -1395,7 +1395,12 @@ impl CodeEditor {
+         // Take the provider out so `self` is free for `build_cx`, then restore it
+         // (avoids an is_some/unwrap dance and the whole-self borrow conflict).
+         let Some(mut provider) = self.comp_provider.take() else {
+-            // No synchronous provider: record an async request for the host.
++            // No synchronous provider: record an async request for the host. A
++            // trigger char or manual invoke overrides an Escape dismissal, as it
++            // does for a provider, so its reply may open the popup.
++            if !matches!(trigger, CompletionTrigger::Typed(_)) {
++                self.completion.on_boundary();
++            }
+             let head = self.doc.selections().newest().head();
+             self.pending_completion_request = Some(CompletionRequest {
+                 revision: self.doc.revision(),

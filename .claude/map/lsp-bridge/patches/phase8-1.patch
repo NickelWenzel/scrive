@@ -1,0 +1,1010 @@
+diff --git a/crates/scrive-lsp/src/client.rs b/crates/scrive-lsp/src/client.rs
+index 8f478d7..b740e1f 100644
+--- a/crates/scrive-lsp/src/client.rs
++++ b/crates/scrive-lsp/src/client.rs
+@@ -14,20 +14,20 @@ use lsp_types::{
+     ApplyWorkspaceEditResponse, ClientInfo, CompletionContext, CompletionParams,
+     CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
+     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+-    HoverParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
++    DocumentFormattingParams, FormattingOptions, HoverParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
+     SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+     TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
+     WorkspaceFolder,
+ };
+ use scrive_core::{
+-    document, Bias, CompletionRequest, CompletionTrigger, DocId, HoverRequest, Revision,
+-    SignatureRequest, Snapshot, Ticket,
++    document, Bias, CompletionRequest, CompletionTrigger, DocId, FormatRequest, HoverRequest,
++    Revision, SignatureRequest, Snapshot, Ticket,
+ };
+ use serde_json::Value;
+ 
+ use crate::message::{self, Message};
+ use crate::update::{self, Update};
+-use crate::{completion, diagnostics, hover, signature, uri, Encoding};
++use crate::{completion, diagnostics, edits, hover, signature, uri, Encoding};
+ 
+ /// JSON-RPC's "method not found": a server request this client does not implement.
+ const METHOD_NOT_FOUND: i64 = -32601;
+@@ -166,6 +166,7 @@ enum Kind {
+     Completion,
+     Signature,
+     Hover,
++    Format,
+ }
+ 
+ /// What a pending request asked, with what its reply needs.
+@@ -174,6 +175,8 @@ enum Query {
+     Completion(completion::Query),
+     Signature(signature::Query),
+     Hover(hover::Query),
++    /// Formatting of the whole document at this indent width.
++    Format { tab_size: u32 },
+ }
+ 
+ impl Client {
+@@ -427,6 +430,33 @@ impl Client {
+         self.send(doc_id, ticket, Query::Hover(query), None)
+     }
+ 
++    /// Asks the server to format the whole document, indenting with spaces. The answer is a
++    /// [`update::Change::Edits`] under the request's ticket; a result that changes nothing
++    /// answers nothing.
++    ///
++    /// When the server is not running or has no formatting provider, nothing is sent. A request
++    /// from a revision other than `snapshot`'s or the last synced one, or for a document that is
++    /// not registered, gets nothing either.
++    pub fn format(&mut self, snapshot: &Snapshot, request: &FormatRequest) -> Output {
++        let doc_id = snapshot.doc_id();
++        let ticket = request.ticket;
++        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
++            return Output::default();
++        };
++        if ticket.revision() != snapshot.revision()
++            || snapshot.revision() != tracked.synced.revision()
++        {
++            return Output::default();
++        }
++        if !matches!(&self.state, State::Running(server) if server.formatting) {
++            return Output::default();
++        }
++        let query = Query::Format {
++            tab_size: request.tab_size,
++        };
++        self.send(doc_id, ticket, query, None)
++    }
++
+     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
+     /// it leads exactly from what the server has to `snapshot`, and the server syncs
+     /// incrementally, the edits go out as ranges; otherwise the whole text goes out. Servers that
+@@ -590,17 +620,22 @@ impl Client {
+             State::Initializing { .. }
+             | State::Running(_)
+             | State::ShuttingDown { .. }
+-            | State::Exited => Ok(self.settled(&id, response.result)),
++            | State::Exited => self.settled(&id, response.result),
+         }
+     }
+ 
+     /// Routes the reply to a pending request. Replies to requests the client no longer waits
+-    /// for, and cancellations, are silent. A failed or undecodable reply settles the editor's
+-    /// slot with the request's empty answer. A request the server dropped as content-modified is
+-    /// sent again, at most once per ticket.
+-    fn settled(&mut self, id: &message::Id, result: Result<Value, message::Error>) -> Output {
++    /// for, and cancellations, are silent. A failed or undecodable reply to an intel request
++    /// settles the editor's slot with the request's empty answer; one to a command is an error,
++    /// since a user asked for it. A request the server dropped as content-modified is sent
++    /// again, at most once per ticket.
++    fn settled(
++        &mut self,
++        id: &message::Id,
++        result: Result<Value, message::Error>,
++    ) -> Result<Output, Error> {
+         let Some(index) = self.pending.iter().position(|p| p.id == *id) else {
+-            return Output::default();
++            return Ok(Output::default());
+         };
+         let entry = self.pending.swap_remove(index);
+         let synced = self
+@@ -612,16 +647,21 @@ impl Client {
+         // over, so a continuing request moves `latest_ticket` forward only after the sync. Only
+         // when the reply arrives is it certain that no newer request adopted this entry.
+         if synced != Some(entry.latest_ticket.revision()) {
+-            return Output::default();
++            return Ok(Output::default());
+         }
+         match result {
+             Err(error) if error.code == REQUEST_CANCELLED || error.code == SERVER_CANCELLED => {
+-                Output::default()
++                Ok(Output::default())
+             }
+             // The drop above guarantees the ticket is still current, so the server's text has
+             // caught up with the editor's and asking again can succeed.
+-            Err(error) if error.code == CONTENT_MODIFIED => self.reissue(entry),
+-            Err(_) => entry.failed(),
++            Err(error) if error.code == CONTENT_MODIFIED => Ok(self.reissue(entry)),
++            Err(error) if entry.query.kind().is_command() => Err(Error::Server {
++                doc_id: Some(entry.doc_id),
++                method: entry.query.method().to_owned(),
++                error,
++            }),
++            Err(_) => Ok(entry.failed()),
+             Ok(value) => self.resolved(&entry, value),
+         }
+     }
+@@ -648,20 +688,21 @@ impl Client {
+                 }),
+                 Some(entry.latest_ticket),
+             ),
+-            Query::Hover(query) => self.send(
++            query @ (Query::Hover(_) | Query::Format { .. }) => self.send(
+                 entry.doc_id,
+                 entry.latest_ticket,
+-                Query::Hover(query),
++                query,
+                 Some(entry.latest_ticket),
+             ),
+         }
+     }
+ 
+-    fn resolved(&mut self, entry: &Pending, value: Value) -> Output {
++    fn resolved(&mut self, entry: &Pending, value: Value) -> Result<Output, Error> {
+         match &entry.query {
+-            Query::Completion(query) => self.completed(entry, query, value),
+-            Query::Signature(query) => self.signed(entry, query, value),
+-            Query::Hover(query) => self.hovered(entry, query, value),
++            Query::Completion(query) => Ok(self.completed(entry, query, value)),
++            Query::Signature(query) => Ok(self.signed(entry, query, value)),
++            Query::Hover(query) => Ok(self.hovered(entry, query, value)),
++            Query::Format { .. } => self.formatted(entry, value),
+         }
+     }
+ 
+@@ -879,6 +920,29 @@ impl Client {
+         Output::answer(entry.doc_id, entry.latest_ticket, update::Change::Hover(card))
+     }
+ 
++    /// Answers the ticket with the reply's edits, converted against the request's text, which
++    /// is still the synced text once `settled` let the reply through.
++    ///
++    /// # Errors
++    /// [`Error::Decode`] when the result is not a `TextEdit[]` or `null`.
++    fn formatted(&self, entry: &Pending, value: Value) -> Result<Output, Error> {
++        let text_edits: Option<Vec<lsp_types::TextEdit>> =
++            decode(entry.query.method(), Some(value))?;
++        let ops = edits::hygiene(
++            &entry.request_snapshot,
++            self.encoding,
++            &text_edits.unwrap_or_default(),
++        );
++        if ops.is_empty() {
++            return Ok(Output::default());
++        }
++        Ok(Output::answer(
++            entry.doc_id,
++            entry.latest_ticket,
++            update::Change::Edits(ops),
++        ))
++    }
++
+     fn answer(&self, request: message::Request) -> Output {
+         let response = match self.state {
+             // After `shutdown()` the client promises nothing; `null` keeps the server unblocked.
+@@ -1073,6 +1137,18 @@ impl Pending {
+             Query::Hover(_) => {
+                 Output::answer(self.doc_id, self.latest_ticket, update::Change::Hover(None))
+             }
++            // Commands have no slot to settle: `settled` reports their failures as errors.
++            Query::Format { .. } => Output::default(),
++        }
++    }
++}
++
++impl Kind {
++    /// Whether the user asked for this request, so its failure is reported rather than settled.
++    fn is_command(self) -> bool {
++        match self {
++            Kind::Completion | Kind::Signature | Kind::Hover => false,
++            Kind::Format => true,
+         }
+     }
+ }
+@@ -1083,6 +1159,18 @@ impl Query {
+             Query::Completion(_) => Kind::Completion,
+             Query::Signature(_) => Kind::Signature,
+             Query::Hover(_) => Kind::Hover,
++            Query::Format { .. } => Kind::Format,
++        }
++    }
++
++    /// The request's LSP method.
++    fn method(&self) -> &'static str {
++        use lsp_types::request::Request;
++        match self {
++            Query::Completion(_) => lsp_types::request::Completion::METHOD,
++            Query::Signature(_) => lsp_types::request::SignatureHelpRequest::METHOD,
++            Query::Hover(_) => lsp_types::request::HoverRequest::METHOD,
++            Query::Format { .. } => lsp_types::request::Formatting::METHOD,
+         }
+     }
+ 
+@@ -1092,6 +1180,8 @@ impl Query {
+             Query::Completion(query) => query.word.end,
+             Query::Signature(query) => query.caret,
+             Query::Hover(query) => query.offset,
++            // Formatting covers the whole document and asks at no caret.
++            Query::Format { .. } => 0,
+         }
+     }
+ 
+@@ -1139,6 +1229,19 @@ impl Query {
+                     work_done_progress_params: Default::default(),
+                 },
+             ),
++            Query::Format { tab_size } => message::Request::new::<lsp_types::request::Formatting>(
++                id,
++                DocumentFormattingParams {
++                    text_document: TextDocumentIdentifier { uri: uri.clone() },
++                    // scrive indents with spaces, so the formatter must too.
++                    options: FormattingOptions {
++                        tab_size: *tab_size,
++                        insert_spaces: true,
++                        ..FormattingOptions::default()
++                    },
++                    work_done_progress_params: Default::default(),
++                },
++            ),
+         }
+     }
+ }
+diff --git a/crates/scrive-lsp/src/client/capabilities.rs b/crates/scrive-lsp/src/client/capabilities.rs
+index d12047f..7fbb10f 100644
+--- a/crates/scrive-lsp/src/client/capabilities.rs
++++ b/crates/scrive-lsp/src/client/capabilities.rs
+@@ -2,7 +2,7 @@
+ 
+ use lsp_types::{
+     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
+-    GeneralClientCapabilities, HoverClientCapabilities, HoverProviderCapability, MarkupKind,
++    DocumentFormattingClientCapabilities, GeneralClientCapabilities, HoverClientCapabilities, HoverProviderCapability, MarkupKind, OneOf,
+     ParameterInformationSettings, PublishDiagnosticsClientCapabilities, ServerCapabilities,
+     SignatureHelpClientCapabilities, SignatureInformationSettings, TextDocumentClientCapabilities,
+     TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
+@@ -24,6 +24,8 @@ pub(crate) struct Server {
+     pub(crate) signature: bool,
+     /// Whether the server answers `textDocument/hover`.
+     pub(crate) hover: bool,
++    /// Whether the server answers `textDocument/formatting`.
++    pub(crate) formatting: bool,
+ }
+ 
+ impl Server {
+@@ -53,6 +55,10 @@ impl Server {
+                 capabilities.hover_provider,
+                 Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
+             ),
++            formatting: matches!(
++                capabilities.document_formatting_provider,
++                Some(OneOf::Left(true) | OneOf::Right(_))
++            ),
+         }
+     }
+ }
+@@ -97,6 +103,7 @@ pub(crate) fn client() -> ClientCapabilities {
+                 content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
+                 ..HoverClientCapabilities::default()
+             }),
++            formatting: Some(DocumentFormattingClientCapabilities::default()),
+             ..TextDocumentClientCapabilities::default()
+         }),
+         general: Some(GeneralClientCapabilities {
+diff --git a/crates/scrive-lsp/src/client/tests.rs b/crates/scrive-lsp/src/client/tests.rs
+index 60b5451..d25ad28 100644
+--- a/crates/scrive-lsp/src/client/tests.rs
++++ b/crates/scrive-lsp/src/client/tests.rs
+@@ -3,8 +3,8 @@ use std::str::FromStr;
+ use scrive_core::intel::completion::Start;
+ use scrive_core::intel::ticket::Counter;
+ use scrive_core::{
+-    CompletionItem, Document, EditOp, GroupingHint, HoverInfo, HoverRequest, OpClass, Point,
+-    SignatureInfo,
++    CompletionItem, Document, EditOp, FormatRequest, GroupingHint, HoverInfo, HoverRequest,
++    OpClass, Point, SignatureInfo,
+ };
+ use serde_json::{json, Value};
+ 
+@@ -89,8 +89,8 @@ fn whole(text: &str) -> Value {
+     json!({"text": text})
+ }
+ 
+-/// With [`completions`], [`signature`] and [`hover`], the only place tests read a `Change`, so a
+-/// new variant changes only these helpers.
++/// With the other per-variant helpers ([`completions`], [`signature`], [`hover`], [`edits`]),
++/// the only place tests read a `Change`, so a new variant changes only these helpers.
+ fn diagnostics(update: &Update) -> (DocId, update::Stamp, Vec<scrive_core::Diagnostic>) {
+     let Update::Document(document) = update else {
+         panic!("expected a document update, got {update:?}")
+@@ -134,6 +134,17 @@ fn hover(update: &Update) -> (update::Stamp, Option<HoverInfo>) {
+     }
+ }
+ 
++/// The stamp and ops of an edits update.
++fn edits(update: &Update) -> (update::Stamp, Vec<EditOp>) {
++    let Update::Document(document) = update else {
++        panic!("expected a document update, got {update:?}")
++    };
++    match document.change() {
++        update::Change::Edits(ops) => (document.stamp(), ops.clone()),
++        other => panic!("expected edits, got {other:?}"),
++    }
++}
++
+ /// A `publishDiagnostics` with one error over `start..end` on line 0.
+ fn publish(uri: &str, version: Option<i32>, span: Option<(u32, u32)>) -> Message {
+     let diagnostics: Vec<Value> = span
+@@ -2318,3 +2329,170 @@ fn failed_hover_request_answers_none() {
+         assert!(info.is_none(), "the failure has no docs");
+     }
+ }
++
++/// Server capabilities with incremental sync, utf-8 positions (fixture columns are bytes) and
++/// formatting.
++fn command_capabilities() -> Value {
++    json!({
++        "positionEncoding": "utf-8",
++        "textDocumentSync": 2,
++        "documentFormattingProvider": true,
++    })
++}
++
++/// A running client with `text` open as `file:///a.rs`, whose server offers the commands.
++fn commanding(text: &str) -> (Client, Document) {
++    let doc = document(text);
++    let (mut client, _) = running(Client::builder(), command_capabilities());
++    let _ = client
++        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
++        .expect("opens");
++    (client, doc)
++}
++
++/// The success reply to request `id`.
++fn reply(id: i64, result: Value) -> Message {
++    from_server(json!({"jsonrpc": "2.0", "id": id, "result": result}))
++}
++
++/// A `TextEdit` over `start..end` (line, character).
++fn text_edit(start: (u32, u32), end: (u32, u32), text: &str) -> Value {
++    json!({"range": {
++        "start": {"line": start.0, "character": start.1},
++        "end": {"line": end.0, "character": end.1},
++    }, "newText": text})
++}
++
++/// `initialize` advertises formatting.
++#[test]
++fn initialize_advertises_formatting() {
++    let (_, initialize) = Client::builder().build();
++    let initialize = serde_json::to_value(&initialize).expect("serializes");
++    assert_eq!(
++        initialize.pointer("/params/capabilities/textDocument/formatting"),
++        Some(&json!({})),
++        "formatting is advertised",
++    );
++}
++
++/// A format request asks for the whole document, indented with spaces at the request's width.
++#[test]
++fn format_request_asks_for_spaces_at_the_tab_size() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = commanding("fn a() {}  \n");
++    let request = FormatRequest::new(tickets.issue(doc.revision()), 4);
++    assert_eq!(
++        wire(&client.format(&doc.snapshot(), &request).messages),
++        vec![json!({"jsonrpc": "2.0", "id": 2, "method": "textDocument/formatting", "params": {
++            "textDocument": {"uri": "file:///a.rs"},
++            "options": {"tabSize": 4, "insertSpaces": true},
++        }})],
++        "the request goes out with spaces",
++    );
++}
++
++/// The formatted edits answer the request's ticket, trimmed and in LF.
++#[test]
++fn format_reply_is_stamped_with_the_request_ticket() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = commanding("fn a() {}  \n");
++    let request = FormatRequest::new(tickets.issue(doc.revision()), 4);
++    let _ = client.format(&doc.snapshot(), &request);
++    let output = client
++        .receive(reply(2, json!([text_edit((0, 9), (0, 11), "")])))
++        .expect("the reply is accepted");
++    assert!(output.messages.is_empty(), "the answer sends nothing");
++    let [update] = output.updates.as_slice() else {
++        panic!("expected one update, got {:?}", output.updates)
++    };
++    let (stamp, ops) = edits(update);
++    assert_eq!(
++        stamp,
++        update::Stamp::Ticket(request.ticket),
++        "stamped with the request's ticket"
++    );
++    assert_eq!(
++        ops,
++        vec![EditOp::delete(9..11)],
++        "the trailing blanks go"
++    );
++}
++
++/// A reply to a format asked before the latest edit would rewrite text that has moved.
++#[test]
++fn format_reply_after_an_edit_is_dropped() {
++    let mut tickets = Counter::new();
++    let (mut client, mut doc) = commanding("fn a() {}  \n");
++    let request = FormatRequest::new(tickets.issue(doc.revision()), 4);
++    let _ = client.format(&doc.snapshot(), &request);
++    type_ops(&mut client, &mut doc, vec![EditOp::insert(0, "x")]);
++    assert_silent(
++        &client
++            .receive(reply(2, json!([text_edit((0, 9), (0, 11), "")])))
++            .expect("a stale reply is not an error"),
++        "a stale format reply is dropped",
++    );
++}
++
++/// A result with nothing to change answers nothing: formatting has no slot to settle.
++#[test]
++fn format_reply_without_changes_answers_nothing() {
++    for result in [json!(null), json!([]), json!([text_edit((0, 0), (0, 2), "fn")])] {
++        let mut tickets = Counter::new();
++        let (mut client, doc) = commanding("fn a() {}\n");
++        let _ = client.format(
++            &doc.snapshot(),
++            &FormatRequest::new(tickets.issue(doc.revision()), 4),
++        );
++        assert_silent(
++            &client.receive(reply(2, result)).expect("the reply is accepted"),
++            "nothing to change",
++        );
++    }
++}
++
++/// A user asked for the format, so a failed or undecodable reply is reported, not swallowed.
++#[test]
++fn format_failures_are_errors() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = commanding("fn a() {}\n");
++    let request = FormatRequest::new(tickets.issue(doc.revision()), 4);
++    let _ = client.format(&doc.snapshot(), &request);
++    let error = client
++        .receive(failure(2, -32603))
++        .expect_err("a server error is reported");
++    assert!(
++        matches!(&error, Error::Server { doc_id: Some(id), method, .. }
++            if *id == doc.doc_id() && method == "textDocument/formatting"),
++        "the error names the document and the method: {error:?}",
++    );
++    let _ = client.format(&doc.snapshot(), &request);
++    let error = client
++        .receive(reply(3, json!("x")))
++        .expect_err("an undecodable result is reported");
++    assert!(
++        matches!(&error, Error::Decode { method, .. } if method == "textDocument/formatting"),
++        "the error names the method: {error:?}",
++    );
++}
++
++/// With no server to ask, or one without a provider, a format sends nothing and answers nothing.
++#[test]
++fn format_declines_before_initialize_and_without_a_provider() {
++    let doc = document("fn a() {}\n");
++    let (initializing, _) = Client::builder().build();
++    let (without, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
++    for mut client in [initializing, without] {
++        let mut tickets = Counter::new();
++        let _ = client
++            .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
++            .expect("opens");
++        assert_silent(
++            &client.format(
++                &doc.snapshot(),
++                &FormatRequest::new(tickets.issue(doc.revision()), 4),
++            ),
++            "a declined format sends nothing",
++        );
++    }
++}
+diff --git a/crates/scrive-lsp/src/edits.rs b/crates/scrive-lsp/src/edits.rs
+new file mode 100644
+index 0000000..405a268
+--- /dev/null
++++ b/crates/scrive-lsp/src/edits.rs
+@@ -0,0 +1,444 @@
++//! Edit hygiene: a server's `TextEdit`s as one batch an `edit_grouped` transaction accepts.
++//!
++//! Servers send CRLF inside `newText`, replace a whole document to change three characters, and
++//! list edits in any order. Applied verbatim, that moves every caret and squiggle in the file and
++//! can split a UTF-8 sequence, so each batch is converted (clamping), normalized to LF, line-diffed
++//! when it replaces the whole document, trimmed to what changes on char boundaries, stripped of
++//! no-ops and sorted.
++
++use std::ops::Range;
++
++use scrive_core::{EditOp, Point, Snapshot};
++
++use crate::Encoding;
++
++/// The longest line-level edit script the diff computes before it falls back to one trimmed edit.
++/// The trace takes about `MAX_D² / 2` words (4 MB at 1000), and the time is
++/// `O((N + M) · MAX_D)`.
++const MAX_D: usize = 1000;
++
++/// `edits` as one hygienic batch against `snapshot`.
++pub(crate) fn hygiene(
++    snapshot: &Snapshot,
++    encoding: Encoding,
++    edits: &[lsp_types::TextEdit],
++) -> Vec<EditOp> {
++    let mut ops: Vec<EditOp> = edits
++        .iter()
++        .map(|edit| EditOp::new(encoding.span(snapshot, edit.range), lf(&edit.new_text)))
++        .collect();
++    let last_line_start = snapshot.point_to_offset(Point::new(snapshot.line_count() - 1, 0));
++    // Formatters answer with one edit over `0:0 → N:0` or `0:0 → last:len`.
++    if let [op] = ops.as_slice() {
++        if op.range.start == 0 && op.range.end >= last_line_start {
++            ops = line_diff(&snapshot.slice(op.range.clone()), &op.text);
++        }
++    }
++    let mut ops: Vec<EditOp> = ops
++        .into_iter()
++        .map(|op| trim(&snapshot.slice(op.range.clone()), op))
++        .filter(|op| !(op.range.is_empty() && op.text.is_empty()))
++        .collect();
++    // Stable, so tied inserts keep the server's order. After the trim, which moves starts.
++    ops.sort_by_key(|op| (op.range.start, op.range.end));
++    ops
++}
++
++/// `text` with `\r\n` and lone `\r` as `\n`, the buffer's only line break.
++fn lf(text: &str) -> String {
++    if text.contains('\r') {
++        text.replace("\r\n", "\n").replace('\r', "\n")
++    } else {
++        text.to_owned()
++    }
++}
++
++/// `op` narrowed to the bytes that change. `old` is the text `op` replaces. The common prefix and
++/// suffix back off to char boundaries in both texts, since `é` and `è` share their lead byte.
++fn trim(old: &str, op: EditOp) -> EditOp {
++    let new = op.text.as_str();
++    let mut prefix = old
++        .bytes()
++        .zip(new.bytes())
++        .take_while(|(a, b)| a == b)
++        .count();
++    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
++        prefix -= 1;
++    }
++    let (old, new) = (&old[prefix..], &new[prefix..]);
++    let mut suffix = old
++        .bytes()
++        .rev()
++        .zip(new.bytes().rev())
++        .take_while(|(a, b)| a == b)
++        .count();
++    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
++        suffix -= 1;
++    }
++    let start = op.range.start + prefix as u32;
++    EditOp::new(
++        start..op.range.end - suffix as u32,
++        &new[..new.len() - suffix],
++    )
++}
++
++/// `old` → `new` as line hunks, with offsets into `old`. Common leading and trailing lines are cut
++/// first, so the Myers pass only sees the changed middle. Past [`MAX_D`] the middle is one edit.
++fn line_diff(old: &str, new: &str) -> Vec<EditOp> {
++    let a: Vec<&str> = old.split_inclusive('\n').collect();
++    let b: Vec<&str> = new.split_inclusive('\n').collect();
++    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
++    let suffix = a[prefix..]
++        .iter()
++        .rev()
++        .zip(b[prefix..].iter().rev())
++        .take_while(|(x, y)| x == y)
++        .count();
++    let (a_mid, b_mid) = (&a[prefix..a.len() - suffix], &b[prefix..b.len() - suffix]);
++    let mut starts = Vec::with_capacity(a.len() + 1);
++    let mut at = 0;
++    for line in &a {
++        starts.push(at);
++        at += line.len() as u32;
++    }
++    starts.push(at);
++    let old_at = |line: usize| starts[prefix + line];
++    match script(a_mid, b_mid) {
++        Some(hunks) => hunks
++            .into_iter()
++            .map(|hunk| {
++                EditOp::new(
++                    old_at(hunk.old.start)..old_at(hunk.old.end),
++                    b_mid[hunk.new].concat(),
++                )
++            })
++            .collect(),
++        None => vec![EditOp::new(old_at(0)..old_at(a_mid.len()), b_mid.concat())],
++    }
++}
++
++/// One replaced run: old lines `old` become new lines `new`, as half-open line indices.
++struct Hunk {
++    old: Range<usize>,
++    new: Range<usize>,
++}
++
++/// One edit in a Myers path.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum Step {
++    /// Consumes an old line.
++    Delete,
++    /// Consumes a new line.
++    Insert,
++}
++
++/// Myers' greedy shortest edit script from `a` to `b`, as hunks, or `None` past [`MAX_D`].
++/// `rows[d]` holds the furthest `x` on diagonals `k = -d, -d+2, …, d` after `d` edits: only
++/// diagonals with `d`'s parity are reachable, which halves the trace.
++fn script(a: &[&str], b: &[&str]) -> Option<Vec<Hunk>> {
++    let (n, m) = (a.len(), b.len());
++    let mut rows: Vec<Vec<usize>> = Vec::new();
++    for d in 0..=(n + m).min(MAX_D) {
++        let mut row = vec![0; d + 1];
++        for (i, slot) in row.iter_mut().enumerate() {
++            let k = 2 * i as isize - d as isize;
++            let mut x = match rows.last() {
++                None => 0,
++                Some(prev) => match step(prev, d, k) {
++                    Step::Insert => at(prev, d - 1, k + 1),
++                    Step::Delete => at(prev, d - 1, k - 1) + 1,
++                },
++            };
++            let mut y = (x as isize - k) as usize;
++            while x < n && y < m && a[x] == b[y] {
++                x += 1;
++                y += 1;
++            }
++            *slot = x;
++            if x >= n && y >= m {
++                rows.push(row);
++                return Some(hunks(&rows, n, m));
++            }
++        }
++        rows.push(row);
++    }
++    None
++}
++
++/// The furthest `x` on diagonal `k` in `row`, the row for `d` edits.
++fn at(row: &[usize], d: usize, k: isize) -> usize {
++    row[((k + d as isize) / 2) as usize]
++}
++
++/// How diagonal `k` is reached at `d` edits from `prev`, the row for `d - 1`: an insertion steps
++/// down from `k + 1`, a deletion right from `k - 1`.
++fn step(prev: &[usize], d: usize, k: isize) -> Step {
++    let edits = d as isize;
++    if k == -edits || (k != edits && at(prev, d - 1, k - 1) < at(prev, d - 1, k + 1)) {
++        Step::Insert
++    } else {
++        Step::Delete
++    }
++}
++
++/// The path through `rows` back from `(n, m)`, with adjacent steps merged into hunks.
++fn hunks(rows: &[Vec<usize>], n: usize, m: usize) -> Vec<Hunk> {
++    let (mut x, mut y) = (n, m);
++    let mut steps = Vec::with_capacity(rows.len());
++    for d in (1..rows.len()).rev() {
++        let k = x as isize - y as isize;
++        let prev = &rows[d - 1];
++        let step = step(prev, d, k);
++        let from_k = match step {
++            Step::Insert => k + 1,
++            Step::Delete => k - 1,
++        };
++        let from_x = at(prev, d - 1, from_k);
++        let from_y = (from_x as isize - from_k) as usize;
++        steps.push((from_x, from_y, step));
++        x = from_x;
++        y = from_y;
++    }
++    let mut hunks: Vec<Hunk> = Vec::new();
++    for (x, y, step) in steps.into_iter().rev() {
++        let (dx, dy) = match step {
++            Step::Insert => (0, 1),
++            Step::Delete => (1, 0),
++        };
++        match hunks.last_mut() {
++            Some(hunk) if hunk.old.end == x && hunk.new.end == y => {
++                hunk.old.end += dx;
++                hunk.new.end += dy;
++            }
++            _ => hunks.push(Hunk {
++                old: x..x + dx,
++                new: y..y + dy,
++            }),
++        }
++    }
++    hunks
++}
++
++#[cfg(test)]
++mod tests {
++    use lsp_types::{Position, TextEdit};
++    use scrive_core::Document;
++
++    use super::*;
++
++    fn snapshot(text: &str) -> Snapshot {
++        Document::new(text).expect("fixture loads").snapshot()
++    }
++
++    fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> TextEdit {
++        TextEdit::new(
++            lsp_types::Range::new(Position::new(start.0, start.1), Position::new(end.0, end.1)),
++            text.to_owned(),
++        )
++    }
++
++    /// `text` with ascending, disjoint `ops` applied.
++    fn apply(text: &str, ops: &[EditOp]) -> String {
++        let mut out = text.to_owned();
++        for op in ops.iter().rev() {
++            out.replace_range(op.range.start as usize..op.range.end as usize, &op.text);
++        }
++        out
++    }
++
++    /// A trim that would split a shared lead byte backs off to the character.
++    #[test]
++    fn format_edit_replacing_e_acute_with_e_grave_trims_to_one_char() {
++        assert_eq!(
++            hygiene(
++                &snapshot("café\n"),
++                Encoding::Utf16,
++                &[edit((0, 0), (0, 4), "cafè")]
++            ),
++            vec![EditOp::new(3..5, "è")],
++            "only the accented character is replaced, whole",
++        );
++        assert_eq!(
++            hygiene(
++                &snapshot("café\n"),
++                Encoding::Utf16,
++                &[edit((0, 3), (0, 4), "è")]
++            ),
++            vec![EditOp::new(3..5, "è")],
++            "utf-16 column 4 is byte 5",
++        );
++    }
++
++    /// A batch in descending order comes out ascending by `(start, end)`.
++    #[test]
++    fn descending_edit_batch_is_sorted_by_start_then_end() {
++        assert_eq!(
++            hygiene(
++                &snapshot("a\nb\nc\n"),
++                Encoding::Utf8,
++                &[edit((2, 0), (2, 1), "C"), edit((0, 0), (0, 1), "A")],
++            ),
++            vec![EditOp::new(0..1, "A"), EditOp::new(4..5, "C")],
++            "sorted ascending",
++        );
++        assert_eq!(
++            hygiene(
++                &snapshot("ab"),
++                Encoding::Utf8,
++                &[edit((0, 1), (0, 2), "Z"), edit((0, 1), (0, 1), "X")],
++            ),
++            vec![EditOp::new(1..1, "X"), EditOp::new(1..2, "Z")],
++            "an insert sorts before a replace at the same start",
++        );
++    }
++
++    /// Two inserts at one offset keep the order the server listed them in.
++    #[test]
++    fn tied_inserts_keep_the_servers_order() {
++        assert_eq!(
++            hygiene(
++                &snapshot("abc\n"),
++                Encoding::Utf8,
++                &[edit((0, 1), (0, 1), "X"), edit((0, 1), (0, 1), "Y")],
++            ),
++            vec![EditOp::new(1..1, "X"), EditOp::new(1..1, "Y")],
++            "the sort is stable",
++        );
++    }
++
++    /// The buffer is LF-only, so every line break in new text arrives as `\n`.
++    #[test]
++    fn crlf_and_lone_cr_in_new_text_become_lf() {
++        assert_eq!(
++            hygiene(
++                &snapshot("x\n"),
++                Encoding::Utf8,
++                &[edit((0, 1), (0, 1), "\r\ny\r\n")]
++            ),
++            vec![EditOp::new(1..1, "\ny\n")],
++            "CRLF becomes LF",
++        );
++        assert_eq!(
++            hygiene(
++                &snapshot("ab"),
++                Encoding::Utf8,
++                &[edit((0, 0), (0, 2), "a\rb")]
++            ),
++            vec![EditOp::new(1..1, "\n")],
++            "a lone CR becomes LF, and the rest trims away",
++        );
++    }
++
++    /// A formatter's whole-document replacement lands as the lines that changed, each trimmed.
++    #[test]
++    fn whole_document_edit_becomes_per_line_hunks() {
++        let doc = snapshot("a  \nb\nc  \n");
++        let expected = vec![EditOp::new(1..3, ""), EditOp::new(7..9, "")];
++        assert_eq!(
++            hygiene(&doc, Encoding::Utf8, &[edit((0, 0), (3, 0), "a\nb\nc\n")]),
++            expected,
++            "only the trailing blanks go",
++        );
++        assert_eq!(
++            hygiene(&doc, Encoding::Utf8, &[edit((0, 0), (99, 0), "a\nb\nc\n")]),
++            expected,
++            "an end past the last line clamps to the document end",
++        );
++        assert_eq!(
++            hygiene(
++                &snapshot("a\nb\n"),
++                Encoding::Utf8,
++                &[edit((0, 0), (0, 1), "A")]
++            ),
++            vec![EditOp::new(0..1, "A")],
++            "an edit ending before the last line is not whole-document",
++        );
++    }
++
++    /// A diff longer than the cap is not searched; the changed middle becomes one edit.
++    #[test]
++    fn line_diff_past_the_myers_cap_falls_back_to_the_trimmed_edit() {
++        let old: String = (0..1100).map(|i| format!("o{i}\n")).collect();
++        let new: String = (0..1100).map(|i| format!("n{i}\n")).collect();
++        let ops = hygiene(
++            &snapshot(&old),
++            Encoding::Utf8,
++            &[edit((0, 0), (1100, 0), &new)],
++        );
++        assert_eq!(ops.len(), 1, "one edit past the cap");
++        assert_eq!(apply(&old, &ops), new, "the edit still yields the new text");
++        let partly: String = (0..1100u32)
++            .map(|i| {
++                if i.is_multiple_of(3) {
++                    format!("n{i}\n")
++                } else {
++                    format!("o{i}\n")
++                }
++            })
++            .collect();
++        let ops = hygiene(
++            &snapshot(&old),
++            Encoding::Utf8,
++            &[edit((0, 0), (1100, 0), &partly)],
++        );
++        assert_eq!(
++            ops.len(),
++            367,
++            "within the cap, every changed line is its own hunk"
++        );
++        assert_eq!(apply(&old, &ops), partly, "the hunks yield the new text");
++    }
++
++    /// Line hunks, trimmed, rebuild the new text from the old and never overlap.
++    #[test]
++    fn line_diff_hunks_rebuild_the_new_text() {
++        /// Up to 8 lines over `a b c é`, with or without a final newline.
++        fn text(next: &mut impl FnMut() -> u64) -> String {
++            const WORDS: [&str; 4] = ["a", "b", "c", "é"];
++            let lines = (next() % 9) as usize;
++            let mut text = (0..lines)
++                .map(|_| WORDS[(next() % 4) as usize])
++                .collect::<Vec<_>>()
++                .join("\n");
++            if next().is_multiple_of(2) {
++                text.push('\n');
++            }
++            text
++        }
++        let mut state: u64 = 7;
++        let mut next = move || {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            state
++        };
++        for _ in 0..2000 {
++            let old = text(&mut next);
++            let new = text(&mut next);
++            let mut ops: Vec<EditOp> = line_diff(&old, &new)
++                .into_iter()
++                .map(|op| trim(&old[op.range.start as usize..op.range.end as usize], op))
++                .collect();
++            ops.sort_by_key(|op| (op.range.start, op.range.end));
++            assert!(
++                ops.windows(2).all(|w| w[0].range.end <= w[1].range.start),
++                "ops for {old:?} → {new:?} are disjoint: {ops:?}",
++            );
++            assert_eq!(apply(&old, &ops), new, "ops rebuild {new:?} from {old:?}");
++        }
++    }
++
++    /// An edit that replaces text with itself is no edit at all.
++    #[test]
++    fn edit_that_changes_nothing_is_dropped() {
++        assert_eq!(
++            hygiene(
++                &snapshot("abc"),
++                Encoding::Utf8,
++                &[edit((0, 0), (0, 3), "abc")]
++            ),
++            vec![],
++            "a no-op is dropped",
++        );
++    }
++}
+diff --git a/crates/scrive-lsp/src/lib.rs b/crates/scrive-lsp/src/lib.rs
+index bc9c360..3567818 100644
+--- a/crates/scrive-lsp/src/lib.rs
++++ b/crates/scrive-lsp/src/lib.rs
+@@ -8,6 +8,7 @@
+ //! - completion → [`Client::complete`]
+ //! - signature help → [`Client::signature_help`]
+ //! - hover → [`Client::hover`]
++//! - formatting → [`Client::format`]
+ //! - what the client hands back → [`Update`] ([`update`])
+ //! - the JSON-RPC envelope → [`message`]
+ //! - LSP positions ↔ scrive byte offsets → [`encoding`]
+@@ -21,6 +22,7 @@
+ pub mod client;
+ mod completion;
+ mod diagnostics;
++mod edits;
+ mod hover;
+ pub mod encoding;
+ mod markdown;
+diff --git a/crates/scrive-lsp/src/update.rs b/crates/scrive-lsp/src/update.rs
+index cf5c09d..9dfba4d 100644
+--- a/crates/scrive-lsp/src/update.rs
++++ b/crates/scrive-lsp/src/update.rs
+@@ -1,6 +1,8 @@
+ //! What the client hands back: document-bound changes, and notifications it passes through.
+ 
+-use scrive_core::{CompletionItem, Diagnostic, DocId, HoverInfo, Revision, SignatureInfo, Ticket};
++use scrive_core::{
++    CompletionItem, Diagnostic, DocId, EditOp, HoverInfo, Revision, SignatureInfo, Ticket,
++};
+ 
+ use crate::message;
+ 
+@@ -41,6 +43,9 @@ pub enum Change {
+     Signature(Option<SignatureInfo>),
+     /// The hover card answering the ticket's request; `None` means no docs.
+     Hover(Option<HoverInfo>),
++    /// A batch of edits for one `edit_grouped` transaction: LF text, each op trimmed to what
++    /// changes, sorted by `(start, end)` with tied inserts in the server's order.
++    Edits(Vec<EditOp>),
+ }
+ 
+ impl Document {

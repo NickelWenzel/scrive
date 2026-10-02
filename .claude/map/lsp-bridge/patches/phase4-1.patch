@@ -1,0 +1,29 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index dd02237..4baeeb1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -10,6 +10,11 @@ license = "MIT"
+ readme = "README.md"
+ repository = "https://github.com/robbym/scrive"
+ 
++# The internal crates, declared once. A release bump edits the `version`s here
++# and nowhere else; each member opts in with `<crate>.workspace = true`.
++[workspace.dependencies]
++scrive-core = { path = "crates/scrive-core", version = "0.3.0" }
++
+ # Track iced's git master. The requirements in scrive-iced are `0.15.0-dev`
+ # to match it; the dev-dep sub-crates are patched to the same source so their
+ # types unify with the ones `iced` re-exports.
+diff --git a/crates/scrive-iced/Cargo.toml b/crates/scrive-iced/Cargo.toml
+index 384792d..e5e4cd0 100644
+--- a/crates/scrive-iced/Cargo.toml
++++ b/crates/scrive-iced/Cargo.toml
+@@ -10,7 +10,7 @@ keywords = ["editor", "iced", "widget", "text", "gui"]
+ categories = ["gui", "text-editors"]
+ 
+ [dependencies]
+-scrive-core = { path = "../scrive-core", version = "0.3.0" }
++scrive-core.workspace = true
+ # `advanced` unlocks the low-level `Widget` API (iced::advanced::*) the editor
+ # widget implements directly, rather than as a canvas::Program.
+ iced = { version = "0.15.0-dev", features = ["advanced"] }

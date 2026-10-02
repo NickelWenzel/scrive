@@ -1,0 +1,1501 @@
+diff --git a/crates/scrive-lsp/src/client.rs b/crates/scrive-lsp/src/client.rs
+index 4b697a0..8f478d7 100644
+--- a/crates/scrive-lsp/src/client.rs
++++ b/crates/scrive-lsp/src/client.rs
+@@ -14,19 +14,20 @@ use lsp_types::{
+     ApplyWorkspaceEditResponse, ClientInfo, CompletionContext, CompletionParams,
+     CompletionTriggerKind, ConfigurationParams, DidChangeConfigurationParams,
+     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+-    InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
+-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
++    HoverParams, InitializeParams, InitializeResult, InitializedParams, PublishDiagnosticsParams,
++    SignatureHelpParams, TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+     TextDocumentPositionParams, TextDocumentSyncKind, Uri, VersionedTextDocumentIdentifier,
+     WorkspaceFolder,
+ };
+ use scrive_core::{
+-    document, Bias, CompletionRequest, CompletionTrigger, DocId, Revision, Snapshot, Ticket,
++    document, Bias, CompletionRequest, CompletionTrigger, DocId, HoverRequest, Revision,
++    SignatureRequest, Snapshot, Ticket,
+ };
+ use serde_json::Value;
+ 
+ use crate::message::{self, Message};
+ use crate::update::{self, Update};
+-use crate::{completion, diagnostics, uri, Encoding};
++use crate::{completion, diagnostics, hover, signature, uri, Encoding};
+ 
+ /// JSON-RPC's "method not found": a server request this client does not implement.
+ const METHOD_NOT_FOUND: i64 = -32601;
+@@ -163,12 +164,16 @@ struct Pending {
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ enum Kind {
+     Completion,
++    Signature,
++    Hover,
+ }
+ 
+ /// What a pending request asked, with what its reply needs.
+ #[derive(Debug)]
+ enum Query {
+     Completion(completion::Query),
++    Signature(signature::Query),
++    Hover(hover::Query),
+ }
+ 
+ impl Client {
+@@ -347,6 +352,81 @@ impl Client {
+         self.request_completion(doc_id, ticket, word, context, None)
+     }
+ 
++    /// Answers the editor's signature request with a `textDocument/signatureHelp` at its caret.
++    ///
++    /// While the caret stays in one call (the same [`SignatureRequest::call`]), a request already
++    /// in flight for that call is adopted instead of superseded: its reply answers the newest
++    /// ticket, and if the caret moved meanwhile the request is sent again at the new caret. A
++    /// request in another call, or outside any call, supersedes the document's previous one.
++    ///
++    /// When the server is not running or has no signature provider, the request is declined with
++    /// [`update::Change::Signature`]`(None)` under its ticket. A request from a revision other
++    /// than `snapshot`'s or the last synced one, or for a document that is not registered, gets
++    /// nothing.
++    pub fn signature_help(&mut self, snapshot: &Snapshot, request: &SignatureRequest) -> Output {
++        let doc_id = snapshot.doc_id();
++        let ticket = request.ticket();
++        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
++            return Output::default();
++        };
++        if ticket.revision() != snapshot.revision()
++            || snapshot.revision() != tracked.synced.revision()
++        {
++            return Output::default();
++        }
++        if !matches!(&self.state, State::Running(server) if server.signature) {
++            return Output::answer(doc_id, ticket, update::Change::Signature(None));
++        }
++        let caret = snapshot.clip_offset(snapshot.point_to_offset(request.position()), Bias::Left);
++        let call = request.call();
++        // Two requests outside any call share no call, so only a known call continues.
++        if call.is_some() {
++            let same_call = |p: &&mut Pending| {
++                p.doc_id == doc_id
++                    && matches!(&p.query, Query::Signature(query) if query.call == call)
++            };
++            if let Some(entry) = self.pending.iter_mut().find(same_call) {
++                entry.latest_ticket = ticket;
++                entry.latest_caret = caret;
++                return Output::default();
++            }
++        }
++        self.send(
++            doc_id,
++            ticket,
++            Query::Signature(signature::Query { call, caret }),
++            None,
++        )
++    }
++
++    /// Answers the editor's hover request with a `textDocument/hover` at its offset, superseding
++    /// the document's previous hover request.
++    ///
++    /// When the server is not running or has no hover provider, the request is declined with
++    /// [`update::Change::Hover`]`(None)` under its ticket. A request from a revision other than
++    /// `snapshot`'s or the last synced one, or for a document that is not registered, gets
++    /// nothing.
++    pub fn hover(&mut self, snapshot: &Snapshot, request: &HoverRequest) -> Output {
++        let doc_id = snapshot.doc_id();
++        let ticket = request.ticket;
++        let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
++            return Output::default();
++        };
++        if ticket.revision() != snapshot.revision()
++            || snapshot.revision() != tracked.synced.revision()
++        {
++            return Output::default();
++        }
++        if !matches!(&self.state, State::Running(server) if server.hover) {
++            return Output::answer(doc_id, ticket, update::Change::Hover(None));
++        }
++        let query = hover::Query {
++            offset: request.offset,
++            word: request.word.clone(),
++        };
++        self.send(doc_id, ticket, Query::Hover(query), None)
++    }
++
+     /// Brings the server up to `snapshot`. `changes` is the document's drained change log: when
+     /// it leads exactly from what the server has to `snapshot`, and the server syncs
+     /// incrementally, the edits go out as ranges; otherwise the whole text goes out. Servers that
+@@ -559,12 +639,29 @@ impl Client {
+                 query.at(entry.latest_caret),
+                 Some(entry.latest_ticket),
+             ),
++            Query::Signature(query) => self.send(
++                entry.doc_id,
++                entry.latest_ticket,
++                Query::Signature(signature::Query {
++                    call: query.call,
++                    caret: entry.latest_caret,
++                }),
++                Some(entry.latest_ticket),
++            ),
++            Query::Hover(query) => self.send(
++                entry.doc_id,
++                entry.latest_ticket,
++                Query::Hover(query),
++                Some(entry.latest_ticket),
++            ),
+         }
+     }
+ 
+     fn resolved(&mut self, entry: &Pending, value: Value) -> Output {
+         match &entry.query {
+             Query::Completion(query) => self.completed(entry, query, value),
++            Query::Signature(query) => self.signed(entry, query, value),
++            Query::Hover(query) => self.hovered(entry, query, value),
+         }
+     }
+ 
+@@ -746,6 +843,42 @@ impl Client {
+         output
+     }
+ 
++    /// Answers the latest ticket with the reply's signature. When the caret moved while the
++    /// request was out, the answer may describe the old caret's parameter, so the request is also
++    /// sent again at the new caret; once typing stops the carets agree and this ends.
++    fn signed(&mut self, entry: &Pending, query: &signature::Query, value: Value) -> Output {
++        let Ok(help) = serde_json::from_value::<Option<lsp_types::SignatureHelp>>(value) else {
++            return entry.failed();
++        };
++        let mut output = Output::answer(
++            entry.doc_id,
++            entry.latest_ticket,
++            update::Change::Signature(help.and_then(signature::convert)),
++        );
++        if entry.latest_caret != query.caret {
++            output.append(self.send(
++                entry.doc_id,
++                entry.latest_ticket,
++                Query::Signature(signature::Query {
++                    call: query.call,
++                    caret: entry.latest_caret,
++                }),
++                entry.reissued_for,
++            ));
++        }
++        output
++    }
++
++    /// Answers the ticket with the reply's card.
++    fn hovered(&self, entry: &Pending, query: &hover::Query, value: Value) -> Output {
++        let Ok(reply) = serde_json::from_value::<Option<lsp_types::Hover>>(value) else {
++            return entry.failed();
++        };
++        let card = reply
++            .and_then(|reply| hover::convert(self.encoding, &entry.request_snapshot, query, reply));
++        Output::answer(entry.doc_id, entry.latest_ticket, update::Change::Hover(card))
++    }
++
+     fn answer(&self, request: message::Request) -> Output {
+         let response = match self.state {
+             // After `shutdown()` the client promises nothing; `null` keeps the server unblocked.
+@@ -932,6 +1065,14 @@ impl Pending {
+                 self.latest_ticket,
+                 update::Change::Completions(Vec::new()),
+             ),
++            Query::Signature(_) => Output::answer(
++                self.doc_id,
++                self.latest_ticket,
++                update::Change::Signature(None),
++            ),
++            Query::Hover(_) => {
++                Output::answer(self.doc_id, self.latest_ticket, update::Change::Hover(None))
++            }
+         }
+     }
+ }
+@@ -940,6 +1081,8 @@ impl Query {
+     fn kind(&self) -> Kind {
+         match self {
+             Query::Completion(_) => Kind::Completion,
++            Query::Signature(_) => Kind::Signature,
++            Query::Hover(_) => Kind::Hover,
+         }
+     }
+ 
+@@ -947,6 +1090,8 @@ impl Query {
+     fn caret(&self) -> u32 {
+         match self {
+             Query::Completion(query) => query.word.end,
++            Query::Signature(query) => query.caret,
++            Query::Hover(query) => query.offset,
+         }
+     }
+ 
+@@ -971,6 +1116,29 @@ impl Query {
+                     context: Some(query.context.clone()),
+                 },
+             ),
++            Query::Signature(query) => {
++                message::Request::new::<lsp_types::request::SignatureHelpRequest>(
++                    id,
++                    SignatureHelpParams {
++                        context: None,
++                        text_document_position_params: TextDocumentPositionParams {
++                            text_document: TextDocumentIdentifier { uri: uri.clone() },
++                            position: encoding.position(snapshot, query.caret),
++                        },
++                        work_done_progress_params: Default::default(),
++                    },
++                )
++            }
++            Query::Hover(query) => message::Request::new::<lsp_types::request::HoverRequest>(
++                id,
++                HoverParams {
++                    text_document_position_params: TextDocumentPositionParams {
++                        text_document: TextDocumentIdentifier { uri: uri.clone() },
++                        position: encoding.position(snapshot, query.offset),
++                    },
++                    work_done_progress_params: Default::default(),
++                },
++            ),
+         }
+     }
+ }
+diff --git a/crates/scrive-lsp/src/client/capabilities.rs b/crates/scrive-lsp/src/client/capabilities.rs
+index 89b4ccd..d12047f 100644
+--- a/crates/scrive-lsp/src/client/capabilities.rs
++++ b/crates/scrive-lsp/src/client/capabilities.rs
+@@ -2,9 +2,11 @@
+ 
+ use lsp_types::{
+     ClientCapabilities, CompletionClientCapabilities, CompletionItemCapability,
+-    GeneralClientCapabilities, MarkupKind, PublishDiagnosticsClientCapabilities,
+-    ServerCapabilities, TextDocumentClientCapabilities, TextDocumentSyncCapability,
+-    TextDocumentSyncClientCapabilities, TextDocumentSyncKind, WorkspaceClientCapabilities,
++    GeneralClientCapabilities, HoverClientCapabilities, HoverProviderCapability, MarkupKind,
++    ParameterInformationSettings, PublishDiagnosticsClientCapabilities, ServerCapabilities,
++    SignatureHelpClientCapabilities, SignatureInformationSettings, TextDocumentClientCapabilities,
++    TextDocumentSyncCapability, TextDocumentSyncClientCapabilities, TextDocumentSyncKind,
++    WorkspaceClientCapabilities,
+ };
+ 
+ use crate::Encoding;
+@@ -18,6 +20,10 @@ pub(crate) struct Server {
+     pub(crate) change: TextDocumentSyncKind,
+     /// The completion trigger strings; `None` when the server has no completion provider.
+     pub(crate) completion: Option<Vec<String>>,
++    /// Whether the server answers `textDocument/signatureHelp`.
++    pub(crate) signature: bool,
++    /// Whether the server answers `textDocument/hover`.
++    pub(crate) hover: bool,
+ }
+ 
+ impl Server {
+@@ -42,6 +48,11 @@ impl Server {
+             open_close,
+             change,
+             completion,
++            signature: capabilities.signature_help_provider.is_some(),
++            hover: matches!(
++                capabilities.hover_provider,
++                Some(HoverProviderCapability::Simple(true) | HoverProviderCapability::Options(_))
++            ),
+         }
+     }
+ }
+@@ -71,6 +82,21 @@ pub(crate) fn client() -> ClientCapabilities {
+                 context_support: Some(true),
+                 ..CompletionClientCapabilities::default()
+             }),
++            signature_help: Some(SignatureHelpClientCapabilities {
++                signature_information: Some(SignatureInformationSettings {
++                    // The box renders documentation as plain text.
++                    documentation_format: Some(vec![MarkupKind::PlainText]),
++                    parameter_information: Some(ParameterInformationSettings {
++                        label_offset_support: Some(true),
++                    }),
++                    active_parameter_support: Some(true),
++                }),
++                ..SignatureHelpClientCapabilities::default()
++            }),
++            hover: Some(HoverClientCapabilities {
++                content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
++                ..HoverClientCapabilities::default()
++            }),
+             ..TextDocumentClientCapabilities::default()
+         }),
+         general: Some(GeneralClientCapabilities {
+diff --git a/crates/scrive-lsp/src/client/tests.rs b/crates/scrive-lsp/src/client/tests.rs
+index 4b18170..60b5451 100644
+--- a/crates/scrive-lsp/src/client/tests.rs
++++ b/crates/scrive-lsp/src/client/tests.rs
+@@ -2,7 +2,10 @@ use std::str::FromStr;
+ 
+ use scrive_core::intel::completion::Start;
+ use scrive_core::intel::ticket::Counter;
+-use scrive_core::{CompletionItem, Document, EditOp, GroupingHint, OpClass};
++use scrive_core::{
++    CompletionItem, Document, EditOp, GroupingHint, HoverInfo, HoverRequest, OpClass, Point,
++    SignatureInfo,
++};
+ use serde_json::{json, Value};
+ 
+ use super::*;
+@@ -86,8 +89,8 @@ fn whole(text: &str) -> Value {
+     json!({"text": text})
+ }
+ 
+-/// With [`completions`], the only place tests read a `Change`, so a new variant changes only
+-/// these helpers.
++/// With [`completions`], [`signature`] and [`hover`], the only place tests read a `Change`, so a
++/// new variant changes only these helpers.
+ fn diagnostics(update: &Update) -> (DocId, update::Stamp, Vec<scrive_core::Diagnostic>) {
+     let Update::Document(document) = update else {
+         panic!("expected a document update, got {update:?}")
+@@ -109,6 +112,28 @@ fn completions(update: &Update) -> (update::Stamp, Vec<CompletionItem>) {
+     }
+ }
+ 
++/// The stamp and signature of a signature update.
++fn signature(update: &Update) -> (update::Stamp, Option<SignatureInfo>) {
++    let Update::Document(document) = update else {
++        panic!("expected a document update, got {update:?}")
++    };
++    match document.change() {
++        update::Change::Signature(info) => (document.stamp(), info.clone()),
++        other => panic!("expected a signature, got {other:?}"),
++    }
++}
++
++/// The stamp and card of a hover update.
++fn hover(update: &Update) -> (update::Stamp, Option<HoverInfo>) {
++    let Update::Document(document) = update else {
++        panic!("expected a document update, got {update:?}")
++    };
++    match document.change() {
++        update::Change::Hover(info) => (document.stamp(), info.clone()),
++        other => panic!("expected a hover, got {other:?}"),
++    }
++}
++
+ /// A `publishDiagnostics` with one error over `start..end` on line 0.
+ fn publish(uri: &str, version: Option<i32>, span: Option<(u32, u32)>) -> Message {
+     let diagnostics: Vec<Value> = span
+@@ -1848,3 +1873,448 @@ fn continuing_request_after_a_dropped_first_request_starts_fresh() {
+         "the request is invoked, not a refinement of a list never received",
+     );
+ }
++
++/// Server capabilities with incremental sync, hover, and signature help triggered by `(` and `,`.
++fn signature_hover_capabilities() -> Value {
++    json!({
++        "textDocumentSync": 2,
++        "signatureHelpProvider": {"triggerCharacters": ["(", ","]},
++        "hoverProvider": true,
++    })
++}
++
++/// A running client with `text` open as `file:///a.rs`, whose server offers signature help and
++/// hover.
++fn signing(text: &str) -> (Client, Document) {
++    let doc = document(text);
++    let (mut client, _) = running(Client::builder(), signature_hover_capabilities());
++    let _ = client
++        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
++        .expect("opens");
++    (client, doc)
++}
++
++/// A signature request at `column` on line 0 of `doc`, inside the call whose `(` is at `call`,
++/// under a fresh ticket.
++fn signature_request(
++    tickets: &mut Counter,
++    doc: &Document,
++    column: u32,
++    call: Option<u32>,
++) -> SignatureRequest {
++    SignatureRequest::new(tickets.issue(doc.revision()), Point::new(0, column), call)
++}
++
++fn signature_help_request(id: i64, column: u32) -> Value {
++    json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/signatureHelp", "params": {
++        "textDocument": {"uri": "file:///a.rs"},
++        "position": {"line": 0, "character": column},
++    }})
++}
++
++/// The reply to request `id`: one signature `foo(a: i32, b: i32)` with the first parameter
++/// active.
++fn signature_reply(id: i64) -> Message {
++    from_server(json!({"jsonrpc": "2.0", "id": id, "result": {
++        "signatures": [{"label": "foo(a: i32, b: i32)", "parameters": [{"label": "a: i32"}, {"label": "b: i32"}]}],
++        "activeParameter": 0,
++    }}))
++}
++
++/// The one signature update in `output`, which sends nothing.
++fn signed(output: &Output) -> (update::Stamp, Option<SignatureInfo>) {
++    assert!(
++        output.messages.is_empty(),
++        "an answer sends nothing: {output:?}"
++    );
++    let [update] = output.updates.as_slice() else {
++        panic!("expected one update, got {:?}", output.updates)
++    };
++    signature(update)
++}
++
++/// `initialize` advertises plain-text signature documentation, label offsets and per-signature
++/// active parameters, no signature context, and markdown hover contents.
++#[test]
++fn signature_and_hover_capabilities_are_advertised() {
++    let (_, initialize) = Client::builder().build();
++    let initialize = serde_json::to_value(&initialize).expect("serializes");
++    let signature = &initialize["params"]["capabilities"]["textDocument"]["signatureHelp"];
++    let information = &signature["signatureInformation"];
++    assert_eq!(
++        information["documentationFormat"],
++        json!(["plaintext"]),
++        "documentation is plain text"
++    );
++    assert_eq!(
++        information["parameterInformation"]["labelOffsetSupport"],
++        json!(true),
++        "label offsets are advertised"
++    );
++    assert_eq!(
++        information["activeParameterSupport"],
++        json!(true),
++        "per-signature active parameters are advertised"
++    );
++    assert_eq!(
++        signature.get("contextSupport"),
++        None,
++        "context is not advertised"
++    );
++    assert_eq!(
++        initialize["params"]["capabilities"]["textDocument"]["hover"]["contentFormat"],
++        json!(["markdown", "plaintext"]),
++        "markdown hover is preferred"
++    );
++}
++
++/// A request goes out at the caret, without a context.
++#[test]
++fn signature_request_carries_the_caret_position() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = signing("foo(");
++    let first = signature_request(&mut tickets, &doc, 4, Some(3));
++    let output = client.signature_help(&doc.snapshot(), &first);
++    assert_eq!(
++        wire(&output.messages),
++        vec![signature_help_request(2, 4)],
++        "the request asks at the caret"
++    );
++    assert!(output.updates.is_empty(), "nothing is answered yet");
++}
++
++/// With no server to ask, or one without a provider, the editor stops waiting at once.
++#[test]
++fn signature_declines_before_initialize_and_without_a_provider() {
++    let doc = document("foo(");
++    let (initializing, _) = Client::builder().build();
++    let (running, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
++    for mut client in [initializing, running] {
++        let mut tickets = Counter::new();
++        let _ = client
++            .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
++            .expect("opens");
++        let first = signature_request(&mut tickets, &doc, 4, Some(3));
++        let (stamp, info) = signed(&client.signature_help(&doc.snapshot(), &first));
++        assert_eq!(
++            stamp,
++            update::Stamp::Ticket(first.ticket()),
++            "the decline answers the ticket"
++        );
++        assert!(info.is_none(), "the decline closes the box");
++    }
++}
++
++/// Typing inside the call of the request in flight sends nothing new.
++#[test]
++fn same_call_adopts_the_in_flight_signature_request() {
++    let mut tickets = Counter::new();
++    let (mut client, mut doc) = signing("foo(");
++    let first = signature_request(&mut tickets, &doc, 4, Some(3));
++    let _ = client.signature_help(&doc.snapshot(), &first);
++    type_ops(&mut client, &mut doc, vec![EditOp::insert(4, "a")]);
++    let second = signature_request(&mut tickets, &doc, 5, Some(3));
++    assert_silent(
++        &client.signature_help(&doc.snapshot(), &second),
++        "the same call adopts the in-flight request",
++    );
++}
++
++/// When the adopted request's reply lands with the caret elsewhere, the answer is delivered and
++/// the request re-issued at the new caret.
++#[test]
++fn signature_reply_after_the_caret_moved_is_delivered_and_reissued() {
++    let mut tickets = Counter::new();
++    let (mut client, mut doc) = signing("foo(");
++    let first = signature_request(&mut tickets, &doc, 4, Some(3));
++    let _ = client.signature_help(&doc.snapshot(), &first);
++    type_ops(&mut client, &mut doc, vec![EditOp::insert(4, "a")]);
++    let second = signature_request(&mut tickets, &doc, 5, Some(3));
++    let _ = client.signature_help(&doc.snapshot(), &second);
++    let output = client
++        .receive(signature_reply(2))
++        .expect("the reply is accepted");
++    let [update] = output.updates.as_slice() else {
++        panic!("expected one update, got {:?}", output.updates)
++    };
++    let (stamp, info) = signature(update);
++    assert_eq!(
++        stamp,
++        update::Stamp::Ticket(second.ticket()),
++        "the reply answers the latest ticket"
++    );
++    let info = info.expect("the signature is delivered");
++    assert_eq!(info.params, vec![4..10, 12..18], "the parameters are located");
++    assert_eq!(
++        wire(&output.messages),
++        vec![signature_help_request(3, 5)],
++        "the request is re-issued at the moved caret"
++    );
++}
++
++/// A reply at the caret the editor last asked about ends the continuation.
++#[test]
++fn reissued_signature_reply_at_the_latest_caret_ends_the_continuation() {
++    let mut tickets = Counter::new();
++    let (mut client, mut doc) = signing("foo(");
++    let first = signature_request(&mut tickets, &doc, 4, Some(3));
++    let _ = client.signature_help(&doc.snapshot(), &first);
++    type_ops(&mut client, &mut doc, vec![EditOp::insert(4, "a")]);
++    let second = signature_request(&mut tickets, &doc, 5, Some(3));
++    let _ = client.signature_help(&doc.snapshot(), &second);
++    let _ = client
++        .receive(signature_reply(2))
++        .expect("the reply is accepted");
++    let (stamp, info) = signed(
++        &client
++            .receive(signature_reply(3))
++            .expect("the reply is accepted"),
++    );
++    assert_eq!(
++        stamp,
++        update::Stamp::Ticket(second.ticket()),
++        "the re-issue answers the latest ticket"
++    );
++    assert!(info.is_some(), "the signature is delivered");
++}
++
++/// A request in another call replaces the one in flight.
++#[test]
++fn different_call_supersedes_with_a_cancel() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = signing("foo(bar(");
++    let outer = signature_request(&mut tickets, &doc, 8, Some(3));
++    let _ = client.signature_help(&doc.snapshot(), &outer);
++    let inner = signature_request(&mut tickets, &doc, 8, Some(7));
++    assert_eq!(
++        wire(&client.signature_help(&doc.snapshot(), &inner).messages),
++        vec![cancel_request(2), signature_help_request(3, 8)],
++        "the outer call's request is cancelled before the inner one goes out"
++    );
++}
++
++/// Requests outside any call share no call, so the newer one supersedes.
++#[test]
++fn request_outside_any_call_never_continues() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = signing("foo");
++    let first = signature_request(&mut tickets, &doc, 3, None);
++    let _ = client.signature_help(&doc.snapshot(), &first);
++    let second = signature_request(&mut tickets, &doc, 3, None);
++    assert_eq!(
++        wire(&client.signature_help(&doc.snapshot(), &second).messages),
++        vec![cancel_request(2), signature_help_request(3, 3)],
++        "the second request cancels the first"
++    );
++}
++
++/// A failed or undecodable signature reply closes the box instead of leaving it waiting.
++#[test]
++fn failed_signature_request_answers_none() {
++    for reply in [
++        failure(2, -32603),
++        from_server(json!({"jsonrpc": "2.0", "id": 2, "result": "x"})),
++    ] {
++        let mut tickets = Counter::new();
++        let (mut client, doc) = signing("foo(");
++        let first = signature_request(&mut tickets, &doc, 4, Some(3));
++        let _ = client.signature_help(&doc.snapshot(), &first);
++        let (stamp, info) = signed(
++            &client
++                .receive(reply)
++                .expect("a signature failure is not an error"),
++        );
++        assert_eq!(
++            stamp,
++            update::Stamp::Ticket(first.ticket()),
++            "stamped with the request's ticket"
++        );
++        assert!(info.is_none(), "the failure closes the box");
++    }
++}
++
++/// A content-modified signature request is sent again once, then given up.
++#[test]
++fn content_modified_reissues_signature_help_once() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = signing("foo(");
++    let first = signature_request(&mut tickets, &doc, 4, Some(3));
++    let _ = client.signature_help(&doc.snapshot(), &first);
++    let reissued = client
++        .receive(failure(2, -32801))
++        .expect("content modified is not an error");
++    assert_eq!(
++        wire(&reissued.messages),
++        vec![signature_help_request(3, 4)],
++        "the request goes out again at its caret"
++    );
++    assert!(reissued.updates.is_empty(), "nothing is answered yet");
++    assert_silent(
++        &client
++            .receive(failure(3, -32801))
++            .expect("content modified is not an error"),
++        "a second content-modified reply for one ticket is final",
++    );
++}
++
++/// Requests from an older revision are neither sent nor answered.
++#[test]
++fn stale_signature_and_hover_requests_are_ignored() {
++    let mut tickets = Counter::new();
++    let (mut client, mut doc) = signing("foo(");
++    type_ops(&mut client, &mut doc, vec![EditOp::insert(4, "a")]);
++    let stale = SignatureRequest::new(tickets.issue(Revision(0)), Point::new(0, 4), Some(3));
++    assert_silent(
++        &client.signature_help(&doc.snapshot(), &stale),
++        "a stale signature request is ignored",
++    );
++    let stale = HoverRequest::new(tickets.issue(Revision(0)), 1, 0..3);
++    assert_silent(
++        &client.hover(&doc.snapshot(), &stale),
++        "a stale hover request is ignored",
++    );
++}
++
++/// A hover request for `value` in `doc` (`let value = 1;`), under a fresh ticket.
++fn hover_request(tickets: &mut Counter, doc: &Document) -> HoverRequest {
++    HoverRequest::new(tickets.issue(doc.revision()), 5, 4..9)
++}
++
++fn hover_wire(id: i64) -> Value {
++    json!({"jsonrpc": "2.0", "id": id, "method": "textDocument/hover", "params": {
++        "textDocument": {"uri": "file:///a.rs"},
++        "position": {"line": 0, "character": 5},
++    }})
++}
++
++/// The one hover update in `output`, which sends nothing.
++fn hovered(output: &Output) -> (update::Stamp, Option<HoverInfo>) {
++    assert!(
++        output.messages.is_empty(),
++        "an answer sends nothing: {output:?}"
++    );
++    let [update] = output.updates.as_slice() else {
++        panic!("expected one update, got {:?}", output.updates)
++    };
++    hover(update)
++}
++
++/// A hover request goes out at the offset under the pointer.
++#[test]
++fn hover_request_carries_the_offset_position() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = signing("let value = 1;");
++    let output = client.hover(&doc.snapshot(), &hover_request(&mut tickets, &doc));
++    assert_eq!(
++        wire(&output.messages),
++        vec![hover_wire(2)],
++        "the request asks at the pointer"
++    );
++    assert!(output.updates.is_empty(), "nothing is answered yet");
++}
++
++/// With no server to ask, or one without a provider, the card gets no docs at once.
++#[test]
++fn hover_declines_before_initialize_and_without_a_provider() {
++    let doc = document("let value = 1;");
++    let (initializing, _) = Client::builder().build();
++    let (without, _) = running(Client::builder(), json!({"textDocumentSync": 2}));
++    let (disabled, _) = running(
++        Client::builder(),
++        json!({"textDocumentSync": 2, "hoverProvider": false}),
++    );
++    for mut client in [initializing, without, disabled] {
++        let mut tickets = Counter::new();
++        let _ = client
++            .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
++            .expect("opens");
++        let first = hover_request(&mut tickets, &doc);
++        let (stamp, info) = hovered(&client.hover(&doc.snapshot(), &first));
++        assert_eq!(
++            stamp,
++            update::Stamp::Ticket(first.ticket),
++            "the decline answers the ticket"
++        );
++        assert!(info.is_none(), "the decline has no docs");
++    }
++}
++
++/// A new hover cancels the one in flight.
++#[test]
++fn new_hover_supersedes_the_previous_one() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = signing("let value = 1;");
++    let _ = client.hover(&doc.snapshot(), &hover_request(&mut tickets, &doc));
++    assert_eq!(
++        wire(&client.hover(&doc.snapshot(), &hover_request(&mut tickets, &doc)).messages),
++        vec![cancel_request(2), hover_wire(3)],
++        "the first hover is cancelled before the second goes out"
++    );
++}
++
++/// A reply becomes a card in the editor's markdown subset over the server's range.
++#[test]
++fn hover_reply_answers_with_the_converted_card() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = signing("let value = 1;");
++    let first = hover_request(&mut tickets, &doc);
++    let _ = client.hover(&doc.snapshot(), &first);
++    let (stamp, info) = hovered(
++        &client
++            .receive(from_server(json!({"jsonrpc": "2.0", "id": 2, "result": {
++                "contents": {"kind": "markdown", "value": "```rust\nlet value: i32\n```"},
++                "range": {"start": {"line": 0, "character": 4}, "end": {"line": 0, "character": 9}},
++            }})))
++            .expect("the reply is accepted"),
++    );
++    assert_eq!(
++        stamp,
++        update::Stamp::Ticket(first.ticket),
++        "the card answers the ticket"
++    );
++    let info = info.expect("a card");
++    assert_eq!(info.markdown, "`let value: i32`", "the fence is a code line");
++    assert_eq!(info.range, 4..9, "the server's range is kept");
++}
++
++/// A `null` reply means no docs.
++#[test]
++fn null_hover_reply_answers_none() {
++    let mut tickets = Counter::new();
++    let (mut client, doc) = signing("let value = 1;");
++    let first = hover_request(&mut tickets, &doc);
++    let _ = client.hover(&doc.snapshot(), &first);
++    let (_, info) = hovered(
++        &client
++            .receive(from_server(
++                json!({"jsonrpc": "2.0", "id": 2, "result": null}),
++            ))
++            .expect("the reply is accepted"),
++    );
++    assert!(info.is_none(), "null has no docs");
++}
++
++/// A failed or undecodable hover reply settles the card instead of leaving it waiting.
++#[test]
++fn failed_hover_request_answers_none() {
++    for reply in [
++        failure(2, -32603),
++        from_server(json!({"jsonrpc": "2.0", "id": 2, "result": "x"})),
++    ] {
++        let mut tickets = Counter::new();
++        let (mut client, doc) = signing("let value = 1;");
++        let first = hover_request(&mut tickets, &doc);
++        let _ = client.hover(&doc.snapshot(), &first);
++        let (stamp, info) = hovered(
++            &client
++                .receive(reply)
++                .expect("a hover failure is not an error"),
++        );
++        assert_eq!(
++            stamp,
++            update::Stamp::Ticket(first.ticket),
++            "stamped with the request's ticket"
++        );
++        assert!(info.is_none(), "the failure has no docs");
++    }
++}
+diff --git a/crates/scrive-lsp/src/hover.rs b/crates/scrive-lsp/src/hover.rs
+new file mode 100644
+index 0000000..b5a1804
+--- /dev/null
++++ b/crates/scrive-lsp/src/hover.rs
+@@ -0,0 +1,177 @@
++//! Hover replies converted to scrive's hover card.
++
++use core::ops::Range;
++
++use lsp_types::{HoverContents, LanguageString, MarkedString, MarkupContent, MarkupKind};
++use scrive_core::intel::hover::escape_markdown;
++use scrive_core::{HoverInfo, Snapshot};
++
++use crate::{markdown, Encoding};
++
++/// What a pending hover request asked.
++#[derive(Clone, Debug)]
++pub(crate) struct Query {
++    /// The byte the pointer rested over.
++    pub(crate) offset: u32,
++    /// The word under the pointer: the card's range when the server gives none that fits.
++    pub(crate) word: Range<u32>,
++}
++
++/// The card for `hover`, converted against the request snapshot, or `None` when the server said
++/// nothing.
++pub(crate) fn convert(
++    encoding: Encoding,
++    snapshot: &Snapshot,
++    query: &Query,
++    hover: lsp_types::Hover,
++) -> Option<HoverInfo> {
++    let markdown = contents(hover.contents);
++    if markdown.trim().is_empty() {
++        return None;
++    }
++    // The widget dismisses the card once the pointer leaves this range, so it must contain the
++    // byte the pointer rests on.
++    let range = hover
++        .range
++        .map(|range| encoding.span(snapshot, range))
++        .filter(|span| span.contains(&query.offset))
++        .unwrap_or_else(|| query.word.clone());
++    Some(HoverInfo { markdown, range })
++}
++
++fn contents(contents: HoverContents) -> String {
++    match contents {
++        HoverContents::Scalar(marked) => marked_string(marked),
++        HoverContents::Array(list) => list
++            .into_iter()
++            .map(marked_string)
++            .filter(|part| !part.trim().is_empty())
++            .collect::<Vec<_>>()
++            .join("\n\n"),
++        HoverContents::Markup(MarkupContent {
++            kind: MarkupKind::Markdown,
++            value,
++        }) => markdown::to_hover(&value),
++        HoverContents::Markup(MarkupContent {
++            kind: MarkupKind::PlainText,
++            value,
++        }) => escape_markdown(&value),
++    }
++}
++
++fn marked_string(marked: MarkedString) -> String {
++    match marked {
++        MarkedString::String(text) => markdown::to_hover(&text),
++        MarkedString::LanguageString(LanguageString { value, .. }) => markdown::code_lines(&value),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use scrive_core::Document;
++    use serde_json::{json, Value};
++
++    use super::*;
++
++    /// The card for a reply over `let value = 1;` with the pointer on `value`.
++    fn card(contents: Value, range: Option<((u32, u32), (u32, u32))>) -> Option<HoverInfo> {
++        let doc = Document::new("let value = 1;").expect("fixture loads");
++        let mut hover = json!({"contents": contents});
++        if let Some((start, end)) = range {
++            hover["range"] = json!({
++                "start": {"line": start.0, "character": start.1},
++                "end": {"line": end.0, "character": end.1},
++            });
++        }
++        let query = Query {
++            offset: 5,
++            word: 4..9,
++        };
++        convert(
++            Encoding::Utf16,
++            &doc.snapshot(),
++            &query,
++            serde_json::from_value(hover).expect("fixture decodes"),
++        )
++    }
++
++    fn markdown(contents: Value) -> String {
++        card(contents, None).expect("a card").markdown
++    }
++
++    /// Plain text shows verbatim, markup characters included.
++    #[test]
++    fn plaintext_contents_are_escaped() {
++        assert_eq!(
++            markdown(json!({"kind": "plaintext", "value": "a*b `c`"})),
++            escape_markdown("a*b `c`"),
++            "plain text is escaped"
++        );
++    }
++
++    /// Markdown is lowered to the card's subset.
++    #[test]
++    fn markdown_contents_go_through_to_hover() {
++        assert_eq!(
++            markdown(json!({"kind": "markdown", "value": "[Vec](u) is **big**"})),
++            "Vec is **big**",
++            "links lose their target, bold stays"
++        );
++    }
++
++    /// Each non-empty part of a `MarkedString` array is its own paragraph.
++    #[test]
++    fn marked_string_array_is_joined_with_blank_lines() {
++        assert_eq!(
++            markdown(json!(["one", {"language": "rust", "value": "fn f()"}, ""])),
++            "one\n\n`fn f()`",
++            "parts are separated by a blank line, empty ones dropped"
++        );
++    }
++
++    /// A language string is code, one span per line.
++    #[test]
++    fn language_string_becomes_code_lines() {
++        assert_eq!(
++            markdown(json!({"language": "rust", "value": "a\n\nb"})),
++            "`a`\n\n`b`",
++            "each line is a code span, blank lines stay blank"
++        );
++    }
++
++    /// A reply with nothing to show shows no card.
++    #[test]
++    fn empty_contents_convert_to_none() {
++        for contents in [
++            json!(""),
++            json!([]),
++            json!({"kind": "markdown", "value": "  "}),
++        ] {
++            assert!(card(contents.clone(), None).is_none(), "{contents}");
++        }
++    }
++
++    /// A server range under the pointer is the card's range.
++    #[test]
++    fn server_range_containing_the_offset_is_kept() {
++        let info = card(json!("x"), Some(((0, 4), (0, 9)))).expect("a card");
++        assert_eq!(info.range, 4..9, "the server's range is kept");
++    }
++
++    /// A server range the pointer is not in, an empty one included, would dismiss the card at
++    /// once, so the word stands in.
++    #[test]
++    fn server_range_missing_the_offset_falls_back_to_the_word() {
++        for range in [((0, 10), (0, 11)), ((0, 5), (0, 5))] {
++            let info = card(json!("x"), Some(range)).expect("a card");
++            assert_eq!(info.range, 4..9, "{range:?} falls back to the word");
++        }
++    }
++
++    /// Without a server range the card covers the word.
++    #[test]
++    fn missing_range_falls_back_to_the_word() {
++        let info = card(json!("x"), None).expect("a card");
++        assert_eq!(info.range, 4..9, "the word is the range");
++    }
++}
+diff --git a/crates/scrive-lsp/src/lib.rs b/crates/scrive-lsp/src/lib.rs
+index 60a4c47..bc9c360 100644
+--- a/crates/scrive-lsp/src/lib.rs
++++ b/crates/scrive-lsp/src/lib.rs
+@@ -6,6 +6,8 @@
+ //!
+ //! - the client state machine → [`Client`] ([`client`])
+ //! - completion → [`Client::complete`]
++//! - signature help → [`Client::signature_help`]
++//! - hover → [`Client::hover`]
+ //! - what the client hands back → [`Update`] ([`update`])
+ //! - the JSON-RPC envelope → [`message`]
+ //! - LSP positions ↔ scrive byte offsets → [`encoding`]
+@@ -19,9 +21,11 @@
+ pub mod client;
+ mod completion;
+ mod diagnostics;
++mod hover;
+ pub mod encoding;
+ mod markdown;
+ pub mod message;
++mod signature;
+ mod snippet;
+ pub mod update;
+ pub mod uri;
+diff --git a/crates/scrive-lsp/src/markdown.rs b/crates/scrive-lsp/src/markdown.rs
+index 10ee5c3..e206bfd 100644
+--- a/crates/scrive-lsp/src/markdown.rs
++++ b/crates/scrive-lsp/src/markdown.rs
+@@ -1,6 +1,8 @@
+-//! Server markdown lowered to what scrive renders: plain text for completion documentation.
++//! Server markdown lowered to what scrive renders: plain text for completion and signature
++//! documentation, and the hover card's markdown subset.
+ 
+ use lsp_types::{Documentation, MarkupContent, MarkupKind};
++use scrive_core::intel::hover::escape_markdown;
+ 
+ /// One source line after block-level lowering.
+ enum Line<'a> {
+@@ -18,12 +20,35 @@ pub(crate) fn to_plain(markdown: &str) -> String {
+     lines(markdown)
+         .map(|line| match line {
+             Line::Code(code) => code.to_owned(),
+-            Line::Text(text) => plain_inline(strip_heading(text)),
++            Line::Text(text) => plain_inline(heading(text).unwrap_or(text)),
+         })
+         .collect::<Vec<_>>()
+         .join("\n")
+ }
+ 
++/// Markdown in the hover card's subset (the grammar on [`scrive_core::HoverInfo::markdown`]):
++/// fenced blocks become one code span per line, thematic breaks are dropped, links and images
++/// become their text and headings become bold. Inline code and `**bold**` pass through. Backslash
++/// escapes of other characters resolve to the character; the card's own (`\*`, `` \` ``, `\\`)
++/// are kept.
++pub(crate) fn to_hover(markdown: &str) -> String {
++    lines(markdown)
++        .map(|line| match line {
++            Line::Code(code) => code_line(code),
++            Line::Text(text) => match heading(text) {
++                Some(title) => format!("**{}**", hover_inline(title)),
++                None => hover_inline(text),
++            },
++        })
++        .collect::<Vec<_>>()
++        .join("\n")
++}
++
++/// `code` in the hover card's subset, one code span per line.
++pub(crate) fn code_lines(code: &str) -> String {
++    code.lines().map(code_line).collect::<Vec<_>>().join("\n")
++}
++
+ /// Completion documentation as plain text. A bare string is plain text per the spec.
+ pub(crate) fn documentation(documentation: &Documentation) -> String {
+     match documentation {
+@@ -81,13 +106,73 @@ fn is_rule(line: &str) -> bool {
+     }
+ }
+ 
+-/// `# Title` → `Title`: one to six hashes, then a space.
+-fn strip_heading(line: &str) -> &str {
++/// The title of an ATX heading (`# Title` → `Title`: one to six hashes, then a space), or `None`
++/// when `line` is not one.
++fn heading(line: &str) -> Option<&str> {
+     let hashes = line.bytes().take_while(|&b| b == b'#').count();
+-    match line[hashes..].strip_prefix(' ') {
+-        Some(rest) if (1..=6).contains(&hashes) => rest,
+-        _ => line,
++    line[hashes..]
++        .strip_prefix(' ')
++        .filter(|_| (1..=6).contains(&hashes))
++}
++
++/// One code line as a code span, an empty line as an empty line.
++fn code_line(line: &str) -> String {
++    if line.is_empty() {
++        String::new()
++    } else {
++        format!("`{}`", escape_markdown(line))
++    }
++}
++
++/// Inline lowering for the hover card.
++fn hover_inline(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    let mut rest = text;
++    while let Some(c) = rest.chars().next() {
++        if let Some((label, after)) = link(rest) {
++            out.push_str(&hover_inline(label));
++            rest = after;
++            continue;
++        }
++        match c {
++            '`' => match rest[1..].find('`') {
++                // A code span's content is literal in CommonMark, backslashes included, so it is
++                // escaped whole for the card.
++                Some(end) => {
++                    out.push('`');
++                    out.push_str(&escape_markdown(&rest[1..1 + end]));
++                    out.push('`');
++                    rest = &rest[end + 2..];
++                }
++                // An unclosed backtick is literal; left bare it would code-format the rest.
++                None => {
++                    out.push_str("\\`");
++                    rest = &rest[1..];
++                }
++            },
++            '\\' => match rest[1..].chars().next() {
++                Some(escaped @ ('*' | '`' | '\\')) => {
++                    out.push('\\');
++                    out.push(escaped);
++                    rest = &rest[2..];
++                }
++                Some(escaped) if escaped.is_ascii_punctuation() => {
++                    out.push(escaped);
++                    rest = &rest[2..];
++                }
++                // A backslash that escapes nothing is literal, and must not escape what follows.
++                _ => {
++                    out.push_str("\\\\");
++                    rest = &rest[1..];
++                }
++            },
++            c => {
++                out.push(c);
++                rest = &rest[c.len_utf8()..];
++            }
++        }
+     }
++    out
+ }
+ 
+ /// Inline lowering for plain text.
+@@ -209,4 +294,74 @@ mod tests {
+             assert_eq!(documentation(&doc), expected, "{doc:?}");
+         }
+     }
++
++    fn assert_hover(rows: &[(&str, &str)]) {
++        for (input, expected) in rows {
++            assert_eq!(to_hover(input), *expected, "lowering {input:?}");
++        }
++    }
++
++    /// Fence lines go; each code line becomes a code span.
++    #[test]
++    fn fences_become_code_lines() {
++        assert_hover(&[("```rust\nfn f() -> u8\n```", "`fn f() -> u8`")]);
++    }
++
++    /// Tilde fences count, and an unterminated fence runs to the end.
++    #[test]
++    fn tilde_and_unterminated_fences_become_code_lines() {
++        assert_hover(&[("~~~\nx\n~~~", "`x`"), ("```\ny", "`y`")]);
++    }
++
++    /// Markup characters in code are escaped, so the span shows them verbatim.
++    #[test]
++    fn code_lines_escape_their_text() {
++        let expected = format!("`{}`", escape_markdown("a`b*c\\d"));
++        assert_hover(&[("```\na`b*c\\d\n```", expected.as_str())]);
++    }
++
++    /// Horizontal rules have no place in the card.
++    #[test]
++    fn thematic_breaks_are_stripped_from_hover() {
++        assert_hover(&[("a\n---\nb", "a\nb")]);
++    }
++
++    /// Links and images keep only their label.
++    #[test]
++    fn links_become_their_text_in_hover() {
++        assert_hover(&[("see [Vec](https://doc) and ![i](x.png)", "see Vec and i")]);
++    }
++
++    /// Bold and inline code are the card's own markup.
++    #[test]
++    fn bold_and_inline_code_pass_through() {
++        assert_hover(&[
++            ("**bold** and `code`", "**bold** and `code`"),
++            ("`a\\*b`", "`a\\\\\\*b`"),
++        ]);
++    }
++
++    /// An unclosed backtick shows as a backtick instead of code-formatting the rest of the line.
++    #[test]
++    fn unclosed_backtick_is_escaped() {
++        assert_hover(&[("a ` b", "a \\` b")]);
++    }
++
++    /// Escapes the card does not know resolve to their character; its own stay escaped.
++    #[test]
++    fn foreign_escapes_resolve_and_ours_are_kept() {
++        assert_hover(&[("a\\_b \\*c\\*", "a_b \\*c\\*")]);
++    }
++
++    /// A heading is bold, the only emphasis the card renders.
++    #[test]
++    fn headings_become_bold() {
++        assert_hover(&[("# Title", "**Title**"), ("#nospace", "#nospace")]);
++    }
++
++    /// A backslash before a letter is literal in markdown, and stays literal in the card.
++    #[test]
++    fn lone_backslash_is_escaped() {
++        assert_hover(&[("C:\\path", "C:\\\\path"), ("end\\", "end\\\\")]);
++    }
+ }
+diff --git a/crates/scrive-lsp/src/signature.rs b/crates/scrive-lsp/src/signature.rs
+new file mode 100644
+index 0000000..5dfd771
+--- /dev/null
++++ b/crates/scrive-lsp/src/signature.rs
+@@ -0,0 +1,226 @@
++//! Signature help converted to scrive's one-line signature box.
++
++use core::ops::Range;
++
++use lsp_types::{ParameterInformation, ParameterLabel, SignatureHelp};
++use scrive_core::SignatureInfo;
++
++use crate::{markdown, Encoding};
++
++/// What a pending signature request asked.
++#[derive(Clone, Debug)]
++pub(crate) struct Query {
++    /// The editor's call identity: the offset of the innermost `(` around the caret.
++    pub(crate) call: Option<u32>,
++    /// The caret the request's position was computed from.
++    pub(crate) caret: u32,
++}
++
++/// The active signature, or `None` when the server offers none.
++pub(crate) fn convert(help: SignatureHelp) -> Option<SignatureInfo> {
++    let last = help.signatures.len().checked_sub(1)?;
++    let index = (help.active_signature.unwrap_or(0) as usize).min(last);
++    let shared = help.active_parameter;
++    let signature = help.signatures.into_iter().nth(index)?;
++    let params = parameters(
++        &signature.label,
++        signature.parameters.as_deref().unwrap_or_default(),
++    );
++    // The per-signature field (LSP 3.16) is precise; the top-level one is shared by every
++    // signature and only a fallback.
++    let active = signature
++        .active_parameter
++        .or(shared)
++        .unwrap_or(0)
++        .min(params.len().saturating_sub(1) as u32);
++    Some(SignatureInfo {
++        doc: signature
++            .documentation
++            .as_ref()
++            .map(markdown::documentation),
++        label: signature.label,
++        params,
++        active,
++    })
++}
++
++/// Byte ranges of each parameter within `label`, one per parameter so the indices stay aligned
++/// with the active parameter. A label that is not found is an empty range where the search
++/// stood.
++fn parameters(label: &str, parameters: &[ParameterInformation]) -> Vec<Range<u32>> {
++    // The search starts after the first `(`, so a parameter named like the function (`x(x)`)
++    // is found in the parameter list, not in the name.
++    let mut cursor = label.find('(').map_or(0, |open| open + 1);
++    parameters
++        .iter()
++        .map(|parameter| {
++            let range = match &parameter.label {
++                ParameterLabel::Simple(text) if !text.is_empty() => {
++                    match label[cursor..].find(text.as_str()) {
++                        Some(at) => cursor + at..cursor + at + text.len(),
++                        None => cursor..cursor,
++                    }
++                }
++                ParameterLabel::Simple(_) => cursor..cursor,
++                // Label offsets are UTF-16 code units whatever position encoding was negotiated
++                // (LSP §textDocument_signatureHelp, `ParameterInformation.label`).
++                ParameterLabel::LabelOffsets([start, end]) => {
++                    let end = Encoding::Utf16.bytes([label], *end) as usize;
++                    let start = (Encoding::Utf16.bytes([label], *start) as usize).min(end);
++                    start..end
++                }
++            };
++            cursor = range.end;
++            range.start as u32..range.end as u32
++        })
++        .collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use serde_json::{json, Value};
++
++    use super::*;
++
++    fn converted(help: Value) -> Option<SignatureInfo> {
++        convert(serde_json::from_value(help).expect("fixture decodes"))
++    }
++
++    /// The parameter ranges of a one-signature reply with `label` and `parameters`.
++    fn ranges(label: &str, parameters: Value) -> Vec<Range<u32>> {
++        let parameters: Vec<Value> = parameters
++            .as_array()
++            .expect("an array of labels")
++            .iter()
++            .map(|label| json!({"label": label}))
++            .collect();
++        converted(json!({"signatures": [{"label": label, "parameters": parameters}]}))
++            .expect("one signature")
++            .params
++    }
++
++    fn active(signature: Value, top: Option<u32>) -> u32 {
++        let mut help = json!({"signatures": [signature]});
++        if let Some(top) = top {
++            help["activeParameter"] = json!(top);
++        }
++        converted(help).expect("one signature").active
++    }
++
++    /// No signature means no box.
++    #[test]
++    fn empty_signatures_convert_to_none() {
++        assert!(
++            converted(json!({"signatures": []})).is_none(),
++            "an empty reply closes the box"
++        );
++    }
++
++    /// An active signature past the end selects the last one.
++    #[test]
++    fn active_signature_is_clamped() {
++        let info = converted(json!({
++            "signatures": [{"label": "f()"}, {"label": "g()"}],
++            "activeSignature": 7,
++        }))
++        .expect("a signature");
++        assert_eq!(info.label, "g()", "the last signature is active");
++    }
++
++    /// The signature's own active parameter overrides the shared one.
++    #[test]
++    fn per_signature_active_parameter_wins() {
++        let signature = json!({"label": "f(a, b)", "parameters": [{"label": "a"}, {"label": "b"}], "activeParameter": 1});
++        assert_eq!(
++            active(signature, Some(0)),
++            1,
++            "the per-signature field wins"
++        );
++        let signature = json!({"label": "f(a, b)", "parameters": [{"label": "a"}, {"label": "b"}]});
++        assert_eq!(
++            active(signature.clone(), Some(1)),
++            1,
++            "the shared field is the fallback"
++        );
++        assert_eq!(active(signature, None), 0, "absent means the first");
++    }
++
++    /// An active parameter past the end is the last parameter, and `0` without parameters.
++    #[test]
++    fn active_parameter_is_clamped_to_the_last_parameter() {
++        let two = json!({"label": "f(a, b)", "parameters": [{"label": "a"}, {"label": "b"}], "activeParameter": 5});
++        assert_eq!(active(two, None), 1, "clamped to the last parameter");
++        let none = json!({"label": "f()", "activeParameter": 3});
++        assert_eq!(active(none, None), 0, "no parameters is 0");
++    }
++
++    /// A parameter named like the function is found in the parameter list.
++    #[test]
++    fn simple_labels_are_found_after_the_open_paren() {
++        assert_eq!(ranges("x(x)", json!(["x"])), vec![2..3], "found after `(`");
++        assert_eq!(
++            ranges("a b", json!(["b"])),
++            vec![2..3],
++            "without `(` the search starts at 0"
++        );
++        assert_eq!(
++            ranges("foo(a: i32, b: i32)", json!(["a: i32", "b: i32"])),
++            vec![4..10, 12..18],
++            "each parameter is found"
++        );
++    }
++
++    /// A repeated label is found once per parameter, left to right.
++    #[test]
++    fn repeated_simple_labels_are_found_in_order() {
++        assert_eq!(
++            ranges("max(x, x)", json!(["x", "x"])),
++            vec![4..5, 7..8],
++            "the second search starts after the first match"
++        );
++    }
++
++    /// A label missing from the signature keeps its slot, empty, and the search goes on.
++    #[test]
++    fn missing_simple_label_is_an_empty_range_at_the_cursor() {
++        assert_eq!(
++            ranges("f(a, b)", json!(["a", "zz", "b"])),
++            vec![2..3, 3..3, 5..6],
++            "the missing label is empty where the search stood"
++        );
++    }
++
++    /// Label offsets count UTF-16 code units, not bytes.
++    #[test]
++    fn label_offsets_are_utf16() {
++        assert_eq!(
++            ranges("f(é: 😀)", json!([[5, 7]])),
++            vec![6..10],
++            "the emoji spans units 5..7"
++        );
++    }
++
++    /// Offsets inside a surrogate pair snap to its start, past the end clamp, and inverted ones
++    /// collapse to the end.
++    #[test]
++    fn label_offsets_snap_clamp_and_collapse() {
++        for (offsets, expected) in [([6, 7], 6..10), ([5, 99], 6..11), ([7, 5], 6..6)] {
++            assert_eq!(
++                ranges("f(é: 😀)", json!([offsets])),
++                vec![expected],
++                "{offsets:?}"
++            );
++        }
++    }
++
++    /// The box shows documentation as plain text.
++    #[test]
++    fn signature_documentation_is_plain_text() {
++        let info = converted(json!({"signatures": [{
++            "label": "f()",
++            "documentation": {"kind": "markdown", "value": "**x**"},
++        }]}))
++        .expect("a signature");
++        assert_eq!(info.doc.as_deref(), Some("x"), "markdown is lowered");
++    }
++}
+diff --git a/crates/scrive-lsp/src/update.rs b/crates/scrive-lsp/src/update.rs
+index b7e4284..cf5c09d 100644
+--- a/crates/scrive-lsp/src/update.rs
++++ b/crates/scrive-lsp/src/update.rs
+@@ -1,6 +1,6 @@
+ //! What the client hands back: document-bound changes, and notifications it passes through.
+ 
+-use scrive_core::{CompletionItem, Diagnostic, DocId, Revision, Ticket};
++use scrive_core::{CompletionItem, Diagnostic, DocId, HoverInfo, Revision, SignatureInfo, Ticket};
+ 
+ use crate::message;
+ 
+@@ -37,6 +37,10 @@ pub enum Change {
+     Diagnostics(Vec<Diagnostic>),
+     /// Completion items answering the ticket's request; an empty list closes the popup.
+     Completions(Vec<CompletionItem>),
++    /// The signature answering the ticket's request; `None` closes the box.
++    Signature(Option<SignatureInfo>),
++    /// The hover card answering the ticket's request; `None` means no docs.
++    Hover(Option<HoverInfo>),
+ }
+ 
+ impl Document {

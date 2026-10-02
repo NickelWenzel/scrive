@@ -1,0 +1,1625 @@
+diff --git a/crates/scrive-iced/examples/lsp/main.rs b/crates/scrive-iced/examples/lsp/main.rs
+index 98549d7..f77c0d6 100644
+--- a/crates/scrive-iced/examples/lsp/main.rs
++++ b/crates/scrive-iced/examples/lsp/main.rs
+@@ -6,13 +6,18 @@
+ //!
+ //! The server (`server.rs`) runs in-process, so there's no transport to set up. It answers
+ //! `initialize`, completion, signature help and hover with canned JSON, and computes
+-//! diagnostics (trailing whitespace), goto definition, rename and formatting from the text the
+-//! client sent it. The right-hand panel shows the traffic. Try:
++//! diagnostics (trailing whitespace), goto definition, rename, formatting and inlay hints from
++//! the text the client sent it. The right-hand panel shows the traffic. Try:
+ //!
+ //! - F12 on `greet` in main.rs: the util.rs tab opens with the definition selected;
+ //! - F2 on `greet`, type a new name, Enter: both files change;
+ //! - Shift+Alt+F: the trailing whitespace goes, and so do its warnings;
+-//! - typing, `(`, and hovering `greet`: the canned completion, signature and hover.
++//! - typing, `(`, and hovering `greet`: the canned completion, signature and hover;
++//! - Ctrl+click `name` in the parameter hint: the util.rs tab opens with the parameter selected;
++//! - Ctrl+click `String` in the type hint: the panel notes the jump into an unopened file;
++//! - double-click the type hint: `: String` is inserted, and the hint goes;
++//! - hovering a hint: its tooltip, resolved by the server;
++//! - Ctrl+I (Cmd+I on macOS): hints off and on.
+ //!
+ //! The wiring is the one a real host uses: sync after every editor update, route each
+ //! `Update::Document` to the tab that owns it, and hand a cross-file jump to the target tab.
+@@ -24,6 +29,7 @@ mod server;
+ 
+ use std::collections::VecDeque;
+ 
++use iced::keyboard::{self, Key};
+ use iced::time::Instant;
+ use iced::widget::{button, column, container, row, scrollable, text};
+ use iced::{Element, Fill, FillPortion, Function, Subscription, Task, Theme};
+@@ -66,6 +72,8 @@ struct App {
+     tabs: Vec<Tab>,
+     active: tab::Id,
+     transport: Transport,
++    /// Whether inlay hints show; Ctrl+I flips it for every tab.
++    hints: bool,
+ }
+ 
+ #[derive(Debug, Clone)]
+@@ -78,6 +86,8 @@ enum Message {
+     Deliver,
+     /// A tab button was pressed.
+     Select(tab::Id),
++    /// Ctrl+I: turn inlay hints off or on.
++    ToggleHints,
+ }
+ 
+ /// The app-owned transport: here, a scripted server in the same process, plus a log of
+@@ -100,7 +110,10 @@ impl App {
+         .into_iter()
+         .enumerate()
+         {
+-            let mut editor = CodeEditor::new(source).language(rust()).rename(true);
++            let mut editor = CodeEditor::new(source)
++                .language(rust())
++                .rename(true)
++                .inlay_hints(true);
+             // Before the handshake completes, this only records the text. The didOpen goes
+             // out with `initialized`.
+             outgoing.extend(
+@@ -122,6 +135,7 @@ impl App {
+                 tabs,
+                 active: tab::Id(0),
+                 transport,
++                hints: true,
+             },
+             task,
+         )
+@@ -134,6 +148,7 @@ impl App {
+             tabs,
+             active,
+             transport,
++            hints,
+         } = self;
+         match message {
+             Message::Editor(id, event) => {
+@@ -141,7 +156,9 @@ impl App {
+                     return Task::none();
+                 };
+                 let task = tab.editor.update(event, now).map(Message::Editor.with(id));
+-                let outgoing = tab.editor.sync_lsp(client);
++                let synced = tab.editor.sync_lsp(client);
++                let mut outgoing = synced.messages;
++                outgoing.extend(follow(tabs, active, client, transport, synced.jump));
+                 Task::batch([task, transport.send(outgoing)])
+             }
+             Message::Lsp(message) => {
+@@ -168,34 +185,7 @@ impl App {
+                             if let Some(refusal) = applied.refused {
+                                 transport.note(format!("refused: {refusal}"));
+                             }
+-                            match applied.jump {
+-                                Some(lsp::update::Jump::Open(open)) => {
+-                                    let Some(target) = tabs.iter_mut().find(|tab| {
+-                                        tab.editor.document().doc_id() == open.doc_id()
+-                                    }) else {
+-                                        continue;
+-                                    };
+-                                    match target.editor.jump(client, open) {
+-                                        Ok(messages) => {
+-                                            outgoing.extend(messages);
+-                                            *active = target.id;
+-                                        }
+-                                        Err(refusal) => {
+-                                            transport.note(format!("jump refused: {refusal}"))
+-                                        }
+-                                    }
+-                                }
+-                                // A host with files would read this one, open a tab, `open_lsp`
+-                                // it, then `select(unopened.span(&text))`. Every demo file is
+-                                // open, and wasm has no disk.
+-                                Some(lsp::update::Jump::Unopened(unopened)) => {
+-                                    transport.note(format!(
+-                                        "definition in unopened {}",
+-                                        unopened.uri().as_str()
+-                                    ));
+-                                }
+-                                None => {}
+-                            }
++                            outgoing.extend(follow(tabs, active, client, transport, applied.jump));
+                         }
+                         // A host with files writes `edits.apply(&disk_text)` back to disk.
+                         lsp::Update::FileEdits(edits) => {
+@@ -216,6 +206,15 @@ impl App {
+                 *active = id;
+                 Task::none()
+             }
++            // Turning hints on schedules a fetch per tab, which the shown tab's widget wakes.
++            Message::ToggleHints => {
++                *hints = !*hints;
++                for tab in tabs.iter_mut() {
++                    tab.editor.set_inlay_hints(*hints);
++                }
++                transport.note(format!("inlay hints {}", if *hints { "on" } else { "off" }));
++                Task::none()
++            }
+         }
+     }
+ 
+@@ -233,9 +232,10 @@ impl App {
+         column![tabs, body].spacing(8).padding(8).into()
+     }
+ 
+-    /// Only the active tab listens: global chords (Ctrl+F) must reach one editor.
++    /// Only the active tab listens, so global chords (Ctrl+F) reach one editor; Ctrl+I reaches
++    /// the app.
+     fn subscription(&self) -> Subscription<Message> {
+-        match self.tabs.iter().find(|tab| tab.id == self.active) {
++        let editor = match self.tabs.iter().find(|tab| tab.id == self.active) {
+             // `Subscription::map` takes only non-capturing closures, so the id rides along
+             // through `with`.
+             Some(tab) => tab
+@@ -244,7 +244,8 @@ impl App {
+                 .with(tab.id)
+                 .map(|(id, event)| Message::Editor(id, event)),
+             None => Subscription::none(),
+-        }
++        };
++        Subscription::batch([editor, keyboard::listen().filter_map(toggle_chord)])
+     }
+ }
+ 
+@@ -294,6 +295,44 @@ impl Transport {
+     }
+ }
+ 
++/// Route `jump` to the tab whose document holds it, and so on for any jump that tab's sync
++/// returns. Returns the messages to send. A host with files would read an unopened one, open a
++/// tab, `open_lsp` it, then `select(unopened.span(&text))`; every demo file is open, and wasm
++/// has no disk, so it is only noted.
++fn follow(
++    tabs: &mut [Tab],
++    active: &mut tab::Id,
++    client: &mut lsp::Client,
++    transport: &mut Transport,
++    mut jump: Option<lsp::update::Jump>,
++) -> Vec<lsp::Message> {
++    let mut outgoing = Vec::new();
++    while let Some(next) = jump.take() {
++        match next {
++            lsp::update::Jump::Open(open) => {
++                let Some(target) = tabs
++                    .iter_mut()
++                    .find(|tab| tab.editor.document().doc_id() == open.doc_id())
++                else {
++                    break;
++                };
++                match target.editor.jump(client, open) {
++                    Ok(applied) => {
++                        outgoing.extend(applied.messages);
++                        jump = applied.jump;
++                        *active = target.id;
++                    }
++                    Err(refusal) => transport.note(format!("jump refused: {refusal}")),
++                }
++            }
++            lsp::update::Jump::Unopened(unopened) => {
++                transport.note(format!("definition in unopened {}", unopened.uri().as_str()));
++            }
++        }
++    }
++    outgoing
++}
++
+ fn tab_button(tab: &Tab, active: tab::Id) -> Element<'_, Message> {
+     let style = if tab.id == active {
+         button::primary
+@@ -318,6 +357,22 @@ fn traffic(lines: &VecDeque<String>) -> Element<'_, Message> {
+         .into()
+ }
+ 
++/// Ctrl+I, or Cmd+I on macOS, without Shift or Alt and not repeated. The editor binds no Ctrl+I,
++/// so the key reaches `keyboard::listen`.
++fn toggle_chord(event: keyboard::Event) -> Option<Message> {
++    match event {
++        keyboard::Event::KeyPressed {
++            key: Key::Character(c),
++            modifiers,
++            repeat: false,
++            ..
++        } if c == "i" && modifiers.command() && !modifiers.shift() && !modifiers.alt() => {
++            Some(Message::ToggleHints)
++        }
++        _ => None,
++    }
++}
++
+ fn uri(text: &str) -> lsp::lsp_types::Uri {
+     text.parse().expect("the demo's URIs parse")
+ }
+@@ -342,9 +397,13 @@ fn main() -> iced::Result {
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::*;
++    use iced::keyboard::key::{Code, Physical};
++    use iced::keyboard::{Location, Modifiers};
++    use scrive_core::intel::inlay;
+     use scrive_iced::Action;
+ 
++    use super::*;
++
+     const MAIN: tab::Id = tab::Id(0);
+     const UTIL: tab::Id = tab::Id(1);
+ 
+@@ -483,4 +542,228 @@ mod tests {
+             "a server notification is logged",
+         );
+     }
++
++    /// Fire tab `id`'s scheduled hint fetch, as its widget does once the delay has passed, and
++    /// let the conversation finish.
++    fn fetch(app: &mut App, id: tab::Id) {
++        let generation = editor(app, id)
++            .pending_wake()
++            .expect("a fetch is scheduled")
++            .generation;
++        press(app, id, Event::Editor(Action::Wake(generation)));
++    }
++
++    /// The hints tab `id` shows, as `(render offset, key)`, in offset order.
++    fn hints(app: &App, id: tab::Id) -> Vec<(u32, inlay::Key)> {
++        let document = editor(app, id).document();
++        document
++            .inlays_in(0..document.buffer().len())
++            .map(|hint| (hint.offset(), hint.key()))
++            .collect()
++    }
++
++    /// Where `needle` starts in `text`, as an editor offset.
++    fn at(text: &str, needle: &str) -> u32 {
++        let found = text
++            .find(needle)
++            .unwrap_or_else(|| panic!("{needle:?} is in the demo"));
++        u32::try_from(found).expect("the demo is small")
++    }
++
++    /// Where main.rs's type hint renders: after `message`.
++    fn type_offset() -> u32 {
++        at(MAIN_RS, "let message") + "let message".len() as u32
++    }
++
++    /// Where main.rs's parameter hint renders: before `"scrive"`.
++    fn parameter_offset() -> u32 {
++        at(MAIN_RS, "\"scrive\"")
++    }
++
++    /// main.rs after boot with its hints fetched: `(type hint key, parameter hint key)`.
++    fn hinted() -> (App, inlay::Key, inlay::Key) {
++        let mut app = booted();
++        fetch(&mut app, MAIN);
++        let shown = hints(&app, MAIN);
++        let key_at = |offset: u32| {
++            shown
++                .iter()
++                .find(|(at, _)| *at == offset)
++                .unwrap_or_else(|| panic!("a hint renders at {offset}: {shown:?}"))
++                .1
++        };
++        let (ty, parameter) = (key_at(type_offset()), key_at(parameter_offset()));
++        (app, ty, parameter)
++    }
++
++    /// The fetch for main.rs brings exactly its two hints: the type after `message` and the
++    /// parameter before `"scrive"`.
++    #[test]
++    fn the_hint_script_lands_in_main_rs() {
++        let (app, _, _) = hinted();
++        let offsets: Vec<u32> = hints(&app, MAIN).iter().map(|(at, _)| *at).collect();
++        assert_eq!(
++            offsets,
++            [type_offset(), parameter_offset()],
++            "the type hint and the parameter hint show, in offset order",
++        );
++        assert!(
++            app.transport
++                .traffic
++                .iter()
++                .any(|line| line.starts_with("→ textDocument/inlayHint")),
++            "the fetch went to the server",
++        );
++    }
++
++    /// Ctrl+click on `name` in the parameter hint switches to util.rs and selects the
++    /// parameter there: an `Open` label jump routed through the editor arm.
++    #[test]
++    fn ctrl_click_on_a_parameter_hint_opens_util_rs_at_the_parameter() {
++        let (mut app, _, parameter) = hinted();
++        press(
++            &mut app,
++            MAIN,
++            Event::Editor(Action::InlayJump {
++                key: parameter,
++                part: 0,
++            }),
++        );
++        assert_eq!(app.active, UTIL, "util.rs is active");
++        let name = at(UTIL_RS, "(name") + 1;
++        assert_eq!(
++            editor(&app, UTIL).selection(),
++            name..name + 4,
++            "greet's parameter is selected",
++        );
++    }
++
++    /// Ctrl+click on `String` in the type hint jumps into a file no tab holds: `sync_lsp`
++    /// returns the jump, with no request to the server, and the panel notes it.
++    #[test]
++    fn ctrl_click_on_a_type_hint_jumps_into_an_unopened_file_through_sync_lsp() {
++        let (mut app, ty, _) = hinted();
++        press(
++            &mut app,
++            MAIN,
++            Event::Editor(Action::InlayJump { key: ty, part: 1 }),
++        );
++        let traffic = &app.transport.traffic;
++        assert!(
++            traffic
++                .iter()
++                .any(|line| line == "· definition in unopened file:///demo/std/string.rs"),
++            "the jump into the standard library is noted",
++        );
++        assert!(
++            !traffic
++                .iter()
++                .any(|line| line.starts_with("→ textDocument/definition")),
++            "no definition request goes out",
++        );
++        assert_eq!(app.active, MAIN, "main.rs stays active");
++    }
++
++    /// Double-clicking the type hint inserts `: String` once and removes the hint; the server
++    /// sees the edit in the same press, and the refetch brings back only the parameter hint.
++    #[test]
++    fn double_click_inserts_the_type_once_and_leaves_no_duplicate_hint() {
++        let (mut app, ty, _) = hinted();
++        let offset = type_offset();
++        press(
++            &mut app,
++            MAIN,
++            Event::Editor(Action::InlayInsert { key: ty, offset }),
++        );
++        let text = text_of(&app, MAIN);
++        let mut expected = MAIN_RS.to_owned();
++        expected.insert_str(offset as usize, ": String");
++        assert_eq!(text, expected, "the type is inserted at the hint");
++        assert_eq!(text.matches(": String").count(), 1, "the type is written once");
++        let shown = hints(&app, MAIN);
++        assert!(
++            shown.iter().all(|(at, key)| *key != ty && *at != offset),
++            "the inserted hint is gone: {shown:?}",
++        );
++        assert_eq!(
++            app.transport.server.text(MAIN_URI),
++            Some(text.as_str()),
++            "the insert's didChange went out with the press",
++        );
++        fetch(&mut app, MAIN);
++        let offsets: Vec<u32> = hints(&app, MAIN).iter().map(|(at, _)| *at).collect();
++        assert_eq!(
++            offsets,
++            [at(&text, "\"scrive\"")],
++            "only the parameter hint comes back",
++        );
++    }
++
++    /// Hovering the type hint asks the server to resolve its tooltip, and the answer lands.
++    #[test]
++    fn hovering_a_hint_resolves_its_tooltip() {
++        let (mut app, ty, _) = hinted();
++        press(
++            &mut app,
++            MAIN,
++            Event::Editor(Action::InlayHover { key: ty, part: 1 }),
++        );
++        let traffic: Vec<&String> = app.transport.traffic.iter().collect();
++        let resolve = traffic
++            .iter()
++            .position(|line| line.starts_with("→ inlayHint/resolve"))
++            .expect("the tooltip is resolved by the server");
++        assert!(
++            !traffic[resolve..]
++                .iter()
++                .any(|line| line.starts_with("· refused")),
++            "the resolved tooltip lands",
++        );
++    }
++
++    /// Ctrl+I clears every tab's hints, and a second Ctrl+I brings them back after a fetch.
++    #[test]
++    fn the_toggle_key_clears_and_restores_the_hints() {
++        let (mut app, _, _) = hinted();
++        let now = Instant::now();
++        let _ = app.update(Message::ToggleHints, now);
++        assert!(!app.hints, "hints are off");
++        assert!(hints(&app, MAIN).is_empty(), "main.rs shows no hints");
++        let _ = app.update(Message::ToggleHints, now);
++        fetch(&mut app, MAIN);
++        assert!(app.hints, "hints are on");
++        assert_eq!(hints(&app, MAIN).len(), 2, "both hints are back");
++    }
++
++    /// Only a plain Ctrl+I (Cmd+I on macOS) toggles the hints.
++    #[test]
++    fn toggle_chord_matches_only_plain_ctrl_i() {
++        let press = |modifiers: Modifiers, repeat: bool| keyboard::Event::KeyPressed {
++            key: Key::Character("i".into()),
++            modified_key: Key::Character("i".into()),
++            physical_key: Physical::Code(Code::KeyI),
++            location: Location::Standard,
++            modifiers,
++            text: None,
++            repeat,
++        };
++        assert!(
++            matches!(
++                toggle_chord(press(Modifiers::COMMAND, false)),
++                Some(Message::ToggleHints)
++            ),
++            "Ctrl+I toggles",
++        );
++        for (modifiers, repeat, chord) in [
++            (Modifiers::COMMAND | Modifiers::SHIFT, false, "Ctrl+Shift+I"),
++            (Modifiers::COMMAND | Modifiers::ALT, false, "Ctrl+Alt+I"),
++            (Modifiers::COMMAND, true, "a repeated Ctrl+I"),
++            (Modifiers::empty(), false, "a plain i"),
++        ] {
++            assert!(
++                toggle_chord(press(modifiers, repeat)).is_none(),
++                "{chord} does not toggle",
++            );
++        }
++    }
+ }
+diff --git a/crates/scrive-iced/examples/lsp/server.rs b/crates/scrive-iced/examples/lsp/server.rs
+index c9aafb7..459263e 100644
+--- a/crates/scrive-iced/examples/lsp/server.rs
++++ b/crates/scrive-iced/examples/lsp/server.rs
+@@ -4,8 +4,10 @@
+ //! queued the moment its request arrives, and the example's transport delivers them one per
+ //! `Message::Deliver`. Canned: `initialize`, completion, signature help, and hover (on `greet`).
+ //! Computed from the text the client sent: diagnostics (trailing whitespace), definition
+-//! (`fn <word>(` in any document), rename (whole-word, every document) and formatting (strip
+-//! trailing whitespace). Columns are bytes: the initialize result picks `utf-8` positions.
++//! (`fn <word>(` in any document), rename (whole-word, every document), formatting (strip
++//! trailing whitespace), and inlay hints: a type hint after `let x = f(…)` for a function some
++//! document defines, a parameter hint before each call's first argument, and their tooltips
++//! through `inlayHint/resolve`. Columns are bytes: the initialize result picks `utf-8` positions.
+ 
+ use std::collections::{BTreeMap, VecDeque};
+ 
+@@ -23,7 +25,8 @@ const INITIALIZE: &str = r#"{
+         "hoverProvider": true,
+         "definitionProvider": true,
+         "renameProvider": true,
+-        "documentFormattingProvider": true
++        "documentFormattingProvider": true,
++        "inlayHintProvider": { "resolveProvider": true }
+     },
+     "serverInfo": { "name": "scrive-demo", "version": "0.4.0" }
+ }"#;
+@@ -70,6 +73,10 @@ const HOVER: &str = r#"{
+     }
+ }"#;
+ 
++/// Where the scripted standard library's `String` lives. No editor opens it, so a jump to it
++/// comes back as `Jump::Unopened`.
++const STRING_URI: &str = "file:///demo/std/string.rs";
++
+ /// The server's state: each document as the client last described it, and the replies not yet
+ /// delivered.
+ #[derive(Default)]
+@@ -83,6 +90,15 @@ struct Document {
+     text: String,
+ }
+ 
++/// A function some document defines as `fn name(param: …) -> Returns`.
++struct Signature<'a> {
++    name: &'a str,
++    param: &'a str,
++    returns: &'a str,
++    /// Where the parameter's name is, as an LSP location.
++    param_location: Value,
++}
++
+ impl Scripted {
+     /// Take one message from the client, and queue whatever the server says back.
+     pub fn receive(&mut self, message: &lsp::Message) {
+@@ -131,6 +147,8 @@ impl Scripted {
+             "textDocument/definition" => self.definition(params),
+             "textDocument/rename" => self.rename(params),
+             "textDocument/formatting" => self.format(params),
++            "textDocument/inlayHint" => self.inlay_hints(params),
++            "inlayHint/resolve" => resolve(params),
+             // `shutdown`, and anything unscripted.
+             _ => Value::Null,
+         }
+@@ -305,6 +323,84 @@ impl Scripted {
+         }])
+     }
+ 
++    /// Every `fn name(param: …) -> Returns` in any document whose first parameter and return
++    /// type are on the `fn` line.
++    fn signatures(&self) -> Vec<Signature<'_>> {
++        let mut found = Vec::new();
++        for (uri, document) in &self.documents {
++            let text = document.text.as_str();
++            for (at, _) in text.match_indices("fn ") {
++                let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
++                let name_at = at + "fn ".len();
++                let name = word(text, name_at);
++                let param_at = name_at + name.len() + "(".len();
++                if name.is_empty() || !text[name_at + name.len()..].starts_with('(') {
++                    continue;
++                }
++                let Some(arrow) = text[param_at..line_end].find(") -> ") else {
++                    continue;
++                };
++                let param = word(text, param_at);
++                let returns = word(text, param_at + arrow + ") -> ".len());
++                if param.is_empty() || returns.is_empty() {
++                    continue;
++                }
++                let range = json!({
++                    "start": position(text, param_at),
++                    "end": position(text, param_at + param.len())
++                });
++                found.push(Signature {
++                    name,
++                    param,
++                    returns,
++                    param_location: json!({ "uri": uri, "range": range }),
++                });
++            }
++        }
++        found
++    }
++
++    /// The hints for one document. The request's range is ignored: the client drops what falls
++    /// outside the span it asked for.
++    fn inlay_hints(&self, params: &Value) -> Value {
++        let Some(document) = params["textDocument"]["uri"]
++            .as_str()
++            .and_then(|uri| self.documents.get(uri))
++        else {
++            return Value::Null;
++        };
++        let text = document.text.as_str();
++        let signatures = self.signatures();
++        let mut hints = Vec::new();
++        for signature in &signatures {
++            for at in occurrences(text, signature.name) {
++                let open = at + signature.name.len();
++                let defines = text[..at].ends_with("fn ");
++                if defines || !text[open..].starts_with('(') || text[open + 1..].starts_with(')') {
++                    continue;
++                }
++                hints.push(parameter_hint(text, open + 1, signature));
++            }
++        }
++        for (at, _) in text.match_indices("let ") {
++            let name_at = at + "let ".len();
++            let name_end = name_at + word(text, name_at).len();
++            let line_end = text[name_end..].find('\n').map_or(text.len(), |i| name_end + i);
++            let rest = &text[name_end..line_end];
++            // `let x: T = …` already states its type.
++            if name_end == name_at || !rest.starts_with(" = ") {
++                continue;
++            }
++            let called = signatures
++                .iter()
++                .find(|signature| rest.contains(&format!("{}(", signature.name)));
++            if let Some(signature) = called {
++                hints.push(type_hint(text, name_end, signature));
++            }
++        }
++        Value::Array(hints)
++    }
++
+     fn push(&mut self, envelope: Value) {
+         self.outbox.push_back(
+             serde_json::from_value(envelope).expect("the script writes valid envelopes"),
+@@ -312,6 +408,62 @@ impl Scripted {
+     }
+ }
+ 
++/// `param:` before a call's first argument; the name links to the parameter.
++fn parameter_hint(text: &str, at: usize, signature: &Signature<'_>) -> Value {
++    json!({
++        "position": position(text, at),
++        "kind": 2,
++        "label": [
++            { "value": signature.param, "location": signature.param_location },
++            { "value": ":" }
++        ],
++        "paddingRight": true,
++        "data": {
++            "tooltip": format!("The `{}` parameter of `{}`.", signature.param, signature.name)
++        }
++    })
++}
++
++/// `: Returns` after a `let` name, insertable; `String` links into the unopened standard library.
++fn type_hint(text: &str, at: usize, signature: &Signature<'_>) -> Value {
++    let mut returns = json!({ "value": signature.returns });
++    if signature.returns == "String" {
++        returns["location"] = json!({
++            "uri": STRING_URI,
++            "range": {
++                "start": { "line": 0, "character": 11 },
++                "end": { "line": 0, "character": 17 }
++            }
++        });
++    }
++    json!({
++        "position": position(text, at),
++        "kind": 1,
++        "label": [{ "value": ": " }, returns],
++        "textEdits": [{
++            "range": { "start": position(text, at), "end": position(text, at) },
++            "newText": format!(": {}", signature.returns)
++        }],
++        "data": { "tooltip": format!("What `{}` returns.", signature.name) }
++    })
++}
++
++/// `inlayHint/resolve`: the hint, with the tooltip its `data` carries. A real server would look
++/// the tooltip up; the script keeps it in `data` so the round trip stays visible.
++fn resolve(params: &Value) -> Value {
++    let mut hint = params.clone();
++    hint["tooltip"] = json!({ "kind": "markdown", "value": params["data"]["tooltip"] });
++    hint
++}
++
++/// The identifier starting at byte `at`, empty when none does.
++fn word(text: &str, at: usize) -> &str {
++    let end = text[at..]
++        .find(|c: char| !is_word(c))
++        .map_or(text.len(), |i| at + i);
++    &text[at..end]
++}
++
+ fn canned(payload: &str) -> Value {
+     serde_json::from_str(payload).expect("canned payloads are valid JSON")
+ }
+diff --git a/crates/scrive-iced/examples/rust_analyzer.rs b/crates/scrive-iced/examples/rust_analyzer.rs
+index 9fbb2df..301b241 100644
+--- a/crates/scrive-iced/examples/rust_analyzer.rs
++++ b/crates/scrive-iced/examples/rust_analyzer.rs
+@@ -12,6 +12,9 @@
+ //! signature help. Ctrl+S (Cmd+S on macOS) writes the file and tells the server, which re-runs
+ //! `cargo check`: the type error's squiggle updates only then.
+ //!
++//! Inlay hints are on: double-click a type hint to insert it, Ctrl+click a part to jump, hover
++//! one for its tooltip. Ctrl+I (Cmd+I on macOS) turns them off and on.
++//!
+ //! The update loop is the one `examples/lsp` uses, cut down to one editor. What that example
+ //! fakes with an in-process server is real here: a child process, a reader thread that decodes
+ //! the LSP base protocol from its stdout, and a writer thread that encodes onto its stdin. The
+@@ -365,6 +368,8 @@ fn main() {
+         file: PathBuf,
+         /// The one-line status bar.
+         status: String,
++        /// Whether inlay hints show; Ctrl+I flips it.
++        hints: bool,
+     }
+ 
+     #[derive(Debug, Clone)]
+@@ -373,6 +378,8 @@ fn main() {
+         Editor(Event),
+         /// Ctrl+S: write the document to its file and tell the server.
+         Save,
++        /// Ctrl+I: turn inlay hints off or on.
++        ToggleHints,
+         /// A JSON-RPC message from the server.
+         Lsp(lsp::Message),
+         /// The server process is running, and this reaches its stdin.
+@@ -449,7 +456,8 @@ fn main() {
+                 .build();
+             let mut editor = CodeEditor::new(workspace.text())
+                 .language(rust())
+-                .rename(true);
++                .rename(true)
++                .inlay_hints(true);
+             let mut queued = vec![initialize];
+             // Before the handshake this only records the text; the didOpen follows `initialized`.
+             queued.extend(
+@@ -463,6 +471,7 @@ fn main() {
+                 link: Link::Connecting(queued),
+                 file: workspace.file.clone(),
+                 status: format!("starting {}…", transport::SERVER),
++                hints: true,
+             }
+         }
+ 
+@@ -474,11 +483,16 @@ fn main() {
+                 link,
+                 file,
+                 status,
++                hints,
+             } = self;
+             match message {
+                 Message::Editor(event) => {
+                     let task = editor.update(event, now).map(Message::Editor);
+-                    link.send(editor.sync_lsp(client));
++                    let synced = editor.sync_lsp(client);
++                    link.send(synced.messages);
++                    if let Some(line) = jumped(synced.jump) {
++                        *status = line;
++                    }
+                     task
+                 }
+                 Message::Save => {
+@@ -486,7 +500,11 @@ fn main() {
+                     // The buffer holds LF; a CRLF file is written back as CRLF.
+                     match std::fs::write(&*file, doc.serialize(doc.buffer().eol_flavor())) {
+                         Ok(()) => {
+-                            link.send(editor.save_lsp(client));
++                            let saved = editor.save_lsp(client);
++                            link.send(saved.messages);
++                            if let Some(line) = jumped(saved.jump) {
++                                *status = line;
++                            }
+                             let name = file.file_name().unwrap_or(file.as_os_str()).display();
+                             *status = match link {
+                                 Link::Connected(_) => {
+@@ -501,6 +519,12 @@ fn main() {
+                     }
+                     Task::none()
+                 }
++                Message::ToggleHints => {
++                    *hints = !*hints;
++                    editor.set_inlay_hints(*hints);
++                    *status = format!("inlay hints {}", if *hints { "on" } else { "off" });
++                    Task::none()
++                }
+                 Message::Connected(sender) => {
+                     if let Link::Connecting(queued) = std::mem::replace(link, Link::Closed) {
+                         sender.send(queued);
+@@ -526,19 +550,8 @@ fn main() {
+                                 if let Some(refusal) = applied.refused {
+                                     *status = format!("refused: {refusal}");
+                                 }
+-                                match applied.jump {
+-                                    // A host with several editors hands this to the one that
+-                                    // owns `open.doc_id()`; here every open document is local.
+-                                    Some(lsp::update::Jump::Open(_)) => {
+-                                        *status = "definition in another open document".to_owned();
+-                                    }
+-                                    Some(lsp::update::Jump::Unopened(unopened)) => {
+-                                        *status = format!(
+-                                            "definition in {}, which is not open",
+-                                            unopened.uri()
+-                                        );
+-                                    }
+-                                    None => {}
++                                if let Some(line) = jumped(applied.jump) {
++                                    *status = line;
+                                 }
+                             }
+                             lsp::Update::FileEdits(edits) => {
+@@ -580,6 +593,7 @@ fn main() {
+             Subscription::batch([
+                 self.editor.subscription().map(Message::Editor),
+                 keyboard::listen().filter_map(save_chord),
++                keyboard::listen().filter_map(toggle_chord),
+                 Subscription::run(connect),
+             ])
+         }
+@@ -654,6 +668,33 @@ fn main() {
+         }
+     }
+ 
++    /// Ctrl+I, or Cmd+I on macOS, without Shift or Alt and not repeated. The editor binds no
++    /// Ctrl+I, so the key reaches `keyboard::listen`.
++    fn toggle_chord(event: keyboard::Event) -> Option<Message> {
++        match event {
++            keyboard::Event::KeyPressed {
++                key: Key::Character(c),
++                modifiers,
++                repeat: false,
++                ..
++            } if c == "i" && modifiers.command() && !modifiers.shift() && !modifiers.alt() => {
++                Some(Message::ToggleHints)
++            }
++            _ => None,
++        }
++    }
++
++    /// The status line a jump earns. A host with several editors hands `Jump::Open` to the one
++    /// that owns `open.doc_id()`; here every open document is local.
++    fn jumped(jump: Option<lsp::update::Jump>) -> Option<String> {
++        match jump? {
++            lsp::update::Jump::Open(_) => Some("definition in another open document".to_owned()),
++            lsp::update::Jump::Unopened(unopened) => {
++                Some(format!("definition in {}, which is not open", unopened.uri()))
++            }
++        }
++    }
++
+     /// The status line a server notification earns: `window/showMessage` text, and the title of
+     /// a `$/progress` report.
+     fn headline(notification: &lsp::message::Notification) -> Option<String> {
+@@ -714,6 +755,7 @@ fn main() {
+         use iced::keyboard::key::{Code, Physical};
+         use iced::keyboard::{Location, Modifiers};
+         use scrive_core::{Diagnostic, EditOp};
++        use scrive_iced::Action;
+         use serde_json::Value;
+ 
+         use super::*;
+@@ -799,6 +841,38 @@ fn main() {
+             }
+         }
+ 
++        /// Only a plain Ctrl+I (Cmd+I on macOS) toggles the hints.
++        #[test]
++        fn toggle_chord_matches_only_plain_ctrl_i() {
++            let press = |modifiers: Modifiers, repeat: bool| keyboard::Event::KeyPressed {
++                key: Key::Character("i".into()),
++                modified_key: Key::Character("i".into()),
++                physical_key: Physical::Code(Code::KeyI),
++                location: Location::Standard,
++                modifiers,
++                text: None,
++                repeat,
++            };
++            assert!(
++                matches!(
++                    toggle_chord(press(Modifiers::COMMAND, false)),
++                    Some(Message::ToggleHints)
++                ),
++                "Ctrl+I toggles",
++            );
++            for (modifiers, repeat, chord) in [
++                (Modifiers::COMMAND | Modifiers::SHIFT, false, "Ctrl+Shift+I"),
++                (Modifiers::COMMAND | Modifiers::ALT, false, "Ctrl+Alt+I"),
++                (Modifiers::COMMAND, true, "a repeated Ctrl+I"),
++                (Modifiers::empty(), false, "a plain i"),
++            ] {
++                assert!(
++                    toggle_chord(press(modifiers, repeat)).is_none(),
++                    "{chord} does not toggle",
++                );
++            }
++        }
++
+         /// The next message from the server, folded into `client`, with its answers sent back.
+         /// `None` once `deadline` passes.
+         fn pump(
+@@ -920,13 +994,13 @@ fn main() {
+             let fixed = lsp::update::Stamp::Revision(doc.revision());
+             let saved = editor.save_lsp(&mut client);
+             assert!(
+-                saved.iter().any(|message| {
++                saved.messages.iter().any(|message| {
+                     matches!(message, lsp::Message::Notification(n) if n.method == "textDocument/didSave")
+                 }),
+                 "rust-analyzer asks for saves, so the didSave goes out",
+             );
+             eprintln!("{:?}: saved", started.elapsed());
+-            sender.send(saved);
++            sender.send(saved.messages);
+ 
+             let deadline = Instant::now() + Duration::from_secs(120);
+             let mut cleared = false;
+@@ -946,6 +1020,16 @@ fn main() {
+                 }
+             }
+ 
++            shut_down(&mut client, &incoming, &sender);
++            let _ = std::fs::remove_dir_all(&root);
++        }
++
++        /// Ask the server to shut down, answer it until it exits, and log why it left.
++        fn shut_down(
++            client: &mut lsp::Client,
++            incoming: &mpsc::Receiver<transport::Incoming>,
++            sender: &transport::Sender,
++        ) {
+             sender.send(client.shutdown().messages);
+             let deadline = Instant::now() + Duration::from_secs(10);
+             loop {
+@@ -962,6 +1046,164 @@ fn main() {
+                     Err(_) => panic!("the server did not exit after shutdown"),
+                 }
+             }
++        }
++
++        /// The offsets of the hints `editor` shows.
++        fn hint_offsets(editor: &CodeEditor) -> Vec<u32> {
++            let document = editor.document();
++            document
++                .inlays_in(0..document.buffer().len())
++                .map(|hint| hint.offset())
++                .collect()
++        }
++
++        /// Drive `editor` against the server until `done` holds, and say whether it did before
++        /// `deadline`. Each round fires a scheduled hint fetch at once, as the widget would
++        /// once its delay passed, then takes one server message and lands its updates.
++        fn settle_until(
++            editor: &mut CodeEditor,
++            client: &mut lsp::Client,
++            incoming: &mpsc::Receiver<transport::Incoming>,
++            sender: &transport::Sender,
++            (started, deadline): (Instant, Instant),
++            done: impl Fn(&CodeEditor) -> bool,
++        ) -> bool {
++            while !done(editor) {
++                if let Some(wake) = editor.pending_wake() {
++                    let event = Event::Editor(Action::Wake(wake.generation));
++                    let _ = editor.update(event, Instant::now());
++                    sender.send(editor.sync_lsp(client).messages);
++                }
++                let Some(output) = pump(client, incoming, sender, deadline) else {
++                    return false;
++                };
++                for update in output.updates {
++                    let lsp::Update::Document(document) = update else {
++                        continue;
++                    };
++                    if let lsp::update::Change::Inlays(Some(hints)) = document.change() {
++                        eprintln!(
++                            "{:?}: {} hints at {:?}",
++                            started.elapsed(),
++                            hints.len(),
++                            document.stamp(),
++                        );
++                    }
++                    let applied = editor.apply_lsp(client, document);
++                    sender.send(applied.messages);
++                }
++            }
++            true
++        }
++
++        /// Against a real rust-analyzer: the scratch file's `let sum = add(1, 2);` gets its
++        /// `: i32` hint after load; an edit above moves the hint before any refetch; a refetch
++        /// at the new revision keeps it there; and a double-click inserts `: i32` once, with no
++        /// hint left beside it, before or after the next refetch.
++        #[test]
++        #[ignore = "needs rust-analyzer on PATH and a Rust toolchain; run with --ignored"]
++        fn rust_analyzer_hints_arrive_move_refresh_and_insert_once() {
++            let root =
++                std::env::temp_dir().join(format!("{SCRATCH}-hints-test-{}", std::process::id()));
++            let workspace = Workspace::scratch(&root).expect("the scratch crate is written");
++            let (deliver, incoming) = mpsc::channel();
++            let sender = transport::spawn(move |message| {
++                let _ = deliver.send(message);
++            })
++            .unwrap_or_else(|error| panic!("{}", transport::describe(&error)));
++
++            let (mut client, initialize) = lsp::Client::builder()
++                .root(workspace.root_uri())
++                .process_id(std::process::id())
++                .build();
++            let mut editor = CodeEditor::new(workspace.text()).inlay_hints(true);
++            let mut outgoing = vec![initialize];
++            outgoing.extend(
++                editor
++                    .open_lsp(&mut client, &workspace.file_uri(), "rust")
++                    .expect("the only document"),
++            );
++            sender.send(outgoing);
++            let started = Instant::now();
++            let within = || (started, Instant::now() + Duration::from_secs(120));
++            let current = |editor: &CodeEditor| {
++                let document = editor.document();
++                document.inlays_revision() == Some(document.revision())
++            };
++
++            let sum_end = SCRATCH_MAIN.find("let sum").expect("the scratch has `sum`");
++            let sum_end = u32::try_from(sum_end + "let sum".len()).expect("small");
++            let arrived = settle_until(
++                &mut editor,
++                &mut client,
++                &incoming,
++                &sender,
++                within(),
++                |e| hint_offsets(e).contains(&sum_end),
++            );
++            assert!(arrived, "the `sum` hint arrived within the timeout");
++
++            let moved = "// moved\n";
++            let main_at = SCRATCH_MAIN.find("fn main").expect("the scratch has main");
++            editor
++                .try_edit(vec![EditOp::insert(u32::try_from(main_at).expect("small"), moved)])
++                .expect("the edit applies");
++            let typed = sum_end + 9;
++            assert!(
++                hint_offsets(&editor).contains(&typed),
++                "the hint rides the edit before any refetch: {:?}",
++                hint_offsets(&editor),
++            );
++            sender.send(editor.sync_lsp(&mut client).messages);
++            let refetched = settle_until(
++                &mut editor,
++                &mut client,
++                &incoming,
++                &sender,
++                within(),
++                |e| current(e) && hint_offsets(e).contains(&typed),
++            );
++            assert!(refetched, "a refetch at the new revision keeps the hint after `sum`");
++
++            let key = editor
++                .document()
++                .inlays_in(typed..typed)
++                .find(|hint| hint.offset() == typed)
++                .expect("the `sum` hint shows")
++                .key();
++            let insert = Event::Editor(Action::InlayInsert { key, offset: typed });
++            let _ = editor.update(insert, Instant::now());
++            sender.send(editor.sync_lsp(&mut client).messages);
++            let text = editor.document().text().into_owned();
++            assert_eq!(
++                text.matches("let sum: i32 = add(1, 2);").count(),
++                1,
++                "the type is inserted once: {text}",
++            );
++            let typed_end = typed + u32::try_from(": i32".len()).expect("small");
++            let beside = |editor: &CodeEditor| {
++                let offsets = hint_offsets(editor);
++                offsets.contains(&typed) || offsets.contains(&typed_end)
++            };
++            assert!(!beside(&editor), "no hint is left beside the inserted type");
++
++            let settled = settle_until(
++                &mut editor,
++                &mut client,
++                &incoming,
++                &sender,
++                within(),
++                current,
++            );
++            assert!(settled, "the hints are refetched after the insert");
++            assert!(
++                !beside(&editor),
++                "the refetch brings no hint beside the inserted type: {:?}",
++                hint_offsets(&editor),
++            );
++            eprintln!("{:?}: done", started.elapsed());
++
++            shut_down(&mut client, &incoming, &sender);
+             let _ = std::fs::remove_dir_all(&root);
+         }
+     }
+diff --git a/crates/scrive-iced/src/code_editor/lsp.rs b/crates/scrive-iced/src/code_editor/lsp.rs
+index a69f953..a4369ff 100644
+--- a/crates/scrive-iced/src/code_editor/lsp.rs
++++ b/crates/scrive-iced/src/code_editor/lsp.rs
+@@ -1,11 +1,13 @@
+ //! A [`CodeEditor`]'s side of a [`scrive_lsp::Client`].
+ //!
+ //! A host calls [`open_lsp`](CodeEditor::open_lsp) once per document,
+-//! [`sync_lsp`](CodeEditor::sync_lsp) after every [`update`](CodeEditor::update), and
++//! [`sync_lsp`](CodeEditor::sync_lsp) after every [`update`](CodeEditor::update),
+ //! [`apply_lsp`](CodeEditor::apply_lsp) for each `Update::Document` the client returns, and
+ //! [`save_lsp`](CodeEditor::save_lsp) after writing the document to disk. Each call returns the
+-//! messages to send; the transport stays the host's.
++//! messages to send, and all but `open_lsp` a jump into another document for the host to route;
++//! the transport stays the host's.
+ 
++use iced::time::Duration;
+ use scrive_core::DiagnosticsOutcome;
+ use scrive_lsp::lsp_types::Uri;
+ use scrive_lsp::update::{self, Change, Refusal, Stamp, Target};
+@@ -47,28 +49,55 @@ impl CodeEditor {
+             "the log starts at the registered snapshot",
+         );
+         self.lsp_client = Some(client.id());
+-        Ok(self.route(output))
++        self.wait_inlays(Duration::ZERO, None);
++        let routed = self.route(output);
++        debug_assert!(routed.jump.is_none(), "an open lands cached diagnostics only");
++        Ok(routed.messages)
+     }
+ 
+     /// Mirror every edit since the last sync to `client`, then send each request the editor
+-    /// recorded: completion, signature help, hover, definition, rename and format. Call it
+-    /// after every [`update`](CodeEditor::update); with nothing new it returns no messages.
+-    /// Answers the client gives without asking the server, such as declines and reused
+-    /// completion lists, land before it returns.
++    /// recorded: completion, signature help, hover, definition, rename, format, an inlay hint
++    /// fetch and a gesture on a hint. Call it after every [`update`](CodeEditor::update); with
++    /// nothing new it returns nothing.
++    ///
++    /// Answers the client gives without asking the server land before it returns: declines,
++    /// reused completion lists, and a hint's label jump or text edits. An edit that lands this
++    /// way is synced in the same call. A label jump into another document comes back as
++    /// [`Applied::jump`](update::Applied::jump) for the host to route; `refused` is always
++    /// `None`.
+     ///
+     /// On an editor that is not registered, before [`open_lsp`](CodeEditor::open_lsp) or after
+-    /// [`close_lsp`](CodeEditor::close_lsp), it does nothing and returns no messages. Its
+-    /// `client` must be the one the editor was opened with.
+-    #[must_use = "the messages must be sent to the server"]
+-    pub fn sync_lsp(&mut self, client: &mut Client) -> Vec<Message> {
++    /// [`close_lsp`](CodeEditor::close_lsp), it does nothing. Its `client` must be the one the
++    /// editor was opened with.
++    #[must_use = "Applied.messages must be sent, and Applied.jump routed"]
++    pub fn sync_lsp(&mut self, client: &mut Client) -> update::Applied {
++        let mut synced = update::Applied::default();
+         let Some(registered) = self.lsp_client else {
+-            return Vec::new();
++            return synced;
+         };
+         debug_assert_eq!(
+             registered,
+             client.id(),
+             "sync_lsp needs the Client this editor was opened with",
+         );
++        // An inserted hint's edit lands inside a pass, so its didChange and the requests it
++        // recorded go out on the next. That pass lands no edit: only a gesture's interaction
++        // edits, and the hint fetch the edit scheduled waits for a wake.
++        let mut passes = 0;
++        loop {
++            passes += 1;
++            debug_assert!(passes <= 2, "only the first pass lands an edit");
++            let revision = self.doc.revision();
++            absorb(&mut synced, self.sync_pass(client));
++            if self.doc.revision() == revision {
++                return synced;
++            }
++        }
++    }
++
++    /// Sync the edits, send every recorded request against one snapshot, then land the
++    /// client's local answers in order.
++    fn sync_pass(&mut self, client: &mut Client) -> update::Applied {
+         let snapshot = self.doc.snapshot();
+         // The client ignores a request from a revision it has not been synced to.
+         let mut outputs = vec![client.sync(&snapshot, self.doc.drain_changes())];
+@@ -90,46 +119,60 @@ impl CodeEditor {
+         if let Some(request) = self.take_format_request() {
+             outputs.push(client.format(&snapshot, &request));
+         }
+-        let mut messages = Vec::new();
++        if let Some(request) = self.take_inlay_request() {
++            outputs.push(client.inlays(&snapshot, &request));
++        }
++        // Last, so an insert's edit lands after the answers made at the revision it moves.
++        if let Some(interaction) = self.take_inlay_interaction() {
++            outputs.push(client.interact(&snapshot, &interaction));
++        }
++        let mut passed = update::Applied::default();
+         for output in outputs {
+-            messages.extend(self.route(output));
++            absorb(&mut passed, self.route(output));
+         }
+-        messages
++        passed
+     }
+ 
+     /// Tell `client` that the document was saved, syncing first so the server holds the saved
+-    /// text. Call it after writing the document to disk. Returns the messages to send: the
+-    /// sync's, then a `didSave` when the server asks for saves.
++    /// text. Call it after writing the document to disk. Returns the sync's messages and jump,
++    /// then a `didSave` when the server asks for saves.
+     ///
+-    /// On an editor that is not registered it does nothing and returns no messages.
+-    #[must_use = "the didChange and didSave must be sent to the server"]
+-    pub fn save_lsp(&mut self, client: &mut Client) -> Vec<Message> {
++    /// On an editor that is not registered it does nothing.
++    #[must_use = "Applied.messages must be sent, and Applied.jump routed"]
++    pub fn save_lsp(&mut self, client: &mut Client) -> update::Applied {
+         if self.lsp_client.is_none() {
+-            return Vec::new();
++            return update::Applied::default();
+         }
+-        let mut messages = self.sync_lsp(client);
++        let mut saved = self.sync_lsp(client);
+         let output = client.save(&self.doc.snapshot());
+-        messages.extend(self.route(output));
+-        messages
++        absorb(&mut saved, self.route(output));
++        saved
+     }
+ 
+     /// Apply one document update from [`Client::receive`], then sync. The update is refused
+     /// when it is for another document, stale, or an edit batch that does not apply. A
+     /// definition in another document comes back as [`Applied::jump`](update::Applied::jump)
+-    /// for the host to route.
++    /// for the host to route, as does a hint's label jump that the sync landed; the update's
++    /// own jump wins over the sync's.
+     #[must_use = "Applied.messages must be sent, and Applied.jump routed"]
+     pub fn apply_lsp(
+         &mut self,
+         client: &mut Client,
+         document: update::Document,
+     ) -> update::Applied {
+-        let mut applied = self.land(document);
+-        applied.messages = self.sync_lsp(client);
+-        applied
++        let landed = self.land(document);
++        let synced = self.sync_lsp(client);
++        update::Applied {
++            messages: synced.messages,
++            // The host is waiting on the answer it passed in.
++            jump: landed.jump.or(synced.jump),
++            refused: landed.refused,
++        }
+     }
+ 
+     /// Select a definition that another editor's [`apply_lsp`](CodeEditor::apply_lsp) returned
+-    /// as [`Jump::Open`](update::Jump::Open), then sync. Returns the messages to send.
++    /// as [`Jump::Open`](update::Jump::Open), then sync. Returns what the sync after the
++    /// selection produced.
+     ///
+     /// # Errors
+     /// [`Refusal::Foreign`] when `open` is in another document, and [`Refusal::Stale`] when
+@@ -138,7 +181,7 @@ impl CodeEditor {
+         &mut self,
+         client: &mut Client,
+         open: update::jump::Open,
+-    ) -> Result<Vec<Message>, Refusal> {
++    ) -> Result<update::Applied, Refusal> {
+         if open.doc_id() != self.doc.doc_id() {
+             return Err(Refusal::Foreign);
+         }
+@@ -151,7 +194,8 @@ impl CodeEditor {
+ 
+     /// Unregister this editor's document from `client`. Mirroring stops, the rename field, the
+     /// completion popup, the signature box and the hover card close, requests in flight are
+-    /// forgotten, and the server's diagnostics are cleared.
++    /// forgotten, the server's diagnostics are cleared, the inlay hints and their tooltip are
++    /// cleared, and a scheduled hint fetch is dropped.
+     /// Returns the messages to send: the `didClose`, and cancellations for requests in flight.
+     /// F2 stays as [`rename`](CodeEditor::rename) set it, for a later
+     /// [`open_lsp`](CodeEditor::open_lsp).
+@@ -169,6 +213,14 @@ impl CodeEditor {
+         self.abandon(Awaited::Definition);
+         self.pending_rename_request = None;
+         self.pending_format_request = None;
++        self.inlay_card = None;
++        self.abandon(Awaited::Inlays);
++        self.abandon(Awaited::InlayTooltip);
++        self.abandon(Awaited::InlayInsert);
++        self.pending_inlay_interaction = None;
++        self.inlays.wait = None;
++        self.inlays.window = None;
++        self.doc.clear_inlays();
+         let _ = self.set_diagnostics(self.doc.revision(), Vec::new());
+         self.lsp_client = None;
+         let output = client.close(self.doc.doc_id());
+@@ -179,9 +231,11 @@ impl CodeEditor {
+         output.messages
+     }
+ 
+-    /// Land `output`'s updates and return its messages. `open` and the request methods answer
+-    /// only the document they were given, under its current ticket or revision.
+-    fn route(&mut self, output: Output) -> Vec<Message> {
++    /// Land `output`'s updates, and return its messages with the jump a landed definition
++    /// points to. `open` and the request methods answer only the document they were given,
++    /// under its current ticket or revision; a refused local answer is dropped, as a late
++    /// reply would be.
++    fn route(&mut self, output: Output) -> update::Applied {
+         let Output { messages, updates } = output;
+         debug_assert!(
+             updates
+@@ -189,16 +243,19 @@ impl CodeEditor {
+                 .all(|update| matches!(update, Update::Document(_))),
+             "open and requests answer with document updates only",
+         );
++        let mut routed = update::Applied {
++            messages,
++            ..update::Applied::default()
++        };
+         for update in updates {
+             if let Update::Document(document) = update {
+-                let applied = self.land(document);
+-                debug_assert!(
+-                    applied.jump.is_none(),
+-                    "a local answer never points into another document",
+-                );
++                let landed = self.land(document);
++                if routed.jump.is_none() {
++                    routed.jump = landed.jump;
++                }
+             }
+         }
+-        messages
++        routed
+     }
+ 
+     /// Check `document`'s identity and stamp against this editor, then apply its change. It
+@@ -286,6 +343,23 @@ impl CodeEditor {
+                 if revision != self.doc.revision() {
+                     return refused(Refusal::Stale);
+                 }
++                let inserting = match stamp {
++                    Stamp::Ticket(ticket) => self.accepts(Awaited::InlayInsert, ticket),
++                    Stamp::Revision(_) => false,
++                };
++                if inserting && ops.is_empty() {
++                    // A declined insert: `try_edit`'s tail would close the popup and the hover
++                    // card for no edit.
++                    self.abandon(Awaited::InlayInsert);
++                    return update::Applied::default();
++                }
++                if inserting {
++                    // The edits spell out the hint's label at its offset, so the hint would
++                    // render beside its own text; `try_edit`'s tail clears the slot naming it.
++                    if let Some((_, key, offset)) = self.awaiting.inlay_insert.take() {
++                        let _ = self.doc.remove_inlay(key, offset);
++                    }
++                }
+                 match self.try_edit(ops) {
+                     Ok(()) => update::Applied::default(),
+                     Err(_) => refused(Refusal::Overlap),
+@@ -324,6 +398,14 @@ impl CodeEditor {
+     }
+ }
+ 
++/// Append `routed` to `into`: its messages follow, and `into` keeps an earlier jump.
++fn absorb(into: &mut update::Applied, routed: update::Applied) {
++    into.messages.extend(routed.messages);
++    if into.jump.is_none() {
++        into.jump = routed.jump;
++    }
++}
++
+ /// An update that was not applied, and why.
+ fn refused(refusal: Refusal) -> update::Applied {
+     update::Applied {
+@@ -335,6 +417,7 @@ fn refused(refusal: Refusal) -> update::Applied {
+ #[cfg(test)]
+ mod tests {
+     use iced::time::Instant;
++    use scrive_core::intel::inlay::Key;
+     use scrive_core::CompletionState;
+     use serde_json::{json, Value};
+ 
+@@ -342,6 +425,7 @@ mod tests {
+     use scrive_lsp::update::{self, Refusal};
+     use scrive_lsp::{Client, Error, Message, Output, Update};
+ 
++    use crate::code_editor::INLAY_EDIT_DELAY;
+     use crate::editor::Action;
+     use crate::{CodeEditor, Event};
+ 
+@@ -413,8 +497,7 @@ mod tests {
+     /// A client past the handshake: every provider, incremental sync, and byte columns (utf-8),
+     /// so fixture positions are byte offsets.
+     fn ready() -> Client {
+-        let (mut client, initialize) = Client::builder().root(uri("file:///w/")).build();
+-        let result = json!({ "capabilities": {
++        handshake(json!({
+             "positionEncoding": "utf-8",
+             "textDocumentSync": { "openClose": true, "change": 2, "save": {} },
+             "completionProvider": { "triggerCharacters": ["."] },
+@@ -423,7 +506,28 @@ mod tests {
+             "definitionProvider": true,
+             "renameProvider": true,
+             "documentFormattingProvider": true,
+-        }});
++        }))
++    }
++
++    /// The capabilities `ready` negotiates, plus an inlay hint provider that resolves tooltips.
++    fn ready_with_hints() -> Client {
++        handshake(json!({
++            "positionEncoding": "utf-8",
++            "textDocumentSync": { "openClose": true, "change": 2, "save": {} },
++            "completionProvider": { "triggerCharacters": ["."] },
++            "signatureHelpProvider": { "triggerCharacters": ["("] },
++            "hoverProvider": true,
++            "definitionProvider": true,
++            "renameProvider": true,
++            "documentFormattingProvider": true,
++            "inlayHintProvider": { "resolveProvider": true },
++        }))
++    }
++
++    /// A client whose server answered `initialize` with `capabilities`.
++    fn handshake(capabilities: Value) -> Client {
++        let (mut client, initialize) = Client::builder().root(uri("file:///w/")).build();
++        let result = json!({ "capabilities": capabilities });
+         let output = client
+             .receive(reply(&wire(&initialize), result))
+             .expect("the initialize result decodes");
+@@ -447,9 +551,32 @@ mod tests {
+     /// Feed `event` through the editor's real update path, then sync.
+     fn drive(editor: &mut CodeEditor, client: &mut Client, event: Event) -> Vec<Message> {
+         let _ = editor.update(event, Instant::now());
++        editor.sync_lsp(client).messages
++    }
++
++    /// Feed `action` through the editor's update path, then sync, keeping the jump.
++    fn gesture(editor: &mut CodeEditor, client: &mut Client, action: Action) -> update::Applied {
++        let _ = editor.update(Event::Editor(action), Instant::now());
+         editor.sync_lsp(client)
+     }
+ 
++    /// Fire the editor's scheduled hint fetch, as its widget does once the delay passes, then
++    /// sync. Returns what went out.
++    fn fetch_inlays(editor: &mut CodeEditor, client: &mut Client) -> Vec<Message> {
++        let generation = editor.pending_wake().expect("a fetch is scheduled").generation;
++        drive(editor, client, Event::Editor(Action::Wake(generation)))
++    }
++
++    /// The hints `editor` shows, as `(render offset, key)`.
++    fn shown(editor: &CodeEditor) -> Vec<(u32, Key)> {
++        let len = editor.document().buffer().len();
++        editor
++            .document()
++            .inlays_in(0..len)
++            .map(|hint| (hint.offset(), hint.key()))
++            .collect()
++    }
++
+     /// The document updates in `output`, one per touched document, in order.
+     fn documents(output: Output) -> Vec<update::Document> {
+         output
+@@ -846,8 +973,9 @@ mod tests {
+         let (mut a, _) = opened(&mut client, A, "f();\n");
+         let (mut b, _) = opened(&mut client, B, "fn f() {}\n");
+         let open = jump_into_b(&mut a, &mut client);
+-        let messages = b.jump(&mut client, open).expect("B has not moved");
+-        assert!(messages.is_empty(), "a selection sends nothing");
++        let applied = b.jump(&mut client, open).expect("B has not moved");
++        assert!(applied.messages.is_empty(), "a selection sends nothing");
++        assert!(applied.jump.is_none(), "a selection jumps nowhere else");
+         assert_eq!(b.selection(), 3..4, "the definition is selected in B");
+     }
+ 
+@@ -860,9 +988,8 @@ mod tests {
+         let open = jump_into_b(&mut a, &mut client);
+         let _ = b.update(Event::Editor(Action::Type('z')), Instant::now());
+         let before = b.selection();
+-        assert_eq!(
+-            b.jump(&mut client, open),
+-            Err(Refusal::Stale),
++        assert!(
++            matches!(b.jump(&mut client, open), Err(Refusal::Stale)),
+             "B moved since the answer",
+         );
+         assert_eq!(b.selection(), before, "nothing is selected");
+@@ -943,7 +1070,7 @@ mod tests {
+         let _ = ed.update(Event::Editor(Action::Type('q')), Instant::now());
+         assert!(ed.drain_changes().is_empty(), "edits are no longer logged");
+         assert!(
+-            ed.sync_lsp(&mut client).is_empty(),
++            ed.sync_lsp(&mut client).messages.is_empty(),
+             "a closed editor syncs nothing"
+         );
+     }
+@@ -999,7 +1126,7 @@ mod tests {
+         let (mut ed, messages) = opened(&mut client, A, "\n");
+         let opened_at = version(&sent(&messages, "textDocument/didOpen"));
+         let _ = ed.update(Event::Editor(Action::Type(';')), Instant::now());
+-        let messages: Vec<Value> = ed.save_lsp(&mut client).iter().map(wire).collect();
++        let messages: Vec<Value> = ed.save_lsp(&mut client).messages.iter().map(wire).collect();
+         let methods: Vec<&Value> = messages.iter().map(|message| &message["method"]).collect();
+         assert_eq!(
+             methods,
+@@ -1024,7 +1151,7 @@ mod tests {
+         let mut client = ready();
+         let mut ed = CodeEditor::new("\n");
+         let _ = ed.update(Event::Editor(Action::Type(';')), Instant::now());
+-        assert!(ed.save_lsp(&mut client).is_empty(), "nothing is sent");
++        assert!(ed.save_lsp(&mut client).messages.is_empty(), "nothing is sent");
+     }
+ 
+     /// `sync_lsp` on an editor that was never opened sends nothing and keeps its requests.
+@@ -1033,10 +1160,113 @@ mod tests {
+         let mut client = ready();
+         let mut ed = CodeEditor::new("\n");
+         let _ = ed.update(Event::Editor(Action::Type('g')), Instant::now());
+-        assert!(ed.sync_lsp(&mut client).is_empty(), "nothing is sent");
++        assert!(ed.sync_lsp(&mut client).messages.is_empty(), "nothing is sent");
+         assert!(
+             ed.take_completion_request().is_some(),
+             "the recorded request is left for the host",
+         );
+     }
++
++    /// A `let` whose `x` the `hinted` answer annotates.
++    const LET_X: &str = "let x = f();\n";
++
++    /// `: Foo` after `x`: insertable, and `Foo` links into a file no editor opened.
++    fn hinted() -> Value {
++        json!([{
++            "position": { "line": 0, "character": 5 },
++            "kind": 1,
++            "label": [
++                { "value": ": " },
++                {
++                    "value": "Foo",
++                    "location": { "uri": "file:///w/foo.rs", "range": on_line(0, 7, 10) },
++                },
++            ],
++            "textEdits": [{ "range": on_line(0, 5, 5), "newText": ": Foo" }],
++        }])
++    }
++
++    /// An editor over `LET_X` with hints on, opened on a hint-aware client, its hints fetched
++    /// and landed. Returns the editor, the `didOpen`'s version and the hint's key.
++    fn with_hint(client: &mut Client) -> (CodeEditor, Value, Key) {
++        let mut ed = CodeEditor::new(LET_X).inlay_hints(true);
++        let opened = ed.open_lsp(client, &uri(A), "rust").expect("the URI is free");
++        let request = sent(&fetch_inlays(&mut ed, client), "textDocument/inlayHint");
++        let document = one_document(client, reply(&request, hinted()));
++        let applied = ed.apply_lsp(client, document);
++        assert_eq!(applied.refused, None, "the hints are current");
++        let [(offset, key)] = shown(&ed)[..] else {
++            panic!("one hint shows, got {:?}", shown(&ed));
++        };
++        assert_eq!(offset, 5, "the hint renders after `x`");
++        (ed, version(&sent(&opened, "textDocument/didOpen")), key)
++    }
++
++    /// A Ctrl+click on a label part that points into a file nobody opened comes back from
++    /// `sync_lsp` itself, with no request to the server.
++    #[test]
++    fn sync_lsp_returns_an_inlay_label_jump_into_an_unopened_file() {
++        let mut client = ready_with_hints();
++        let (mut ed, _, key) = with_hint(&mut client);
++        let applied = gesture(&mut ed, &mut client, Action::InlayJump { key, part: 1 });
++        match &applied.jump {
++            Some(update::Jump::Unopened(unopened)) => assert_eq!(
++                unopened.uri().as_str(),
++                "file:///w/foo.rs",
++                "the jump names the part's file",
++            ),
++            other => panic!("expected a jump into an unopened file, got {other:?}"),
++        }
++        assert_eq!(applied.refused, None, "a sync refuses nothing");
++        assert!(
++            all_sent(&applied.messages, "textDocument/definition").is_empty(),
++            "the client answers from the hint, without asking the server",
++        );
++    }
++
++    /// A double-clicked hint inserts its text once: the hint goes before the text lands, and the
++    /// edit's didChange leaves in the same `sync_lsp` call.
++    #[test]
++    fn an_inlay_insert_lands_once_and_syncs_in_the_same_call() {
++        let mut client = ready_with_hints();
++        let (mut ed, opened_at, key) = with_hint(&mut client);
++        let applied = gesture(&mut ed, &mut client, Action::InlayInsert { key, offset: 5 });
++        assert_eq!(ed.document().text(), "let x: Foo = f();\n", "the hint's text is inserted");
++        assert!(shown(&ed).is_empty(), "the inserted hint no longer shows");
++        let change = sent(&applied.messages, "textDocument/didChange");
++        assert_eq!(
++            version(&change),
++            json!(opened_at.as_i64().expect("versions are integers") + 1),
++            "the insert is synced at the next version",
++        );
++        assert!(applied.jump.is_none(), "an insert jumps nowhere");
++    }
++
++    /// `close_lsp` drops the shown hints and every inlay slot, so nothing waits on a reply that
++    /// can no longer land.
++    #[test]
++    fn close_lsp_clears_the_hints_and_their_slots() {
++        let mut client = ready_with_hints();
++        let (mut ed, _, key) = with_hint(&mut client);
++        let _ = ed.update(
++            Event::Editor(Action::InlayHover { key, part: 1 }),
++            Instant::now(),
++        );
++        ed.wait_inlays(INLAY_EDIT_DELAY, None);
++        assert!(
++            ed.awaiting.inlay_tooltip.is_some() && ed.pending_wake().is_some(),
++            "a tooltip and a fetch are pending before the close",
++        );
++        let _closed = ed.close_lsp(&mut client);
++        assert!(shown(&ed).is_empty(), "the hints are cleared");
++        assert!(ed.take_inlay_interaction().is_none(), "the hover gesture is forgotten");
++        assert!(ed.take_inlay_request().is_none(), "no fetch is left to pull");
++        assert!(ed.pending_wake().is_none(), "the scheduled fetch is dropped");
++        assert!(
++            ed.awaiting.inlays.is_none()
++                && ed.awaiting.inlay_tooltip.is_none()
++                && ed.awaiting.inlay_insert.is_none(),
++            "every inlay slot is settled",
++        );
++    }
+ }

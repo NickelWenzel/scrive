@@ -1,0 +1,1518 @@
+diff --git a/crates/scrive-core/src/bracket.rs b/crates/scrive-core/src/bracket.rs
+index b23591e..df11b08 100644
+--- a/crates/scrive-core/src/bracket.rs
++++ b/crates/scrive-core/src/bracket.rs
+@@ -291,6 +291,17 @@ impl Brackets {
+             .map(|(o, _)| o)
+     }
+ 
++    /// The offset of the innermost opener `ch` (e.g. `b'('`) still open at
++    /// `offset`, looking strictly before it. Unlike [`Self::enclosing_pair`], an
++    /// unmatched opener counts, so the call being typed (`foo(a, b` with no `)`
++    /// yet) is found. Brackets inside strings and comments are skipped exactly
++    /// as matching skips them: line-locally, per the document's
++    /// [`BracketConfig`]. O(log + depth).
++    #[must_use]
++    pub fn innermost_open(&self, offset: u32, ch: u8) -> Option<u32> {
++        bracket_tree::innermost_open(&self.tree, offset, ch)
++    }
++
+     /// The innermost matched pair whose CONTENTS contain the whole range —
+     /// `open + 1 <= start && end <= close` — as `(open, close)`. The
+     /// expand-selection ladder's next rung. `None` outside every pair.
+@@ -906,4 +917,45 @@ mod tests {
+         assert_oracle(&b, &buf, "scattered two-insert transaction");
+         assert_eq!(bat(&b, 1).partner, Some(18)); // "a(aa\n…\ne)ee"
+     }
++
++    /// The innermost `(` still open before the offset is found whether or not
++    /// it is closed later, and closed or foreign brackets never count.
++    #[test]
++    fn innermost_open_finds_the_unclosed_call() {
++        for (text, at, want) in [
++            ("foo(a, b", 8, Some(3)),
++            ("f(g(x), y", 9, Some(1)),
++            ("f(g(x", 5, Some(3)),
++            ("f(x)", 4, None),
++            ("f(x)", 2, Some(1)),
++            ("(", 0, None),
++            ("x = [1, 2", 9, None),
++            ("a[f(b]", 6, Some(3)),
++        ] {
++            let b = Brackets::match_text(text);
++            assert_eq!(b.innermost_open(at, b'('), want, "{text:?} at {at}");
++        }
++    }
++
++    /// A `(` inside a string or a line comment is not the call under a lexing
++    /// config, and is under the structural match.
++    #[test]
++    fn innermost_open_skips_a_paren_inside_a_string() {
++        let text = "f(\"(\", x";
++        assert_eq!(
++            Brackets::match_text_with(text, &cfg()).innermost_open(8, b'('),
++            Some(1),
++            "the string's paren is skipped"
++        );
++        assert_eq!(
++            Brackets::match_text(text).innermost_open(8, b'('),
++            Some(3),
++            "without lexing the string's paren counts"
++        );
++        assert_eq!(
++            Brackets::match_text_with("f( // (\n", &cfg()).innermost_open(7, b'('),
++            Some(1),
++            "the comment's paren is skipped"
++        );
++    }
+ }
+diff --git a/crates/scrive-core/src/bracket_tree.rs b/crates/scrive-core/src/bracket_tree.rs
+index 780d0e5..076d073 100644
+--- a/crates/scrive-core/src/bracket_tree.rs
++++ b/crates/scrive-core/src/bracket_tree.rs
+@@ -152,6 +152,12 @@ fn enclosing_openers(tree: &SumTree<BracketItem>, offset: u32) -> Vec<Entry> {
+     tree.summary_before(&ByteDim(offset)).stack
+ }
+ 
++/// The offset of the innermost opener `ch` on the enclosing stack at `offset`,
++/// matched or not. O(log + depth).
++pub(crate) fn innermost_open(tree: &SumTree<BracketItem>, offset: u32, ch: u8) -> Option<u32> {
++    enclosing_openers(tree, offset).iter().rev().find(|e| e.ch == ch).map(|e| e.off)
++}
++
+ /// The matched partner of the bracket `ch` at byte `offset`, or `None` if it is
+ /// unmatched. Dispatches on the char — a closer looks left, an opener looks right.
+ fn partner(tree: &SumTree<BracketItem>, offset: u32, ch: u8) -> Option<u32> {
+diff --git a/crates/scrive-core/src/intel.rs b/crates/scrive-core/src/intel.rs
+index e511500..dc7d012 100644
+--- a/crates/scrive-core/src/intel.rs
++++ b/crates/scrive-core/src/intel.rs
+@@ -1,4 +1,5 @@
+-//! Language services — completion, signature help, hover.
++//! Language services — completion, signature help, hover, and the
++//! goto-definition, rename and format commands.
+ //!
+ //! Each service has two ways in. A **provider** is one small trait defined
+ //! here and satisfied by the app (not a god-trait with no-op defaults): the
+@@ -8,13 +9,17 @@
+ //! with a [`Ticket`](ticket::Ticket), and the reply lands only if it carries
+ //! the ticket the editor still awaits, at the same revision. The plain data
+ //! both paths exchange lives here, so neither reaches an editor internal.
++//! The commands have no provider: the editor always records a request.
+ //!
+ //! The controller state machines (completion / snippet session) that consume
+ //! these providers are core view-state and land in the submodules below.
+ 
+ pub mod completion;
++pub mod definition;
++pub mod format;
+ pub mod hover;
+ pub mod providers;
++pub mod rename;
+ pub mod signature;
+ pub mod snippet;
+ pub mod ticket;
+diff --git a/crates/scrive-core/src/intel/definition.rs b/crates/scrive-core/src/intel/definition.rs
+new file mode 100644
+index 0000000..139c1ab
+--- /dev/null
++++ b/crates/scrive-core/src/intel/definition.rs
+@@ -0,0 +1,23 @@
++//! Goto-definition: the request an editor records for F12. The host answers
++//! with a range in the same document through the editor's `set_definition`,
++//! or opens the target itself when it lies elsewhere.
++
++use crate::intel::ticket::Ticket;
++
++/// A request for the definition of the symbol at `offset`.
++#[non_exhaustive]
++#[derive(Clone, Debug)]
++pub struct DefinitionRequest {
++    /// The ticket the answer must carry to land.
++    pub ticket: Ticket,
++    /// The caret offset the request was made at.
++    pub offset: u32,
++}
++
++impl DefinitionRequest {
++    /// A definition request at `offset`, made under `ticket`.
++    #[must_use]
++    pub fn new(ticket: Ticket, offset: u32) -> Self {
++        Self { ticket, offset }
++    }
++}
+diff --git a/crates/scrive-core/src/intel/format.rs b/crates/scrive-core/src/intel/format.rs
+new file mode 100644
+index 0000000..bb6ee9b
+--- /dev/null
++++ b/crates/scrive-core/src/intel/format.rs
+@@ -0,0 +1,23 @@
++//! Formatting: the request an editor records for Shift+Alt+F. The answer is a
++//! set of edits against the revision the ticket names.
++
++use crate::intel::ticket::Ticket;
++
++/// A request to format the whole document.
++#[non_exhaustive]
++#[derive(Clone, Debug)]
++pub struct FormatRequest {
++    /// The ticket naming the revision the format was asked at.
++    pub ticket: Ticket,
++    /// The indent width in spaces. scrive indents with spaces, so a formatter
++    /// should insert spaces at this width.
++    pub tab_size: u32,
++}
++
++impl FormatRequest {
++    /// A format request at indent width `tab_size`, made under `ticket`.
++    #[must_use]
++    pub fn new(ticket: Ticket, tab_size: u32) -> Self {
++        Self { ticket, tab_size }
++    }
++}
+diff --git a/crates/scrive-core/src/intel/hover.rs b/crates/scrive-core/src/intel/hover.rs
+index 90aa81c..57bea36 100644
+--- a/crates/scrive-core/src/intel/hover.rs
++++ b/crates/scrive-core/src/intel/hover.rs
+@@ -43,8 +43,15 @@ pub struct HoverCx {
+ /// A resolved hover: the markdown to render and the word it describes.
+ #[derive(Clone, Debug)]
+ pub struct HoverInfo {
+-    /// Markdown body (a minimal block/inline subset; richer degrades to plain
+-    /// text at render).
++    /// The card's text, in the small markdown grammar the hover card renders:
++    /// - `**` toggles bold, outside code; a single `*` is literal;
++    /// - `` ` `` toggles inline code; inside code `**` is literal;
++    /// - `\*`, `` \` `` and `\\` are the literal characters in every style,
++    ///   code included; any other `\` is literal;
++    /// - each line renders as one line; nothing else is markup.
++    ///
++    /// Build text that must show verbatim (a diagnostic message, plain-text
++    /// docs, a code line's content) with [`escape_markdown`].
+     pub markdown: String,
+     /// The word range the doc describes — the popup anchors here and the widget
+     /// re-tests pointer containment against it for dismissal.
+@@ -54,7 +61,7 @@ pub struct HoverInfo {
+ /// A hover request an editor records for an async source when no synchronous
+ /// [`Hover`] provider is set. Answer it through the editor's `set_hover` with
+ /// `ticket`; `None` means no docs. A card of the diagnostics under the pointer
+-/// shows until the answer replaces it.
++/// shows meanwhile, and the answer's docs join it.
+ #[non_exhaustive]
+ #[derive(Clone, Debug)]
+ pub struct HoverRequest {
+@@ -73,3 +80,40 @@ impl HoverRequest {
+         Self { ticket, offset, word }
+     }
+ }
++
++/// Escape `text` so the hover card shows it verbatim: every `\`, `*` and `` ` ``
++/// gets a backslash (the grammar is on [`HoverInfo::markdown`]). A message like
++/// `expected *mut T` then never switches the card to bold.
++#[must_use]
++pub fn escape_markdown(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    for c in text.chars() {
++        if matches!(c, '\\' | '*' | '`') {
++            out.push('\\');
++        }
++        out.push(c);
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Exactly the three markup characters are escaped, each with one
++    /// backslash.
++    #[test]
++    fn escape_markdown_backslashes_exactly_the_markup_chars() {
++        for (raw, escaped) in [
++            ("plain", "plain"),
++            ("a*b", "a\\*b"),
++            ("**x**", "\\*\\*x\\*\\*"),
++            ("`c`", "\\`c\\`"),
++            ("a\\b", "a\\\\b"),
++            ("expected *mut T, found `&T`", "expected \\*mut T, found \\`&T\\`"),
++            ("", ""),
++        ] {
++            assert_eq!(escape_markdown(raw), escaped, "{raw:?}");
++        }
++    }
++}
+diff --git a/crates/scrive-core/src/intel/rename.rs b/crates/scrive-core/src/intel/rename.rs
+new file mode 100644
+index 0000000..9a63bfb
+--- /dev/null
++++ b/crates/scrive-core/src/intel/rename.rs
+@@ -0,0 +1,29 @@
++//! Rename: the request an editor records when the user submits a new name for
++//! the symbol under the caret. The answer is a set of edits; the editor's own
++//! document takes them as an ordinary edit.
++
++use crate::intel::ticket::Ticket;
++
++/// A request to rename the symbol at `offset` to `new_name`.
++#[non_exhaustive]
++#[derive(Clone, Debug)]
++pub struct RenameRequest {
++    /// The ticket naming the revision the rename was asked at.
++    pub ticket: Ticket,
++    /// The caret offset of the symbol to rename.
++    pub offset: u32,
++    /// The name the user typed. Never empty.
++    pub new_name: String,
++}
++
++impl RenameRequest {
++    /// A rename of the symbol at `offset` to `new_name`, made under `ticket`.
++    #[must_use]
++    pub fn new(ticket: Ticket, offset: u32, new_name: impl Into<String>) -> Self {
++        Self {
++            ticket,
++            offset,
++            new_name: new_name.into(),
++        }
++    }
++}
+diff --git a/crates/scrive-core/src/intel/signature.rs b/crates/scrive-core/src/intel/signature.rs
+index 91d7829..abb7fa7 100644
+--- a/crates/scrive-core/src/intel/signature.rs
++++ b/crates/scrive-core/src/intel/signature.rs
+@@ -66,14 +66,15 @@ impl SignatureInfo {
+ pub struct SignatureRequest {
+     ticket: Ticket,
+     position: Point,
++    call: Option<u32>,
+ }
+ 
+ impl SignatureRequest {
+-    /// A request for signature help at `position` (the caret), made under
+-    /// `ticket`.
++    /// A request for signature help at `position` (the caret), inside the call
++    /// whose `(` sits at byte offset `call`, made under `ticket`.
+     #[must_use]
+-    pub fn new(ticket: Ticket, position: Point) -> Self {
+-        Self { ticket, position }
++    pub fn new(ticket: Ticket, position: Point, call: Option<u32>) -> Self {
++        Self { ticket, position, call }
+     }
+ 
+     /// The ticket the reply must carry.
+@@ -87,4 +88,14 @@ impl SignatureRequest {
+     pub fn position(&self) -> Point {
+         self.position
+     }
++
++    /// The byte offset of the innermost `(` still open at the caret, if any:
++    /// the call's identity. Two requests with the same `call` are about the
++    /// same call, so a client can keep one in flight while the user types its
++    /// arguments. It skips strings and comments only line-locally, as bracket
++    /// colouring does.
++    #[must_use]
++    pub fn call(&self) -> Option<u32> {
++        self.call
++    }
+ }
+diff --git a/crates/scrive-core/src/lib.rs b/crates/scrive-core/src/lib.rs
+index 0622507..3b6e303 100644
+--- a/crates/scrive-core/src/lib.rs
++++ b/crates/scrive-core/src/lib.rs
+@@ -80,6 +80,9 @@ pub use highlight::{
+ };
+ pub use history::{GroupingHint, OpClass};
+ pub use intel::completion::{CompletionController, CompletionRequest, CompletionState, PopupList};
++pub use intel::definition::DefinitionRequest;
++pub use intel::format::FormatRequest;
++pub use intel::rename::RenameRequest;
+ pub use intel::hover::{Hover, HoverCx, HoverInfo, HoverRequest, HOVER_IDLE_DELAY_MS};
+ pub use intel::signature::{SignatureCx, SignatureHelp, SignatureInfo, SignatureRequest};
+ pub use intel::snippet::{CaretOutcome, Snippet, SnippetError, SnippetSession, TabOutcome, TabStop};
+diff --git a/crates/scrive-iced/src/code_editor.rs b/crates/scrive-iced/src/code_editor.rs
+index 55abbc4..a0dd62e 100644
+--- a/crates/scrive-iced/src/code_editor.rs
++++ b/crates/scrive-iced/src/code_editor.rs
+@@ -38,12 +38,13 @@ use iced::time::Instant;
+ use iced::{Alignment, Color, Element, Font, Length, Shadow, Subscription, Task, Theme, Vector};
+ 
+ use scrive_core::intel::completion::Start;
++use scrive_core::intel::hover::escape_markdown;
+ use scrive_core::intel::ticket;
+ use scrive_core::{
+     default_indent_size, is_completion_word_char, Bias, CompletionController, CompletionCx, CompletionItem,
+-    CompletionState, CompletionTrigger, Completions, Diagnostic, DiagnosticsOutcome, Document, EditOp,
+-    FindQuery, Hover,
+-    HoverCx, HoverInfo, InsertText, Point, Revision, Selection, SelectionId, SelectionSet, Severity,
++    CompletionState, CompletionTrigger, Completions, DefinitionRequest, Diagnostic, DiagnosticsOutcome,
++    Document, EditOp, FindQuery, FormatRequest, Hover,
++    HoverCx, HoverInfo, InsertText, Point, RenameRequest, Revision, Selection, SelectionId, SelectionSet, Severity,
+     SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, SyntaxDef, TabOutcome, Ticket,
+     TokenTheme, LOOKBACK_LINES,
+ };
+@@ -64,6 +65,16 @@ const DEFAULT_ID: &str = "scrive-editor";
+ /// editor is a proper single-focus model.
+ const FIND_INPUT: &str = "scrive-find-input";
+ const REPLACE_INPUT: &str = "scrive-replace-input";
++/// The rename field's input. It shares the find bar's focus plumbing.
++const RENAME_INPUT: &str = "scrive-rename-input";
++
++/// The floating bars' input box: width, row height (pinned so the find bar's
++/// chevron can span its rows exactly), and the gap and margin around the
++/// in-box buttons. Shared so the rename field matches the find bar.
++const BAR_INPUT_W: f32 = 264.0;
++const BAR_ROW_H: f32 = 26.0;
++const BAR_BOX_GAP: f32 = 3.0;
++const BAR_BOX_MARGIN: f32 = 3.0;
+ 
+ /// The opaque message a [`CodeEditor`] emits and consumes. The host never
+ /// matches on it — it only maps it through the three wires
+@@ -88,7 +99,8 @@ pub enum Event {
+     OpenFind,
+     /// Open the find bar with the replace row expanded (Ctrl+H).
+     OpenReplace,
+-    /// Close the find bar (Escape), returning focus to the editor.
++    /// Close the open bar (Escape): the rename field if it is open, else the
++    /// find bar. Focus returns to the editor.
+     CloseFind,
+     /// The query text changed.
+     FindQuery(String),
+@@ -116,6 +128,10 @@ pub enum Event {
+     ReplaceAll,
+     /// Toggle the preserve-case (`AB`) replace option.
+     TogglePreserveCase,
++    /// The rename field's text changed.
++    RenameText(String),
++    /// Submit the rename field (Enter): record a rename request and close it.
++    SubmitRename,
+     /// Tab / Shift+Tab moved focus between the bar's inputs and the editor.
+     CycleFocus {
+         /// Whether focus moved backwards (Shift+Tab).
+@@ -125,13 +141,24 @@ pub enum Event {
+     PointerDown,
+     /// A bar input gained or lost native focus; mirror it into the ring flags.
+     Focused {
+-        /// Whether this is the replace input (else the find input).
+-        replace: bool,
++        /// Which input.
++        field: Field,
+         /// Whether it is now focused.
+         on: bool,
+     },
+ }
+ 
++/// One of the floating bars' text inputs, for [`Event::Focused`].
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Field {
++    /// The find bar's query input.
++    Find,
++    /// The find bar's replacement input.
++    Replace,
++    /// The rename field.
++    Rename,
++}
++
+ /// A batteries-included code editor: owns a [`Document`], renders the
+ /// [`Editor`] widget, and runs the editing/highlighting plumbing
+ /// internally. See the [module docs](self) for the mechanism-vs-policy split and
+@@ -213,6 +240,20 @@ pub struct CodeEditor {
+     /// A pending async hover request (same pattern), recorded when the pointer
+     /// rested over a word and no synchronous hover provider is set.
+     pending_hover_request: Option<HoverRequest>,
++    /// A pending goto-definition request (F12), for the host to pull via
++    /// [`take_definition_request`](CodeEditor::take_definition_request).
++    pending_definition_request: Option<DefinitionRequest>,
++    /// A pending format request (Shift+Alt+F), for the host to pull via
++    /// [`take_format_request`](CodeEditor::take_format_request).
++    pending_format_request: Option<FormatRequest>,
++    /// A pending rename request (the rename field was submitted), for the host
++    /// to pull via [`take_rename_request`](CodeEditor::take_rename_request).
++    pending_rename_request: Option<RenameRequest>,
++    /// Whether F2 opens the rename field. Off by default, because a host with
++    /// no rename provider would show a field that does nothing.
++    rename_enabled: bool,
++    /// The open rename field. Only one floating bar is open at a time.
++    rename: Option<Rename>,
+     /// Mints the ticket every async request carries. Per editor, so two
+     /// requests at one revision still differ.
+     tickets: ticket::Counter,
+@@ -249,6 +290,18 @@ struct Awaiting {
+     /// The hover ticket, plus the pointer offset and word it asked about: the
+     /// word keeps a pointer move inside it from cancelling the request.
+     hover: Option<(Ticket, u32, Range<u32>)>,
++    /// The goto-definition ticket; a landed range is selected and revealed.
++    definition: Option<Ticket>,
++}
++
++/// The open rename field: the name being typed, the caret offset and revision
++/// it opened at (the rename names the symbol there, so an edit underneath
++/// closes it), and whether its input wears the focus ring.
++struct Rename {
++    text: String,
++    offset: u32,
++    revision: Revision,
++    focused: bool,
+ }
+ 
+ /// Which awaited slot an `accepts` / `abandon` call addresses.
+@@ -257,6 +310,7 @@ enum Awaited {
+     Completion,
+     Signature,
+     Hover,
++    Definition,
+ }
+ 
+ impl CodeEditor {
+@@ -303,6 +357,11 @@ impl CodeEditor {
+             pending_completion_request: None,
+             pending_signature_request: None,
+             pending_hover_request: None,
++            pending_definition_request: None,
++            pending_format_request: None,
++            pending_rename_request: None,
++            rename_enabled: false,
++            rename: None,
+             tickets: ticket::Counter::new(),
+             awaiting: Awaiting::default(),
+             items_caret: 0,
+@@ -368,6 +427,14 @@ impl CodeEditor {
+         self
+     }
+ 
++    /// Enable or disable the rename field that F2 opens. Default off: turn it on
++    /// when the host answers [`take_rename_request`](CodeEditor::take_rename_request).
++    #[must_use]
++    pub fn rename(mut self, enabled: bool) -> Self {
++        self.rename_enabled = enabled;
++        self
++    }
++
+     /// Set the line-comment marker used by toggle-comment (e.g. `Some("//")`);
+     /// `None` (the default) disables toggle-comment. It also drives comment-aware
+     /// bracket matching, so brackets inside `// …` stop being matched / coloured /
+@@ -574,19 +641,65 @@ impl CodeEditor {
+         self.pending_hover_request.take()
+     }
+ 
+-    /// Ingest a hover card from an async source, stamped with the request's
++    /// Ingest hover docs from an async source, stamped with the request's
+     /// `ticket` (see [`set_completions`](Self::set_completions) for when it
+-    /// lands). Replaces the shown card (the host builds it, and may fold in
+-    /// diagnostics read from [`document`](CodeEditor::document)); `None` clears
+-    /// it.
++    /// lands). The card shows the diagnostics under the hovered offset first,
++    /// then these docs; `None` leaves just the diagnostics, or no card.
+     pub fn set_hover(&mut self, ticket: Ticket, info: Option<HoverInfo>) {
+         if !self.accepts(Awaited::Hover, ticket) {
+             return;
+         }
++        let Some(offset) = self.awaiting.hover.as_ref().map(|(_, offset, _)| *offset) else {
++            return;
++        };
+         if info.is_none() {
+             self.abandon(Awaited::Hover);
+         }
+-        self.hover = info;
++        self.hover = self.hover_card(offset, info);
++    }
++
++    /// Take the pending goto-definition request, if any. Answer a target in
++    /// this document through [`set_definition`](Self::set_definition).
++    pub fn take_definition_request(&mut self) -> Option<DefinitionRequest> {
++        self.pending_definition_request.take()
++    }
++
++    /// Land a goto-definition answer stamped with the request's `ticket`. A
++    /// range in this document is selected and revealed; `None` (no definition,
++    /// or one the host opens elsewhere) retires the request. Dropped if the
++    /// caret moved or the text changed since the request.
++    pub fn set_definition(&mut self, ticket: Ticket, target: Option<Range<u32>>) {
++        if !self.accepts(Awaited::Definition, ticket) {
++            return;
++        }
++        self.abandon(Awaited::Definition);
++        if let Some(range) = target {
++            self.select(range);
++        }
++    }
++
++    /// Take the pending rename request, if any. Its answer is an edit batch
++    /// for [`edit`](Self::edit), valid while the document is still at the
++    /// ticket's revision.
++    pub fn take_rename_request(&mut self) -> Option<RenameRequest> {
++        self.pending_rename_request.take()
++    }
++
++    /// Take the pending format request, if any. Its answer is an edit batch
++    /// for [`edit`](Self::edit), valid while the document is still at the
++    /// ticket's revision.
++    pub fn take_format_request(&mut self) -> Option<FormatRequest> {
++        self.pending_format_request.take()
++    }
++
++    /// Select `range` and reveal it centered, unfolding whatever hides it: the
++    /// programmatic jump for host navigation such as goto-definition. The range
++    /// is clamped to the document and snapped to char boundaries. Like a caret
++    /// move, it closes the completion popup and retires requests tied to the old
++    /// caret.
++    pub fn select(&mut self, range: Range<u32>) {
++        self.doc.select_and_reveal(range);
++        self.after_edit(CompletionEvent::CaretOrClose);
+     }
+ 
+     /// Enable or disable the per-commit change log, for a host mirroring
+@@ -720,33 +833,17 @@ impl CodeEditor {
+                 self.abandon(Awaited::Signature);
+                 Task::none()
+             }
+-            // Hover: the pointer rested over `offset` — diagnostics first (their
+-            // messages ride the decoration store), then the provider's docs.
+             Event::Editor(Action::HoverQuery(offset)) => {
+-                let diags: Vec<(Range<u32>, String)> = self
+-                    .doc
+-                    .diagnostics_in(offset..offset + 1)
+-                    .map(|(r, sev, msg)| (r, format!("**{}:** {msg}", severity_label(sev))))
+-                    .collect();
+                 let cx = self.build_hover_cx(offset);
+-                let word = (cx.word.start != cx.word.end)
++                let has_word = cx.word.start != cx.word.end;
++                let docs = has_word
+                     .then(|| self.hover_provider.as_mut().and_then(|p| p.hover(&cx)))
+                     .flatten();
+-                self.hover = if diags.is_empty() {
+-                    word
+-                } else {
+-                    let range = diags[0].0.clone();
+-                    let mut md: Vec<String> = diags.into_iter().map(|(_, m)| m).collect();
+-                    if let Some(w) = word {
+-                        md.push(String::new());
+-                        md.push(w.markdown);
+-                    }
+-                    Some(HoverInfo { markdown: md.join("\n"), range })
+-                };
++                self.hover = self.hover_card(offset, docs);
+                 // With no synchronous provider, record an async request so the
+-                // host can supply docs; the diagnostics-only card (if any) shows
+-                // meanwhile and `set_hover` replaces it when the docs arrive.
+-                if self.hover_provider.is_none() && cx.word.start != cx.word.end {
++                // host can supply docs; the diagnostics show meanwhile and the
++                // docs join them when they land.
++                if self.hover_provider.is_none() && has_word {
+                     let ticket = self.tickets.issue(self.doc.revision());
+                     self.awaiting.hover = Some((ticket, offset, cx.word.clone()));
+                     self.pending_hover_request = Some(HoverRequest::new(ticket, offset, cx.word.clone()));
+@@ -762,6 +859,36 @@ impl CodeEditor {
+                 self.abandon(Awaited::Hover);
+                 Task::none()
+             }
++            Event::Editor(Action::GotoDefinition) => {
++                let head = self.doc.selections().newest().head();
++                let ticket = self.tickets.issue(self.doc.revision());
++                self.awaiting.definition = Some(ticket);
++                self.pending_definition_request = Some(DefinitionRequest::new(ticket, head));
++                Task::none()
++            }
++            // One bar at a time, so an open find bar closes.
++            Event::Editor(Action::Rename) if self.rename_enabled => {
++                if self.find_open {
++                    self.close_find();
++                }
++                let head = self.doc.selections().newest().head();
++                let word = self.word_around(head);
++                self.rename = Some(Rename {
++                    text: self.doc.buffer().slice(word).into_owned(),
++                    offset: head,
++                    revision: self.doc.revision(),
++                    focused: true,
++                });
++                focus(RENAME_INPUT)
++            }
++            // Kept out of `apply`, whose tail would treat it as a caret move and
++            // close the popup.
++            Event::Editor(Action::Rename) => Task::none(),
++            Event::Editor(Action::Format) => {
++                let ticket = self.tickets.issue(self.doc.revision());
++                self.pending_format_request = Some(FormatRequest::new(ticket, default_indent_size()));
++                Task::none()
++            }
+             Event::Editor(action) => {
+                 self.apply(action);
+                 Task::none()
+@@ -809,6 +936,7 @@ impl CodeEditor {
+ 
+             // ── find bar ────────────────────────────────────────────────────
+             Event::OpenFind if self.find_enabled => {
++                self.rename = None;
+                 self.find_open = true;
+                 // Seed (or re-seed) the query from a non-empty, single-line
+                 // selection, as mainstream editors do; an empty selection leaves
+@@ -834,17 +962,27 @@ impl CodeEditor {
+                 let moved = if back { focus_previous() } else { focus_next() };
+                 moved.chain(Self::sync_rings())
+             }
+-            Event::PointerDown if self.find_open => {
++            Event::PointerDown if self.find_open || self.rename.is_some() => {
+                 Task::batch([Self::resync_focus(), Self::sync_rings()])
+             }
+-            Event::Focused { replace, on } => {
+-                if replace {
+-                    self.replace_focused = on;
+-                } else {
+-                    self.find_focused = on;
++            Event::Focused { field, on } => {
++                match field {
++                    Field::Find => self.find_focused = on,
++                    Field::Replace => self.replace_focused = on,
++                    Field::Rename => {
++                        if let Some(rename) = &mut self.rename {
++                            rename.focused = on;
++                        }
++                    }
+                 }
+                 Task::none()
+             }
++            // Escape arrives here through the global bar chord, whatever holds
++            // focus. At most one bar is open.
++            Event::CloseFind if self.rename.is_some() => {
++                self.rename = None;
++                focus(self.id.clone())
++            }
+             Event::CloseFind if self.find_open => {
+                 self.close_find();
+                 focus(self.id.clone())
+@@ -933,6 +1071,22 @@ impl CodeEditor {
+                 self.replace_preserve_case = !self.replace_preserve_case;
+                 Task::none()
+             }
++            Event::RenameText(text) => {
++                if let Some(rename) = &mut self.rename {
++                    rename.text = text;
++                }
++                Task::none()
++            }
++            // A name typed over text that has since changed, or an empty one,
++            // asks nothing.
++            Event::SubmitRename => {
++                let Some(rename) = self.rename.take() else { return Task::none() };
++                if rename.revision == self.doc.revision() && !rename.text.is_empty() {
++                    let ticket = self.tickets.issue(rename.revision);
++                    self.pending_rename_request = Some(RenameRequest::new(ticket, rename.offset, rename.text));
++                }
++                focus(self.id.clone())
++            }
+             // Guarded find variants whose guard did not hold (bar closed, or find
+             // disabled): ignore.
+             Event::OpenFind
+@@ -973,18 +1127,23 @@ impl CodeEditor {
+             .font(self.font)
+             .text_size(self.text_size)
+             .id(self.id.clone());
+-        if self.find_open {
+-            // Float the find bar over the editor, top-right (where mainstream
++        let bar = match &self.rename {
++            Some(rename) => Some(rename_bar(rename)),
++            None => self.find_open.then(|| self.find_bar()),
++        };
++        match bar {
++            // Float the bar over the editor, top-right (where mainstream
+             // editors place it). The right padding clears the scrollbar lane so
+             // the bar never sits over it; the overlay is transparent except the
+             // bar, so clicks pass through.
+-            let overlay = container(self.find_bar())
+-                .width(Length::Fill)
+-                .align_x(Horizontal::Right)
+-                .padding(iced::Padding::new(8.0).right(8.0 + crate::SCROLLBAR_WIDTH));
+-            stack([editor.into(), overlay.into()]).into()
+-        } else {
+-            editor.into()
++            Some(bar) => {
++                let overlay = container(bar)
++                    .width(Length::Fill)
++                    .align_x(Horizontal::Right)
++                    .padding(iced::Padding::new(8.0).right(8.0 + crate::SCROLLBAR_WIDTH));
++                stack([editor.into(), overlay.into()]).into()
++            }
++            None => editor.into(),
+         }
+     }
+ 
+@@ -1011,28 +1170,11 @@ impl CodeEditor {
+         } else {
+             Color::from_rgb8(0xCC, 0xCC, 0xCC)
+         };
+-        // Both inputs share this width so the two boxes align under each other.
+-        const INPUT_W: f32 = 264.0;
+         // Fixed so the nav buttons never shuffle as the match-count digits change.
+         const COUNT_W: f32 = 78.0;
+         const SPACING: f32 = 4.0;
+-        // One row's height, pinned so the chevron can span the rows exactly.
+-        const ROW_H: f32 = 26.0;
+-        // The box look lives on the CONTAINER (`box_of`), so the field is
+-        // transparent and sits inside it beside the in-box buttons as a row
+-        // sibling — not overlaid in a `Stack` (which early-returns on capture and
+-        // would leave a field stale-focused). One style for BOTH fields.
+-        let input_style = |_theme: &Theme, _status: text_input::Status| text_input::Style {
+-            background: Color::TRANSPARENT.into(),
+-            border: iced::border::rounded(0.0),
+-            placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
+-            value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
+-            selection: Color::from_rgb8(0x26, 0x4F, 0x78),
+-        };
+         const BTN_W: f32 = 22.0;
+         const IN_BTN: f32 = 20.0;
+-        const IN_GAP: f32 = 3.0;
+-        const IN_MARGIN: f32 = 3.0;
+         // Flat icon buttons: transparent at rest, translucent gray on hover; `on`
+         // latches the background + a focus-blue border so an engaged option reads
+         // as pressed at rest, not only under the pointer.
+@@ -1069,7 +1211,7 @@ impl CodeEditor {
+         let btn = |glyph: char, msg| sized_btn(glyph, false, msg, BTN_W, BTN_W);
+         let in_btn = |glyph: char, on: bool, msg| sized_btn(glyph, on, msg, IN_BTN, IN_BTN);
+         let box_of =
+-            |field, buttons, focused| box_of(field, buttons, focused, INPUT_W, ROW_H, IN_GAP, IN_MARGIN);
++            |field, buttons, focused| box_of(field, buttons, focused, BAR_INPUT_W, BAR_ROW_H, BAR_BOX_GAP, BAR_BOX_MARGIN);
+ 
+         let find_box = box_of(
+             text_input("Find", &self.find_query)
+@@ -1079,7 +1221,7 @@ impl CodeEditor {
+                 .padding(iced::Padding::new(4.0).left(2.0))
+                 .size(13)
+                 .width(Length::Fill)
+-                .style(input_style)
++                .style(bar_input_style)
+                 .into(),
+             vec![
+                 in_btn(crate::icon::CASE_SENSITIVE, self.find_case, Event::ToggleCase).into(),
+@@ -1101,7 +1243,7 @@ impl CodeEditor {
+             btn(crate::icon::CLOSE, Event::CloseFind),
+         ]
+         .spacing(SPACING)
+-        .height(Length::Fixed(ROW_H))
++        .height(Length::Fixed(BAR_ROW_H))
+         .align_y(Alignment::Center);
+         let rows = if self.replace_open {
+             let replace_box = box_of(
+@@ -1112,7 +1254,7 @@ impl CodeEditor {
+                     .padding(iced::Padding::new(4.0).left(2.0))
+                     .size(13)
+                     .width(Length::Fill)
+-                    .style(input_style)
++                    .style(bar_input_style)
+                     .into(),
+                 vec![in_btn(crate::icon::PRESERVE_CASE, self.replace_preserve_case, Event::TogglePreserveCase)
+                     .into()],
+@@ -1124,7 +1266,7 @@ impl CodeEditor {
+                 btn(crate::icon::REPLACE_ALL, Event::ReplaceAll),
+             ]
+             .spacing(SPACING)
+-            .height(Length::Fixed(ROW_H))
++            .height(Length::Fixed(BAR_ROW_H))
+             .align_y(Alignment::Center);
+             column![find_row, replace_row].spacing(SPACING)
+         } else {
+@@ -1140,7 +1282,7 @@ impl CodeEditor {
+                     false,
+                     Event::ToggleReplace,
+                     BTN_W,
+-                    if self.replace_open { ROW_H * 2.0 + SPACING } else { ROW_H },
++                    if self.replace_open { BAR_ROW_H * 2.0 + SPACING } else { BAR_ROW_H },
+                 ),
+                 rows,
+             ]
+@@ -1148,16 +1290,7 @@ impl CodeEditor {
+             .align_y(Alignment::Center),
+         )
+         .padding([6, 8])
+-        .style(|_theme: &Theme| container::Style {
+-            background: Some(Color::from_rgb8(0x25, 0x25, 0x26).into()),
+-            border: iced::border::rounded(8.0).color(Color::from_rgb8(0x45, 0x45, 0x45)).width(1.0),
+-            shadow: Shadow {
+-                color: Color::from_rgba8(0, 0, 0, 0.36),
+-                offset: Vector::new(0.0, 2.0),
+-                blur_radius: 8.0,
+-            },
+-            ..container::Style::default()
+-        })
++        .style(bar_panel_style)
+         .into()
+     }
+ 
+@@ -1181,8 +1314,9 @@ impl CodeEditor {
+         // captured it. `listen_with` filters, so non-find keys produce nothing
+         // and the editor's own captured keystrokes still route through the widget.
+         // The closure is a plain fn (non-capturing), so the `find_open` gating
+-        // happens in `update`.
+-        let keys = if self.find_enabled {
++        // happens in `update`. The same chords close the rename field, so they
++        // are live while it is open even with find disabled.
++        let keys = if self.find_enabled || self.rename.is_some() {
+             iced::event::listen_with(|event, status, _window| match event {
+                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                     find_chord(&key, modifiers, status)
+@@ -1266,20 +1400,22 @@ impl CodeEditor {
+     /// that can't be predicted here (a click, a Tab).
+     fn sync_rings() -> Task<Event> {
+         Task::batch([
+-            is_focused(FIND_INPUT).map(|on| Event::Focused { replace: false, on }),
+-            is_focused(REPLACE_INPUT).map(|on| Event::Focused { replace: true, on }),
++            is_focused(FIND_INPUT).map(|on| Event::Focused { field: Field::Find, on }),
++            is_focused(REPLACE_INPUT).map(|on| Event::Focused { field: Field::Replace, on }),
++            is_focused(RENAME_INPUT).map(|on| Event::Focused { field: Field::Rename, on }),
+         ])
+     }
+ 
+     /// Re-assert single focus after a press: a click inside an input focuses it
+     /// natively and captures the event, so the editor's own press handler never
+-    /// runs to unfocus itself — focusing whichever input iced reports as focused
+-    /// is exactly the repair. When the press landed in the editor, neither input
+-    /// is focused and both arms are no-ops.
++    /// runs to unfocus itself — focusing whichever bar input iced reports as
++    /// focused is exactly the repair. When the press landed in the editor, no
++    /// bar input is focused and every arm is a no-op.
+     fn resync_focus() -> Task<Event> {
+         Task::batch([
+             is_focused(FIND_INPUT).then(|f| if f { focus(FIND_INPUT) } else { Task::none() }),
+             is_focused(REPLACE_INPUT).then(|f| if f { focus(REPLACE_INPUT) } else { Task::none() }),
++            is_focused(RENAME_INPUT).then(|f| if f { focus(RENAME_INPUT) } else { Task::none() }),
+         ])
+     }
+ 
+@@ -1358,6 +1494,9 @@ impl CodeEditor {
+             | Action::SignatureClose
+             | Action::HoverQuery(_)
+             | Action::HoverDismiss
++            | Action::GotoDefinition
++            | Action::Rename
++            | Action::Format
+             | Action::ToggleFold { .. }
+             | Action::FoldAtCarets { .. } => {}
+         }
+@@ -1389,10 +1528,17 @@ impl CodeEditor {
+         self.drive_signature(comp_event);
+         self.reconcile_snippet();
+         self.hover = None;
+-        // A caret jump abandons a pending hover. Typing keeps it: its reply is
+-        // then dropped by revision, and the pointer re-arm asks again.
++        // A caret jump abandons a pending hover and definition. Typing keeps
++        // them: their replies are then dropped by revision, and the pointer
++        // re-arm asks for hover again.
+         if matches!(comp_event, CompletionEvent::CaretOrClose) {
+             self.abandon(Awaited::Hover);
++            self.abandon(Awaited::Definition);
++        }
++        // The rename field names the symbol at the revision it opened on, so an
++        // edit underneath (a host edit, an undo) makes it stale.
++        if self.rename.as_ref().is_some_and(|r| r.revision != self.doc.revision()) {
++            self.rename = None;
+         }
+         // `dirty` is set by the callers on an actual text change (a bare caret
+         // move runs the tail but must not dirty the document — see `apply`).
+@@ -1510,9 +1656,10 @@ impl CodeEditor {
+             // No synchronous provider: record an async request for the host.
+             let head = self.doc.selections().newest().head();
+             let ticket = self.tickets.issue(self.doc.revision());
++            let call = self.doc.brackets().innermost_open(head, b'(');
+             self.awaiting.signature = Some(ticket);
+             self.pending_signature_request =
+-                Some(SignatureRequest::new(ticket, self.doc.buffer().offset_to_point(head)));
++                Some(SignatureRequest::new(ticket, self.doc.buffer().offset_to_point(head), call));
+         }
+     }
+ 
+@@ -1626,6 +1773,7 @@ impl CodeEditor {
+             Awaited::Completion => self.awaiting.completion,
+             Awaited::Signature => self.awaiting.signature,
+             Awaited::Hover => self.awaiting.hover.as_ref().map(|(t, ..)| *t),
++            Awaited::Definition => self.awaiting.definition,
+         };
+         awaited == Some(ticket) && ticket.revision() == self.doc.revision()
+     }
+@@ -1646,6 +1794,10 @@ impl CodeEditor {
+                 self.awaiting.hover = None;
+                 self.pending_hover_request = None;
+             }
++            Awaited::Definition => {
++                self.awaiting.definition = None;
++                self.pending_definition_request = None;
++            }
+         }
+     }
+ 
+@@ -1777,6 +1929,27 @@ impl CodeEditor {
+         (line_start + start as u32)..(line_start + end as u32)
+     }
+ 
++    /// The hover card for `offset`: the diagnostics under it, escaped so a
++    /// message's own `*` or backtick renders literally, then the docs after a
++    /// blank line. The diagnostics never depend on the docs, so a `None` reply
++    /// still leaves them showing.
++    fn hover_card(&self, offset: u32, docs: Option<HoverInfo>) -> Option<HoverInfo> {
++        let diags: Vec<(Range<u32>, String)> = self
++            .doc
++            .diagnostics_in(offset..offset + 1)
++            .map(|(r, sev, msg)| (r, format!("**{}:** {}", severity_label(sev), escape_markdown(&msg))))
++            .collect();
++        let Some(range) = diags.first().map(|(r, _)| r.clone()) else {
++            return docs;
++        };
++        let mut md: Vec<String> = diags.into_iter().map(|(_, m)| m).collect();
++        if let Some(docs) = docs {
++            md.push(String::new());
++            md.push(docs.markdown);
++        }
++        Some(HoverInfo { markdown: md.join("\n"), range })
++    }
++
+     /// Build a hover request for the word under `offset`. The lookback runs
+     /// through the word's END, so the provider reads the full word from its tail.
+     fn build_hover_cx(&self, offset: u32) -> HoverCx {
+@@ -1827,6 +2000,59 @@ fn box_of<'a>(
+     .into()
+ }
+ 
++/// The bars' text-input look. The field is transparent: the box and the focus
++/// ring live on the `box_of` container around it, beside the in-box buttons as
++/// a row sibling. A `Stack` overlay would early-return on capture and leave a
++/// field stale-focused.
++fn bar_input_style(_theme: &Theme, _status: text_input::Status) -> text_input::Style {
++    text_input::Style {
++        background: Color::TRANSPARENT.into(),
++        border: iced::border::rounded(0.0),
++        placeholder: Color::from_rgb8(0xA6, 0xA6, 0xA6),
++        value: Color::from_rgb8(0xCC, 0xCC, 0xCC),
++        selection: Color::from_rgb8(0x26, 0x4F, 0x78),
++    }
++}
++
++/// The floating bars' panel: dark fill, hairline border, soft drop shadow.
++fn bar_panel_style(_theme: &Theme) -> container::Style {
++    container::Style {
++        background: Some(Color::from_rgb8(0x25, 0x25, 0x26).into()),
++        border: iced::border::rounded(8.0).color(Color::from_rgb8(0x45, 0x45, 0x45)).width(1.0),
++        shadow: Shadow {
++            color: Color::from_rgba8(0, 0, 0, 0.36),
++            offset: Vector::new(0.0, 2.0),
++            blur_radius: 8.0,
++        },
++        ..container::Style::default()
++    }
++}
++
++/// The rename field: one input seeded with the symbol under the caret, in the
++/// find bar's panel. Enter submits; Escape (the shared bar chord) closes it.
++fn rename_bar(rename: &Rename) -> Element<'_, Event> {
++    let field = text_input("Rename symbol", &rename.text)
++        .id(RENAME_INPUT)
++        .on_input(Event::RenameText)
++        .on_submit(Event::SubmitRename)
++        .padding(iced::Padding::new(4.0).left(2.0))
++        .size(13)
++        .width(Length::Fill)
++        .style(bar_input_style);
++    container(box_of(
++        field.into(),
++        Vec::new(),
++        rename.focused,
++        BAR_INPUT_W,
++        BAR_ROW_H,
++        BAR_BOX_GAP,
++        BAR_BOX_MARGIN,
++    ))
++    .padding([6, 8])
++    .style(bar_panel_style)
++    .into()
++}
++
+ /// A severity's display name for the diagnostic hover.
+ fn severity_label(sev: Severity) -> &'static str {
+     match sev {
+@@ -2429,4 +2655,236 @@ mod tests {
+         ed.set_completions(second.ticket(), vec![item("fresh")]);
+         assert_eq!(shown(&ed), ["fresh"], "the newest reply lands");
+     }
++
++    /// A signature request names the innermost `(` still open at the caret,
++    /// not a call that has closed before it.
++    #[test]
++    fn signature_request_names_the_innermost_open_paren() {
++        let mut ed = CodeEditor::new("");
++        for c in ['f', '(', 'g', '(', 'x', ')', ','] {
++            act(&mut ed, Action::Type(c));
++        }
++        let text = ed.document().text().into_owned();
++        let outer = text.find('(').expect("the outer call") as u32;
++        let req = ed.take_signature_request().expect("typing in a call re-queries while awaited");
++        assert_eq!(req.call(), Some(outer), "the closed inner call does not count: {text:?}");
++    }
++
++    /// With string lexing on, a `(` inside a string literal on the caret's
++    /// line is not the call.
++    #[test]
++    fn a_paren_inside_a_string_is_not_the_call() {
++        let mut ed = CodeEditor::new("g\nf(\"(\", \n").bracket_lexing(vec![b'"'], None);
++        act(&mut ed, Action::PlaceCaret(1));
++        act(&mut ed, Action::Type('('));
++        let _ = ed.take_signature_request();
++        let text = ed.document().text().into_owned();
++        let call = text.find("f(").expect("the call") as u32 + 1;
++        let end = text[call as usize..].find('\n').expect("the call's line ends") as u32 + call;
++        act(&mut ed, Action::PlaceCaret(end));
++        let req = ed.take_signature_request().expect("a move re-queries while awaited");
++        assert_eq!(req.call(), Some(call), "the paren inside the string is skipped");
++    }
++
++    /// `select` selects the range, requests a reveal and closes an open popup.
++    #[test]
++    fn select_selects_reveals_and_closes_the_popup() {
++        let mut ed = CodeEditor::new("hello\n");
++        act(&mut ed, Action::Type('h'));
++        let req = ed.take_completion_request().expect("a word char asks");
++        ed.set_completions(req.ticket(), vec![item("hello")]);
++        assert!(ed.completion.is_open(), "the reply opens the popup");
++        let seq = ed.document().reveal_seq();
++        ed.select(0..1);
++        assert!(matches!(ed.completion.state(), CompletionState::Closed), "selecting closes the popup");
++        assert_eq!(ed.selection(), 0..1, "the range is selected");
++        assert!(ed.document().reveal_seq() > seq, "the selection is revealed");
++    }
++
++    /// A definition answer for the request's caret selects the range and
++    /// reveals it.
++    #[test]
++    fn goto_definition_selects_the_landed_range_and_reveals_it() {
++        let mut ed = CodeEditor::new("fn foo() {}\nfoo();\n");
++        act(&mut ed, Action::PlaceCaret(13));
++        act(&mut ed, Action::GotoDefinition);
++        let req = ed.take_definition_request().expect("F12 asks");
++        assert_eq!(req.offset, 13, "asked at the caret");
++        let seq = ed.document().reveal_seq();
++        ed.set_definition(req.ticket, Some(3..6));
++        assert_eq!(ed.selection(), 3..6, "the definition is selected");
++        assert!(ed.document().reveal_seq() > seq, "the definition is revealed");
++    }
++
++    /// A click before the definition lands abandons the request.
++    #[test]
++    fn a_click_before_the_definition_lands_drops_it() {
++        let mut ed = CodeEditor::new("fn foo() {}\nfoo();\n");
++        act(&mut ed, Action::PlaceCaret(13));
++        act(&mut ed, Action::GotoDefinition);
++        let req = ed.take_definition_request().expect("F12 asks");
++        act(&mut ed, Action::PlaceCaret(0));
++        ed.set_definition(req.ticket, Some(3..6));
++        assert_eq!(ed.selection(), 0..0, "the click abandoned the request");
++    }
++
++    /// Typing before the definition lands drops it by revision.
++    #[test]
++    fn typing_before_the_definition_lands_drops_it() {
++        let mut ed = CodeEditor::new("fn foo() {}\nfoo();\n");
++        act(&mut ed, Action::PlaceCaret(13));
++        act(&mut ed, Action::GotoDefinition);
++        let req = ed.take_definition_request().expect("F12 asks");
++        act(&mut ed, Action::Type('x'));
++        let caret = ed.selection();
++        ed.set_definition(req.ticket, Some(3..6));
++        assert_eq!(ed.selection(), caret, "the text moved past the request");
++    }
++
++    /// An accepted `None` retires the request, so a second answer under the
++    /// same ticket is dropped.
++    #[test]
++    fn a_none_definition_retires_the_request() {
++        let mut ed = CodeEditor::new("fn foo() {}\nfoo();\n");
++        act(&mut ed, Action::PlaceCaret(13));
++        act(&mut ed, Action::GotoDefinition);
++        let req = ed.take_definition_request().expect("F12 asks");
++        ed.set_definition(req.ticket, None);
++        ed.set_definition(req.ticket, Some(3..6));
++        assert_eq!(ed.selection(), 13..13, "the retired request's second answer is dropped");
++    }
++
++    /// Format asks at the current revision with scrive's indent width and
++    /// leaves the text alone.
++    #[test]
++    fn format_records_a_request_with_the_indent_size() {
++        let mut ed = CodeEditor::new("fn f(){}\n");
++        act(&mut ed, Action::Format);
++        let req = ed.take_format_request().expect("Shift+Alt+F asks");
++        assert_eq!(req.tab_size, default_indent_size(), "the editor's indent width");
++        assert_eq!(req.ticket.revision(), ed.document().revision(), "asked at the current revision");
++        assert_eq!(ed.document().text(), "fn f(){}\n", "asking changes nothing");
++    }
++
++    /// The Escape the global bar chord produces, as a focused input sees it.
++    fn escape_chord() -> Event {
++        use iced::keyboard::{key::Named, Key, Modifiers};
++        find_chord(&Key::Named(Named::Escape), Modifiers::empty(), iced::event::Status::Captured)
++            .expect("Escape is a bar chord")
++    }
++
++    /// F2 opens the field on the symbol under the caret, and Enter asks to
++    /// rename that symbol to the typed name, closing the field.
++    #[test]
++    fn rename_submits_the_typed_name_for_the_symbol_at_the_caret() {
++        let mut ed = CodeEditor::new("let foo = 1;\n").rename(true);
++        act(&mut ed, Action::PlaceCaret(5));
++        act(&mut ed, Action::Rename);
++        assert_eq!(ed.rename.as_ref().map(|r| r.text.as_str()), Some("foo"), "seeded with the symbol");
++        let _ = ed.update(Event::RenameText("bar".into()), Instant::now());
++        let _ = ed.update(Event::SubmitRename, Instant::now());
++        let req = ed.take_rename_request().expect("Enter asks");
++        assert_eq!((req.offset, req.new_name.as_str()), (5, "bar"), "the symbol at the caret, renamed");
++        assert_eq!(req.ticket.revision(), ed.document().revision(), "asked at the current revision");
++        assert!(ed.rename.is_none(), "submitting closes the field");
++
++        act(&mut ed, Action::Rename);
++        let _ = ed.update(Event::RenameText(String::new()), Instant::now());
++        let _ = ed.update(Event::SubmitRename, Instant::now());
++        assert!(ed.take_rename_request().is_none(), "an empty name asks nothing");
++        assert!(ed.rename.is_none(), "submitting an empty name still closes the field");
++    }
++
++    /// Without the opt-in, F2 opens nothing and leaves an open popup alone.
++    #[test]
++    fn rename_is_ignored_unless_enabled() {
++        let mut ed = CodeEditor::new("hello\n");
++        act(&mut ed, Action::Type('h'));
++        let req = ed.take_completion_request().expect("a word char asks");
++        ed.set_completions(req.ticket(), vec![item("hello")]);
++        act(&mut ed, Action::Rename);
++        assert!(ed.rename.is_none(), "rename is off by default");
++        assert!(ed.completion.is_open(), "F2 does not act as a caret move");
++    }
++
++    /// An edit underneath the open field closes it, so it can never submit a
++    /// name for a stale offset.
++    #[test]
++    fn rename_closes_when_the_revision_moves() {
++        let mut ed = CodeEditor::new("let foo = 1;\n").rename(true);
++        act(&mut ed, Action::PlaceCaret(5));
++        act(&mut ed, Action::Rename);
++        ed.edit(vec![EditOp::insert(0, "x")]);
++        assert!(ed.rename.is_none(), "a host edit closes the field");
++        let _ = ed.update(Event::SubmitRename, Instant::now());
++        assert!(ed.take_rename_request().is_none(), "a closed field asks nothing");
++    }
++
++    /// Only one bar is open, and Escape through the bar chord closes the
++    /// rename field without reopening find.
++    #[test]
++    fn escape_through_the_bar_chord_closes_rename_not_find() {
++        let mut ed = CodeEditor::new("let foo = 1;\n").rename(true);
++        let _ = ed.update(Event::OpenFind, Instant::now());
++        act(&mut ed, Action::Rename);
++        assert!(!ed.find_open && ed.rename.is_some(), "one bar at a time");
++        let _ = ed.update(escape_chord(), Instant::now());
++        assert!(ed.rename.is_none(), "Escape closes the rename field");
++        assert!(!ed.find_open, "find stays closed");
++
++        let _ = ed.update(Event::OpenFind, Instant::now());
++        let _ = ed.update(escape_chord(), Instant::now());
++        assert!(!ed.find_open, "with no rename field, Escape closes find");
++    }
++
++    /// The bar chords stay live for the rename field when find is disabled.
++    #[test]
++    fn escape_closes_rename_even_with_find_disabled() {
++        let mut ed = CodeEditor::new("let foo = 1;\n").find(false).rename(true);
++        act(&mut ed, Action::Rename);
++        assert!(ed.rename.is_some(), "F2 opens the field");
++        let _ = ed.update(escape_chord(), Instant::now());
++        assert!(ed.rename.is_none(), "Escape closes it");
++    }
++
++    /// Opening find closes the rename field.
++    #[test]
++    fn opening_find_closes_rename() {
++        let mut ed = CodeEditor::new("let foo = 1;\n").rename(true);
++        act(&mut ed, Action::Rename);
++        let _ = ed.update(Event::OpenFind, Instant::now());
++        assert!(ed.rename.is_none(), "one bar at a time");
++        assert!(ed.find_open, "find opened");
++    }
++
++    /// An async hover that answers `None` keeps the diagnostics card, and one
++    /// that answers docs puts them after the diagnostics.
++    #[test]
++    fn the_hover_card_keeps_its_diagnostics_when_the_docs_are_none() {
++        let mut ed = CodeEditor::new("hello world\n");
++        let rev = ed.document().revision();
++        let _ = ed.set_diagnostics(rev, vec![Diagnostic::new(0..5, Severity::Error, "unknown name")]);
++        act(&mut ed, Action::HoverQuery(2));
++        let req = ed.take_hover_request().expect("a word with no provider asks");
++        ed.set_hover(req.ticket, None);
++        let shown = ed.hover.as_ref().expect("the diagnostics stay");
++        assert_eq!(shown.markdown, "**error:** unknown name", "only the diagnostics show");
++
++        act(&mut ed, Action::HoverQuery(2));
++        let req = ed.take_hover_request().expect("the word asks again");
++        ed.set_hover(req.ticket, Some(card()));
++        let shown = ed.hover.as_ref().expect("a card shows");
++        assert_eq!(shown.markdown, "**error:** unknown name\n\ndoc", "the docs follow the diagnostics");
++    }
++
++    /// A diagnostic's own markup characters are escaped in the card.
++    #[test]
++    fn diagnostic_messages_are_escaped_in_the_hover_card() {
++        let mut ed = CodeEditor::new("hello world\n");
++        let rev = ed.document().revision();
++        let _ = ed.set_diagnostics(rev, vec![Diagnostic::new(0..5, Severity::Error, "expected *mut T")]);
++        act(&mut ed, Action::HoverQuery(2));
++        let card = ed.hover.as_ref().expect("the diagnostic shows at once");
++        assert!(card.markdown.contains("expected \\*mut T"), "{}", card.markdown);
++    }
+ }
+diff --git a/crates/scrive-iced/src/editor.rs b/crates/scrive-iced/src/editor.rs
+index 6e3862c..94bb0e8 100644
+--- a/crates/scrive-iced/src/editor.rs
++++ b/crates/scrive-iced/src/editor.rs
+@@ -34,7 +34,7 @@ use std::cell::Ref;
+ use std::ops::Range;
+ 
+ use scrive_core::{
+-    display_map, BufferRow, ColumnDir, CompletionKind, Document, FoldMap, Granularity,
++    display_map, BufferRow, ColumnDir, CompletionKind, DocId, Document, FoldMap, Granularity,
+     HighlightSpan, HoverInfo, Motion, Point as BufPoint, PopupList, RevealMode, RowLayout, Severity,
+     SignatureInfo, HOVER_IDLE_DELAY_MS,
+ };
+@@ -360,6 +360,12 @@ pub enum Action {
+         /// Forward if true (F8), backward if false (Shift+F8).
+         forward: bool,
+     },
++    /// Go to the definition of the symbol at the caret (F12).
++    GotoDefinition,
++    /// Rename the symbol at the caret (F2).
++    Rename,
++    /// Format the document (Shift+Alt+F).
++    Format,
+     /// The pointer rested over byte `offset` long enough for a hover query.
+     /// The app resolves the word + queries its provider.
+     HoverQuery(u32),
+@@ -416,6 +422,9 @@ impl Action {
+                 | Action::SignatureClose
+                 | Action::HoverQuery(_)
+                 | Action::HoverDismiss
++                | Action::GotoDefinition
++                | Action::Rename
++                | Action::Format
+                 | Action::ToggleFold { .. }
+                 | Action::FoldAtCarets { .. }
+                 // These verbs reveal through the core's request_reveal —
+@@ -543,6 +552,10 @@ struct State {
+     /// drives the immediate plain-hover expand highlight. Tracked so a move
+     /// on/off a chip repaints exactly once; `None` when off any chip or Ctrl is held.
+     hover_chip: Option<u32>,
++    /// The document this state describes. The widget tree keeps state by
++    /// position, so a host that renders another document here (a tab switch)
++    /// would otherwise hand it the old document's scroll, drags and hover.
++    doc: Option<DocId>,
+ }
+ 
+ impl Default for State {
+@@ -573,6 +586,7 @@ impl Default for State {
+             gutter_hover_row: None,
+             fold_preview: None,
+             hover_chip: None,
++            doc: None,
+         }
+     }
+ }
+@@ -1197,7 +1211,28 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+     }
+ 
+     fn state(&self) -> widget::tree::State {
+-        widget::tree::State::new(State::default())
++        widget::tree::State::new(State { doc: Some(self.doc.doc_id()), ..State::default() })
++    }
++
++    fn diff(&mut self, tree: &mut widget::Tree) {
++        let state = tree.state.downcast_mut::<State>();
++        let doc = self.doc.doc_id();
++        if state.doc == Some(doc) {
++            return;
++        }
++        // Scroll, drags, hover and fold previews describe the old document's
++        // text; focus, the measured metrics and the held modifiers describe the
++        // widget. The fresh `last_reveal_seq` of 0 sends a document that ever
++        // requested a reveal down the jump path, to its recorded reveal mode.
++        *state = State {
++            focus: state.focus,
++            metrics: state.metrics,
++            measured_font: state.measured_font,
++            modifiers: state.modifiers,
++            doc: Some(doc),
++            autoscroll: true,
++            ..State::default()
++        };
+     }
+ 
+     fn operate(
+@@ -2457,6 +2492,23 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                     shell.capture_event();
+                     return;
+                 }
++                // Matched on the physical key: with Alt held the logical char
++                // depends on the layout (macOS gives `Ï`), and `interpret_key`
++                // would type it.
++                if modifiers.shift()
++                    && modifiers.alt()
++                    && !modifiers.control()
++                    && !modifiers.logo()
++                    && matches!(
++                        physical_key,
++                        iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyF)
++                    )
++                {
++                    state.ping();
++                    shell.publish((self.on_action)(Action::Format));
++                    shell.capture_event();
++                    return;
++                }
+                 if let Some(action) = interpret_key(key, text.as_deref(), *modifiers) {
+                     if action.moves_caret() {
+                         state.autoscroll = true;
+@@ -3541,6 +3593,8 @@ fn interpret_key(key: &Key, text: Option<&str>, mods: Modifiers) -> Option<Actio
+         Key::Named(Named::Escape) => Some(Action::Collapse),
+         // F8 / Shift+F8 jump to the next/previous diagnostic.
+         Key::Named(Named::F8) => Some(Action::NextDiagnostic { forward: !mods.shift() }),
++        Key::Named(Named::F12) => Some(Action::GotoDefinition),
++        Key::Named(Named::F2) => Some(Action::Rename),
+         // Ctrl+D add-next-occurrence. The `!alt` guard keeps Ctrl+Alt
+         // (AltGr) from ever triggering the gesture.
+         Key::Character(c) if mods.control() && !mods.alt() && c.as_str() == "d" => {
+@@ -3655,9 +3709,9 @@ enum MdStyle {
+     Code,
+ }
+ 
+-/// Split one markdown line into styled runs, consuming the `**bold**` and
+-/// `` `code` `` markers. A minimal inline subset (no nesting) — enough for the
+-/// hover's spec-derived docs; unmatched markers just toggle back at line end.
++/// Split one markdown line into styled runs: the decoding side of the grammar
++/// documented on `HoverInfo::markdown`, which `escape_markdown` encodes. No
++/// nesting; unmatched markers just toggle back at line end.
+ fn parse_md_runs(line: &str) -> Vec<(String, MdStyle)> {
+     let mut runs = Vec::new();
+     let mut cur = String::new();
+@@ -3670,7 +3724,11 @@ fn parse_md_runs(line: &str) -> Vec<(String, MdStyle)> {
+     let mut chars = line.chars().peekable();
+     while let Some(c) = chars.next() {
+         match c {
+-            '*' if chars.peek() == Some(&'*') => {
++            '\\' => match chars.next_if(|&n| matches!(n, '\\' | '*' | '`')) {
++                Some(escaped) => cur.push(escaped),
++                None => cur.push('\\'),
++            },
++            '*' if style != MdStyle::Code && chars.peek() == Some(&'*') => {
+                 chars.next(); // second '*'
+                 push(&mut cur, style);
+                 style = if style == MdStyle::Bold { MdStyle::Plain } else { MdStyle::Bold };
+@@ -4681,4 +4739,107 @@ mod tests {
+         let (actions, _) = pump(&doc, None, cache, &mut r, inside, &moved);
+         assert!(actions.contains(&Action::HoverDismiss), "without a pending word the same move cancels");
+     }
++
++    /// F12 is goto-definition and F2 is rename.
++    #[test]
++    fn f12_and_f2_are_the_language_commands() {
++        assert_eq!(
++            interpret_key(&Key::Named(Named::F12), None, Modifiers::default()),
++            Some(Action::GotoDefinition),
++            "F12 goes to the definition"
++        );
++        assert_eq!(
++            interpret_key(&Key::Named(Named::F2), None, Modifiers::default()),
++            Some(Action::Rename),
++            "F2 renames"
++        );
++    }
++
++    /// Shift+Alt+F formats by physical key, whatever character the layout
++    /// makes of it, and never types that character.
++    #[test]
++    fn shift_alt_f_formats_by_physical_key() {
++        use iced::keyboard::key::{Code, Physical};
++        use iced::keyboard::Location;
++        let doc = Document::new("x\n").expect("doc fits");
++        let mut r = headless_renderer();
++        let press = iced::Event::Keyboard(Keyboard::KeyPressed {
++            key: Key::Character("Ï".into()),
++            modified_key: Key::Character("Ï".into()),
++            physical_key: Physical::Code(Code::KeyF),
++            location: Location::Standard,
++            modifiers: Modifiers::SHIFT | Modifiers::ALT,
++            text: Some("Ï".into()),
++            repeat: false,
++        });
++        let cache = iced_runtime::user_interface::Cache::new();
++        let (actions, _) = pump(&doc, None, cache, &mut r, Point::new(200.0, 5.0), &[press]);
++        assert!(actions.contains(&Action::Format), "Shift+Alt+F formats: {actions:?}");
++        assert!(!actions.iter().any(|a| matches!(a, Action::Type(_))), "the layout's character is not typed");
++    }
++
++    /// Rendering a different document in the same tree position starts the
++    /// view state over (and reveals once) while keeping the widget's focus;
++    /// the same document keeps it all.
++    #[test]
++    fn rendering_another_document_resets_the_view_state_and_reveals() {
++        use iced::advanced::widget::Tree;
++        let a = Document::new("one\n").expect("doc fits");
++        let mut b = Document::new(&"line\n".repeat(400)).expect("doc fits");
++        b.select_and_reveal(1000..1004);
++        let mut on_a = Editor::new(&a, |x: Action| x);
++        let mut tree = Tree::new(&on_a as &dyn Widget<Action, iced::Theme, iced::Renderer>);
++        {
++            let st = tree.state.downcast_mut::<State>();
++            st.scroll = ScrollAnchor::from_rows(120.0, 19.0);
++            st.hover_scroll = 38.0;
++            st.unfocus();
++        }
++        Widget::<Action, iced::Theme, iced::Renderer>::diff(&mut on_a, &mut tree);
++        assert_eq!(tree.state.downcast_ref::<State>().hover_scroll, 38.0, "the same document keeps its view state");
++        let mut on_b = Editor::new(&b, |x: Action| x);
++        Widget::<Action, iced::Theme, iced::Renderer>::diff(&mut on_b, &mut tree);
++        let st = tree.state.downcast_ref::<State>();
++        assert_eq!(st.scroll, ScrollAnchor::TOP, "a new document starts unscrolled");
++        assert_eq!(st.hover_scroll, 0.0, "hover state belongs to the old document");
++        assert!(st.autoscroll, "the new document is revealed once");
++        assert_eq!(st.last_reveal_seq, 0, "a document that revealed takes the jump path");
++        assert!(!st.is_focused(), "focus belongs to the widget and survives");
++        assert_eq!(st.doc, Some(b.doc_id()), "the state now describes the new document");
++    }
++
++    /// Escapes are literal characters in every style, and code never turns
++    /// bold.
++    #[test]
++    fn parse_md_runs_honors_escapes_and_literal_code() {
++        use MdStyle::*;
++        for (line, runs) in [
++            ("a \\*\\* b", vec![("a ** b", Plain)]),
++            ("\\`x\\`", vec![("`x`", Plain)]),
++            ("a\\\\b", vec![("a\\b", Plain)]),
++            ("\\q", vec![("\\q", Plain)]),
++            ("a\\", vec![("a\\", Plain)]),
++            ("`a**b`", vec![("a**b", Code)]),
++            ("`a\\`b`", vec![("a`b", Code)]),
++            ("**x** \\*", vec![("x", Bold), (" *", Plain)]),
++        ] {
++            let want: Vec<(String, MdStyle)> = runs.into_iter().map(|(t, s)| (t.to_string(), s)).collect();
++            assert_eq!(parse_md_runs(line), want, "{line:?}");
++        }
++    }
++
++    /// The parser inverts `escape_markdown`: escaped text renders exactly as
++    /// written, as plain text or inside a code span.
++    #[test]
++    fn escaped_text_renders_verbatim() {
++        use scrive_core::intel::hover::escape_markdown;
++        for raw in ["a*b", "**x**", "`c`", "a\\b", "\\*", "mixed * ` \\ **"] {
++            assert_eq!(parse_md_runs(&escape_markdown(raw)), vec![(raw.to_string(), MdStyle::Plain)], "{raw:?}");
++        }
++        assert_eq!(
++            parse_md_runs(&format!("`{}`", escape_markdown("a`b**c"))),
++            vec![("a`b**c".to_string(), MdStyle::Code)],
++            "an escaped code line stays one code run"
++        );
++    }
+ }

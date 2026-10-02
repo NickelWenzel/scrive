@@ -1,0 +1,179 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 2ef5028..c0e1fc7 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -26,6 +26,10 @@ jobs:
+       - name: Test workspace
+         run: cargo test --workspace
+ 
++      # The `lsp` feature's glue and its tests compile only with it.
++      - name: Test workspace (all features)
++        run: cargo test --workspace --all-features
++
+   wasm:
+     name: Wasm
+     runs-on: ubuntu-latest
+@@ -39,9 +43,10 @@ jobs:
+         with:
+           tool: wasmtime
+ 
+-      # The browser target: the library, its tests, and the examples must build.
++      # The browser target: the libraries (every feature), their tests, and the
++      # examples must build.
+       - name: Build for wasm32-unknown-unknown
+-        run: cargo build --workspace --all-targets --target wasm32-unknown-unknown
++        run: cargo build --workspace --all-targets --all-features --target wasm32-unknown-unknown
+ 
+       # The GUI-free core runs its unit tests as wasm (32-bit usize, no threads).
+       - name: Test scrive-core on wasm32-wasip1
+@@ -68,6 +73,10 @@ jobs:
+       - name: Clippy (no warnings)
+         run: cargo clippy --workspace --all-targets -- -D warnings
+ 
++      # The glue is `cfg(feature = "lsp")`: lint it too.
++      - name: Clippy, all features (no warnings)
++        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
++
+       # Missing docs and broken intra-doc links are denied at the crate level;
+       # this catches every other rustdoc warning.
+       - name: Docs build clean
+@@ -75,6 +84,13 @@ jobs:
+         env:
+           RUSTDOCFLAGS: -D warnings
+ 
++      # The default build above catches links to gated items from ungated docs;
++      # this one checks the gated docs themselves.
++      - name: Docs build clean (all features)
++        run: cargo doc --no-deps --workspace --all-features
++        env:
++          RUSTDOCFLAGS: -D warnings
++
+       # The headless crates must never pull a GUI crate into their normal
+       # dependency graph. `cargo tree` failing is itself a failure.
+       - name: Headless crates depend on no GUI crate
+diff --git a/Cargo.lock b/Cargo.lock
+index a28a96c..9885846 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2817,6 +2817,8 @@ dependencies = [
+  "iced_tiny_skia",
+  "png",
+  "scrive-core",
++ "scrive-lsp",
++ "serde_json",
+ ]
+ 
+ [[package]]
+diff --git a/crates/scrive-iced/Cargo.toml b/crates/scrive-iced/Cargo.toml
+index e5e4cd0..870cdc1 100644
+--- a/crates/scrive-iced/Cargo.toml
++++ b/crates/scrive-iced/Cargo.toml
+@@ -11,10 +11,19 @@ categories = ["gui", "text-editors"]
+ 
+ [dependencies]
+ scrive-core.workspace = true
++# The Language Server Protocol bridge behind the `lsp` feature, re-exported as
++# `scrive_iced::lsp` and driven by the `CodeEditor` glue.
++scrive-lsp = { workspace = true, optional = true }
+ # `advanced` unlocks the low-level `Widget` API (iced::advanced::*) the editor
+ # widget implements directly, rather than as a canvas::Program.
+ iced = { version = "0.15.0-dev", features = ["advanced"] }
+ 
++# Language-server support: re-exports scrive-lsp as `scrive_iced::lsp` and adds
++# the `CodeEditor` methods that drive a client. Off by default, so a host without
++# a language server compiles none of it.
++[features]
++lsp = ["dep:scrive-lsp"]
++
+ [dev-dependencies]
+ # Headless render-to-PNG for self-validation screenshots: construct a real
+ # `iced::Renderer` (fallback::Renderer::Secondary over tiny-skia) with no window
+@@ -25,6 +34,9 @@ iced_runtime = { version = "0.15.0-dev", default-features = false }
+ png = "0.17"
+ # Pure-Rust GIF encoder for the headless showcase recorder (record_showcase).
+ gif = "0.13"
++# JSON-RPC fixtures: the glue tests write server replies as JSON and read the
++# client's requests back as JSON.
++serde_json = "1"
+ 
+ # In the browser the examples need WebGL (for browsers without WebGPU) and an
+ # embedded UI font, since the web offers no system fonts.
+diff --git a/crates/scrive-iced/src/code_editor.rs b/crates/scrive-iced/src/code_editor.rs
+index a0dd62e..d375cf6 100644
+--- a/crates/scrive-iced/src/code_editor.rs
++++ b/crates/scrive-iced/src/code_editor.rs
+@@ -46,7 +46,7 @@ use scrive_core::{
+     Document, EditOp, FindQuery, FormatRequest, Hover,
+     HoverCx, HoverInfo, InsertText, Point, RenameRequest, Revision, Selection, SelectionId, SelectionSet, Severity,
+     SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, SyntaxDef, TabOutcome, Ticket,
+-    TokenTheme, LOOKBACK_LINES,
++    TokenTheme, TransactionError, LOOKBACK_LINES,
+ };
+ 
+ use crate::editor::{Action, Editor};
+@@ -522,14 +522,26 @@ impl CodeEditor {
+     /// Apply a programmatic batch of edits as one transaction, then run the
+     /// post-edit tail. The tail is why this exists instead of a raw `&mut
+     /// Document`: it keeps highlighting, find, and the intel controllers current.
++    /// A rejected batch is dropped silently; [`try_edit`](Self::try_edit) says why.
+     pub fn edit(&mut self, ops: Vec<EditOp>) {
++        let _ = self.try_edit(ops);
++    }
++
++    /// [`edit`](Self::edit), with a rejected batch returned instead of dropped.
++    /// A transaction is all-or-nothing, so nothing is applied on `Err`.
++    ///
++    /// # Errors
++    /// [`TransactionError::Overlap`] when two ops overlap in the pre-edit text,
++    /// and [`TransactionError::WouldOverflow`] when the result would grow past
++    /// the `u32` offset space.
++    pub fn try_edit(&mut self, ops: Vec<EditOp>) -> Result<(), TransactionError> {
+         let before = self.doc.revision();
+-        if self.doc.edit(ops).is_ok() {
+-            self.after_edit(CompletionEvent::CaretOrClose);
+-            if self.doc.revision() != before {
+-                self.dirty = true;
+-            }
++        self.doc.edit(ops)?;
++        self.after_edit(CompletionEvent::CaretOrClose);
++        if self.doc.revision() != before {
++            self.dirty = true;
+         }
++        Ok(())
+     }
+ 
+     /// Swap the whole buffer (load a new file), keeping the current grammar and
+@@ -2280,6 +2292,16 @@ mod tests {
+         assert!(ed.is_dirty());
+     }
+ 
++    /// `try_edit` reports an overlapping batch instead of dropping it, and applies nothing.
++    #[test]
++    fn try_edit_reports_an_overlapping_batch() {
++        let mut ed = CodeEditor::new("abcd\n");
++        let result = ed.try_edit(vec![EditOp::new(0..3, "x"), EditOp::new(1..4, "y")]);
++        assert!(matches!(result, Err(TransactionError::Overlap { .. })), "the overlap is reported");
++        assert_eq!(ed.document().text().into_owned(), "abcd\n", "nothing was applied");
++        assert!(!ed.is_dirty(), "a rejected batch doesn't dirty the document");
++    }
++
+     /// Async completions, end to end: with no sync provider, typing a word char
+     /// records a request; the host fulfills it and ingests the result, which opens
+     /// the popup; accepting inserts the item.
+diff --git a/crates/scrive-iced/src/lib.rs b/crates/scrive-iced/src/lib.rs
+index 7cd5f1e..c35daac 100644
+--- a/crates/scrive-iced/src/lib.rs
++++ b/crates/scrive-iced/src/lib.rs
+@@ -60,6 +60,12 @@ pub use code_editor::{CodeEditor, Event};
+ pub use editor::{default_autoscroll_margin, Action, Editor, SCROLLBAR_WIDTH};
+ pub use metrics::Metrics;
+ 
++/// The Language Server Protocol bridge, re-exported so a host names one crate:
++/// `scrive_iced::lsp::Client`, `scrive_iced::lsp::Message`, `scrive_iced::lsp::update`.
++/// Needs the `lsp` feature.
++#[cfg(feature = "lsp")]
++pub use scrive_lsp as lsp;
++
+ /// The bundled [Codicon](https://github.com/microsoft/vscode-codicons) icon font
+ /// (v0.0.45) — VS Code's own UI glyph set. The host application **must** load
+ /// these bytes into iced's font system at startup (e.g.

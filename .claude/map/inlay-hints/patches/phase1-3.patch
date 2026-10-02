@@ -1,0 +1,1881 @@
+diff --git a/crates/scrive-core/src/decorations.rs b/crates/scrive-core/src/decorations.rs
+index 47aaa43..2911c1d 100644
+--- a/crates/scrive-core/src/decorations.rs
++++ b/crates/scrive-core/src/decorations.rs
+@@ -30,6 +30,7 @@ use std::ops::Range;
+ use std::sync::Arc;
+ 
+ use crate::coords::Bias;
++use crate::intel::inlay;
+ use crate::patch::Patch;
+ use crate::sum_tree::{Dimension, Item, Summary, SumTree};
+ 
+@@ -142,16 +143,23 @@ pub enum DecorationKind {
+     },
+     /// The provenance region of an auto-inserted closing pair.
+     AutoClosePair,
++    /// An inlay hint, ranged over the token it annotates. Only a document's
++    /// inlay store holds this kind, and no public API hands one out. An
++    /// anchored hint goes with its token: when the token is deleted, or one
++    /// edit replaces all of it.
++    InlayHint(inlay::Anchor),
+ }
+ 
+ impl DecorationKind {
+     /// Post-commit policy for a range of this kind that has collapsed to empty:
+-    /// [`FindMatch`](Self::FindMatch) is re-queried so it drops; everything else
+-    /// keeps (the owner controls its lifetime).
++    /// [`FindMatch`](Self::FindMatch) is re-queried so it drops, and an
++    /// [`InlayHint`](Self::InlayHint) anchored to a token goes with the token;
++    /// everything else keeps (the owner controls its lifetime).
+     #[must_use]
+     pub fn empty_policy(&self) -> EmptyPolicy {
+         match self {
+             Self::FindMatch => EmptyPolicy::Drop,
++            Self::InlayHint(anchor) => anchor.empty_policy(),
+             _ => EmptyPolicy::Keep,
+         }
+     }
+@@ -378,14 +386,19 @@ fn decoitems_to_ranges(tree: &SumTree<DecoItem>, base: u32) -> Vec<TrackedRange>
+ /// Map every range's endpoints through `patch` with its stickiness bias, never
+ /// inverting (a collapse pins both ends to the mapped end — [`Patch::map_range`]'s
+ /// rule), and drop the ranges that collapsed to empty whose kind re-publishes
+-/// ([`EmptyPolicy::Drop`], i.e. find matches). Shared by the naive and windowed
+-/// movers so their per-range semantics are identical by construction.
++/// ([`EmptyPolicy::Drop`], i.e. find matches), and drop the inlay hints whose
++/// whole token one edit replaced. Shared by the naive and windowed movers so
++/// their per-range semantics are identical by construction.
+ fn remap_ranges(patch: &Patch, v: &mut Vec<TrackedRange>) {
+     let mut queries: Vec<(u32, Bias)> = Vec::with_capacity(v.len() * 2);
++    // Coverage is a question about the old text, so read it before the remap
++    // below overwrites the ranges.
++    let mut replaced: Vec<bool> = Vec::with_capacity(v.len());
+     for r in v.iter() {
+         let (bs, be) = r.stickiness.biases();
+         queries.push((r.range.start, bs));
+         queries.push((r.range.end, be));
++        replaced.push(rides_a_token(&r.kind) && replaces_whole(patch.edits(), &r.range));
+     }
+     let mut mapped: Vec<u32> = Vec::new();
+     patch.map_many(&queries, &mut mapped);
+@@ -393,12 +406,27 @@ fn remap_ranges(patch: &Patch, v: &mut Vec<TrackedRange>) {
+         let (ms, me) = (mapped[2 * i], mapped[2 * i + 1]);
+         r.range = ms.min(me)..me;
+     }
++    let mut replaced = replaced.into_iter();
+     v.retain(|r| {
++        let replaced = replaced.next().expect("one flag per range");
+         let collapsed = r.range.start == r.range.end;
+-        !(collapsed && matches!(r.kind.empty_policy(), EmptyPolicy::Drop))
++        !(replaced || (collapsed && matches!(r.kind.empty_policy(), EmptyPolicy::Drop)))
+     });
+ }
+ 
++/// Whether `kind` is an inlay hint anchored to a token.
++fn rides_a_token(kind: &DecorationKind) -> bool {
++    matches!(kind, DecorationKind::InlayHint(anchor) if anchor.is_anchored())
++}
++
++/// Whether one of `edits` (ascending, disjoint) replaces all of `range` with
++/// new text. Only the first edit whose old end reaches `range.end` can cover
++/// it: every later edit starts at or after that end.
++fn replaces_whole(edits: &[crate::patch::Edit], range: &Range<u32>) -> bool {
++    let k = edits.partition_point(|e| e.old.end < range.end);
++    edits.get(k).is_some_and(|e| e.old.start <= range.start && e.new.start < e.new.end)
++}
++
+ /// Re-anchor a split-off `zone_c` (decorations entirely after the edit) onto a
+ /// rebuilt head: its first item's start becomes `old_start + delta`, while every
+ /// later gap and length stays relative and unchanged — so the whole suffix shifts
+@@ -480,6 +508,10 @@ impl DecorationStore {
+         kind: DecorationKind,
+         stickiness: Stickiness,
+     ) -> DecorationId {
++        debug_assert!(
++            !matches!(kind, DecorationKind::InlayHint(_)),
++            "inlay hints enter a store only through `replace_all`",
++        );
+         let id = self.mint();
+         let mut v = self.to_vec();
+         v.push(TrackedRange { id, range, kind, stickiness });
+@@ -579,6 +611,25 @@ impl DecorationStore {
+         out.into_iter()
+     }
+ 
++    /// Every range touching `range`, borrowed, in ascending `(start, id)` order:
++    /// the allocation-free sibling of [`Self::decorations_in`] for per-row
++    /// render queries.
++    pub(crate) fn visit_in<'s>(&'s self, range: Range<u32>, mut f: impl FnMut(Range<u32>, &'s DecorationKind)) {
++        let (qs, qe) = (range.start, range.end);
++        self.tree.filter_visit::<StartDim, _, _>(
++            &|before: &StartDim, sum: &DecoSummary| before.0 <= qe && before.0 + sum.max_end >= qs,
++            &mut |it: &'s DecoItem, before: &StartDim| {
++                let start = before.0 + it.gap;
++                let end = start + it.len;
++                if start <= qe && end >= qs {
++                    crate::perf::charge(1);
++                    count_visit();
++                    f(start..end, &it.kind);
++                }
++            },
++        );
++    }
++
+     /// How many [`DecorationKind::FindMatch`] ranges the store holds — an O(1)
+     /// read of the root summary, not a whole-store walk.
+     #[must_use]
+@@ -631,6 +682,10 @@ impl DecorationStore {
+         kind: DecorationKind,
+         stickiness: Stickiness,
+     ) -> Vec<DecorationId> {
++        debug_assert!(
++            !matches!(kind, DecorationKind::InlayHint(_)),
++            "inlay hints enter a store only through `replace_all`",
++        );
+         if spans.is_empty() {
+             return Vec::new();
+         }
+@@ -749,6 +804,10 @@ impl DecorationStore {
+         kind: DecorationKind,
+         stickiness: Stickiness,
+     ) -> Vec<DecorationId> {
++        debug_assert!(
++            !matches!(kind, DecorationKind::InlayHint(_)),
++            "inlay hints enter a store only through `replace_all`",
++        );
+         let mut v = self.to_vec();
+         let mut ids = Vec::new();
+         for range in spans {
+@@ -885,6 +944,8 @@ impl DecorationStore {
+     /// interior, which makes it *touch* the edit — so it is in the middle. The store
+     /// never holds a collapsed Drop-kind range (it is never added empty and is
+     /// dropped on the edit that collapses it), so left/zone_c need no retain pass.
++    /// The same holds for an inlay hint whose whole token the edit replaces:
++    /// covering the token means touching the edit.
+     fn apply_single_edit(&mut self, patch: &Patch, edit: &crate::patch::Edit) {
+         let (os, oe) = (edit.old.start, edit.old.end);
+         let delta = (i64::from(edit.new.end) - i64::from(edit.new.start))
+@@ -964,6 +1025,21 @@ impl DecorationStore {
+         DiagnosticsOutcome::Applied { count }
+     }
+ 
++    /// Replace every range with `items`, minting ids in item order so that, at
++    /// one start, the items keep that order. One sort for the whole set.
++    pub(crate) fn replace_all(&mut self, items: impl IntoIterator<Item = (Range<u32>, DecorationKind, Stickiness)>) {
++        let v: Vec<TrackedRange> = items
++            .into_iter()
++            .map(|(range, kind, stickiness)| TrackedRange { id: self.mint(), range, kind, stickiness })
++            .collect();
++        self.set_sorted(v);
++    }
++
++    /// Remove every range. Ids already minted are never reused.
++    pub(crate) fn clear(&mut self) {
++        self.tree = SumTree::new();
++    }
++
+     /// Mint the next id and bump the monotonic counter.
+     fn mint(&mut self) -> DecorationId {
+         let id = DecorationId(self.next_id);
+@@ -1001,6 +1077,7 @@ impl DecorationStore {
+ mod tests {
+     use super::*;
+     use crate::coords::Bias::{Left, Right};
++    use crate::intel::inlay;
+     use crate::patch::Edit;
+ 
+     fn store() -> DecorationStore {
+@@ -1801,4 +1878,127 @@ mod tests {
+              the whole store instead of splicing the window band"
+         );
+     }
++
++    // ─── Inlay hints ────────────────────────────────────────────────────────
++
++    fn hint() -> Arc<inlay::Hint> {
++        let label = vec![inlay::Part::new("h", inlay::Link::None)];
++        Arc::new(inlay::Hint::new(inlay::Kind::Other, label, inlay::Key::new(0)).expect("visible"))
++    }
++
++    fn on_token(side: inlay::Side) -> DecorationKind {
++        DecorationKind::InlayHint(inlay::Anchor::token(hint(), side, 0))
++    }
++
++    fn at_point(side: inlay::Side) -> DecorationKind {
++        DecorationKind::InlayHint(inlay::Anchor::point(hint(), side, 0))
++    }
++
++    /// One `(range, kind, stickiness)` store item.
++    fn item(range: Range<u32>, kind: DecorationKind, stickiness: Stickiness) -> (Range<u32>, DecorationKind, Stickiness) {
++        (range, kind, stickiness)
++    }
++
++    /// A hint anchored to a token goes when the token collapses; a zero-width
++    /// fallback hint keeps.
++    #[test]
++    fn anchored_inlay_hints_drop_on_collapse_and_point_hints_keep() {
++        assert_eq!(on_token(inlay::Side::Suffix).empty_policy(), EmptyPolicy::Drop, "anchored drops");
++        assert_eq!(at_point(inlay::Side::Prefix).empty_policy(), EmptyPolicy::Keep, "a point keeps");
++    }
++
++    /// One edit replacing a whole anchor drops the hint even where its
++    /// stickiness would keep it; a partial replacement keeps it; the naive
++    /// (multi-edit) mover agrees.
++    #[test]
++    fn an_edit_replacing_a_whole_anchor_drops_the_hint_on_both_movers() {
++        let prefix = || {
++            let mut s = store();
++            s.replace_all([item(4..6, on_token(inlay::Side::Prefix), Stickiness::GrowsOnlyBefore)]);
++            s
++        };
++        let survives = |patch: Patch| {
++            let mut s = prefix();
++            s.apply_patch(&patch);
++            s.len() == 1
++        };
++        assert!(!survives(Patch::single(Edit { old: 4..6, new: 4..7 })), "exact replacement drops");
++        assert!(!survives(Patch::single(Edit { old: 3..7, new: 3..5 })), "a wider replacement drops");
++        assert!(survives(Patch::single(Edit { old: 5..6, new: 5..7 })), "a partial replacement keeps");
++        assert!(survives(Patch::single(Edit { old: 6..6, new: 6..8 })), "an insert at the end keeps");
++        let mut two = Patch::new();
++        two.push(Edit { old: 0..1, new: 0..1 });
++        two.push(Edit { old: 4..6, new: 4..7 });
++        assert!(!survives(two), "the multi-edit path drops it too");
++    }
++
++    /// The windowed single-edit mover equals the naive one with anchored and
++    /// zero-width inlay hints in the store, including edits that replace whole
++    /// anchors.
++    #[test]
++    fn windowed_apply_patch_equals_naive_with_inlay_hints() {
++        let mut next = xorshift(0x1A1A_7E57);
++        let kind_of = |t: u64| -> (DecorationKind, Stickiness) {
++            match t % 7 {
++                0 => (DecorationKind::FindMatch, Stickiness::NeverGrows),
++                1 => (DecorationKind::AutoClosePair, Stickiness::AlwaysGrows),
++                2 => (diag(Severity::Error), Stickiness::GrowsOnlyAfter),
++                3 => (on_token(inlay::Side::Suffix), Stickiness::GrowsOnlyAfter),
++                4 => (on_token(inlay::Side::Prefix), Stickiness::GrowsOnlyBefore),
++                5 => (at_point(inlay::Side::Suffix), Stickiness::GrowsOnlyAfter),
++                _ => (at_point(inlay::Side::Prefix), Stickiness::NeverGrows),
++            }
++        };
++        let proj = |s: &DecorationStore| -> Vec<(u64, u32, u32)> {
++            s.iter().map(|r| (r.id.0, r.range.start, r.range.end)).collect()
++        };
++        for trial in 0..4000u32 {
++            let n = next() % 40;
++            let mut items = Vec::new();
++            for _ in 0..n {
++                let a = (next() % 120) as u32;
++                let (kind, stick) = kind_of(next());
++                let len = match kind.empty_policy() {
++                    // The store never holds a collapsed Drop range.
++                    EmptyPolicy::Drop => 1 + (next() % 24) as u32,
++                    EmptyPolicy::Keep if matches!(kind, DecorationKind::InlayHint(_)) => 0,
++                    EmptyPolicy::Keep => (next() % 25) as u32,
++                };
++                items.push(item(a..a + len, kind, stick));
++            }
++            let (mut windowed, mut naive) = (store(), store());
++            windowed.replace_all(items.clone());
++            naive.replace_all(items);
++            let os = (next() % 120) as u32;
++            let oe = os + (next() % 15) as u32;
++            let ins = (next() % 15) as u32;
++            let patch = Patch::single(Edit { old: os..oe, new: os..os + ins });
++            windowed.apply_patch(&patch);
++            naive.apply_patch_naive(&patch);
++            assert_eq!(proj(&windowed), proj(&naive), "trial {trial}: edit {os}..{oe} → +{ins}");
++        }
++    }
++
++    /// Ids follow item order, so at one start the items keep their order.
++    #[test]
++    fn replace_all_mints_ids_in_item_order() {
++        let mut s = store();
++        s.replace_all([
++            item(9..9, DecorationKind::AutoClosePair, Stickiness::NeverGrows),
++            item(2..2, DecorationKind::AutoClosePair, Stickiness::NeverGrows),
++            item(2..2, DecorationKind::SnippetStop { index: 7 }, Stickiness::NeverGrows),
++        ]);
++        let order: Vec<(u32, u64)> = s.iter().map(|r| (r.range.start, r.id.0)).collect();
++        assert_eq!(order, vec![(2, 2), (2, 3), (9, 1)], "sorted by start, ties in item order");
++        s.clear();
++        assert!(s.is_empty(), "clear empties the store");
++    }
++
++    /// Hints never enter a store through the bulk producers.
++    #[cfg(debug_assertions)]
++    #[test]
++    #[should_panic(expected = "inlay hints enter a store only through")]
++    fn add_decoration_rejects_the_inlay_hint_kind() {
++        store().add_decoration(0..1, on_token(inlay::Side::Suffix), Stickiness::GrowsOnlyAfter);
++    }
+ }
+diff --git a/crates/scrive-core/src/document.rs b/crates/scrive-core/src/document.rs
+index 1b4d704..d738e66 100644
+--- a/crates/scrive-core/src/document.rs
++++ b/crates/scrive-core/src/document.rs
+@@ -27,6 +27,7 @@ use std::cell::{Ref, RefCell};
+ use crate::fold_map::{FoldMap, FoldSet};
+ use crate::highlight::{HighlightCache, HighlightEngine, HighlightSpan, SyntaxDef, TokenTheme};
+ use crate::history::{GroupingHint, History};
++use crate::intel::inlay;
+ use crate::movement::{self, ColumnDir, Granularity, Motion};
+ use crate::selection::{Selection, SelectionId, SelectionSet};
+ use crate::transaction::{apply, Committed, EditOp, TransactionError};
+@@ -64,6 +65,12 @@ pub struct Document {
+     /// still occupies, and emptiness is read straight off the store
+     /// (`!self.autoclose.is_empty()`).
+     autoclose: DecorationStore,
++    /// Inlay hints, in their own store so installing a set never re-sorts
++    /// diagnostics or find matches. Each range covers the token its hint
++    /// annotates, and rides every edit, undo and redo through the one mover.
++    inlays: DecorationStore,
++    /// The revision the inlay set was installed at; `None` when none is.
++    inlays_at: Option<Revision>,
+     /// Active code folds — **view state**, never on the buffer or the undo
+     /// stack. Rides the commit-path patch mover (see `rebase_views`) like a
+     /// decoration, so folds survive edits and undo/redo with no fold-specific
+@@ -313,6 +320,8 @@ impl Document {
+             brackets,
+             decorations: DecorationStore::new(),
+             autoclose: DecorationStore::new(),
++            inlays: DecorationStore::new(),
++            inlays_at: None,
+             folds: FoldSet::new(),
+             find: FindState::new(),
+             line_comment: None,
+@@ -1126,6 +1135,7 @@ impl Document {
+                     brackets: &mut self.brackets,
+                     decorations: &mut self.decorations,
+                     autoclose: &mut self.autoclose,
++                    inlays: &mut self.inlays,
+                     folds: &mut self.folds,
+                     find: &mut self.find,
+                 },
+@@ -1228,10 +1238,10 @@ impl Document {
+         let mut caret_home: Option<u32> = None;
+         let bracket_cfg = self.bracket_config();
+         let Self {
+-            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find,
+-            changes, ..
++            history, buffer, selections, highlight, brackets, decorations, autoclose, inlays, folds,
++            find, changes, ..
+         } = self;
+-        let mut views = Views { highlight, brackets, decorations, autoclose, folds, find };
++        let mut views = Views { highlight, brackets, decorations, autoclose, inlays, folds, find };
+         // Each step is its own commit (its own revision), so the log gets one
+         // entry per step, each recorded against the text the step applied to.
+         let mut before = changes.capture(buffer);
+@@ -1272,10 +1282,10 @@ impl Document {
+         let mut caret_home: Option<u32> = None;
+         let bracket_cfg = self.bracket_config();
+         let Self {
+-            history, buffer, selections, highlight, brackets, decorations, autoclose, folds, find,
+-            changes, ..
++            history, buffer, selections, highlight, brackets, decorations, autoclose, inlays, folds,
++            find, changes, ..
+         } = self;
+-        let mut views = Views { highlight, brackets, decorations, autoclose, folds, find };
++        let mut views = Views { highlight, brackets, decorations, autoclose, inlays, folds, find };
+         let mut before = changes.capture(buffer);
+         let redone = history.redo(buffer, selections, |committed, buffer| {
+             // The same one mover as `undo` (folds ride it, position + fold reveal).
+@@ -1985,6 +1995,91 @@ impl Document {
+         })
+     }
+ 
++    /// Install the inlay hints computed against `revision`, replacing the
++    /// previous set. When the document has moved past `revision` this returns
++    /// [`inlay::Outcome::Stale`] and changes nothing. Offsets are clipped to
++    /// the buffer. Each hint moves with the token it annotates from then on,
++    /// and goes when that token is deleted or replaced whole. The order of
++    /// `hints` is the render order among hints at one offset.
++    pub fn set_inlays(&mut self, revision: Revision, hints: Vec<inlay::Placed>) -> inlay::Outcome {
++        let current = self.buffer.revision();
++        if revision != current {
++            return inlay::Outcome::Stale { current };
++        }
++        let count = hints.len();
++        let anchored = inlay::Anchor::install(&self.buffer, hints);
++        self.inlays.replace_all(
++            anchored.into_iter().map(|(range, anchor, stickiness)| (range, DecorationKind::InlayHint(anchor), stickiness)),
++        );
++        self.inlays_at = Some(current);
++        inlay::Outcome::Applied { count }
++    }
++
++    /// Remove every inlay hint.
++    pub fn clear_inlays(&mut self) {
++        self.inlays.clear();
++        self.inlays_at = None;
++    }
++
++    /// The revision the current inlay set was installed at, or `None` when
++    /// there is none. While it differs from [`revision`](Self::revision) the
++    /// hints have moved with edits since their host computed them.
++    #[must_use]
++    pub fn inlays_revision(&self) -> Option<Revision> {
++        self.inlays_at
++    }
++
++    /// Remove the hint keyed `key` that renders at `offset`, and say whether
++    /// there was one. `offset` is exact only at the revision the caller read
++    /// it at.
++    pub fn remove_inlay(&mut self, key: inlay::Key, offset: u32) -> bool {
++        if self.inlays.is_empty() {
++            return false;
++        }
++        let row = self.buffer.offset_to_point(offset).row;
++        let row_start = self.buffer.point_to_offset(Point::new(row, 0));
++        let line = self.buffer.line(row);
++        let row_end = row_start + line.len() as u32;
++        // Keys are the host's and may repeat, so take at most one hint.
++        let mut found = false;
++        let taken = self.inlays.take_matching_in(offset..offset, |r| {
++            let hit = !found
++                && matches!(&r.kind, DecorationKind::InlayHint(anchor)
++                    if anchor.hint().key() == key
++                        && anchor.render_offset(r.range.clone(), row_start, row_end, &line) == Some(offset));
++            found |= hit;
++            hit
++        });
++        !taken.is_empty()
++    }
++
++    /// The inlay hints that render within `range` (touching counts), in render
++    /// order: by offset, and at one offset [`Prefix`](inlay::Side::Prefix)
++    /// hints before [`Suffix`](inlay::Side::Suffix) hints, each in install
++    /// order.
++    pub fn inlays_in(&self, range: Range<u32>) -> impl Iterator<Item = inlay::Shown> {
++        let mut shown = Vec::new();
++        if !self.inlays.is_empty() {
++            let len = self.buffer.len();
++            let first = self.buffer.offset_to_point(range.start.min(len)).row;
++            let last = self.buffer.offset_to_point(range.end.min(len)).row;
++            for row in first..=last {
++                let row_start = self.buffer.point_to_offset(Point::new(row, 0));
++                let line = self.buffer.line(row);
++                let row_end = row_start + line.len() as u32;
++                self.inlays.visit_in(row_start..row_end, |stored, kind| {
++                    let DecorationKind::InlayHint(anchor) = kind else { return };
++                    let Some(offset) = anchor.render_offset(stored, row_start, row_end, &line) else { return };
++                    if (range.start..=range.end).contains(&offset) {
++                        shown.push(anchor.shown(offset));
++                    }
++                });
++            }
++        }
++        shown.sort_by_key(inlay::Shown::render_order);
++        shown.into_iter()
++    }
++
+     /// Set (or clear with `None`) the find query, scanning synchronously.
+     /// Never scrolls and drops the active match; the app calls [`find_next`] after
+     /// if it wants reveal-as-you-type. `now_ms` is the injected clock. This is the
+@@ -2474,6 +2569,9 @@ struct Views<'a> {
+     /// beside `decorations` so a forward edit's pairs rebase for free (and undo/redo
+     /// inherit the move, though `reset_transient` empties it there first).
+     autoclose: &'a mut DecorationStore,
++    /// The inlay-hint store, a separate [`DecorationStore`] moved beside
++    /// `decorations`.
++    inlays: &'a mut DecorationStore,
+     folds: &'a mut FoldSet,
+     find: &'a mut FindState,
+ }
+@@ -2560,6 +2658,7 @@ fn rebase_views(
+     // is a no-op there — keeping it in the one mover means no edit path can ever
+     // leave a pair stranded at a stale offset.
+     views.autoclose.apply_patch(committed.patch());
++    views.inlays.apply_patch(committed.patch());
+     // The find repair rides the same commit hook, AFTER the store move (it needs
+     // post-patch positions) — the match set is re-verified in a window around
+     // each edit, so it is always current and undo/redo inherit the repair with no
+@@ -5971,4 +6070,309 @@ mod tests {
+         assert_eq!(healed.len(), 1, "logging resumes after the drain");
+         assert_chain(&healed, &d);
+     }
++
++    // ─── Inlay hints ────────────────────────────────────────────────────────
++
++    fn hint(kind: inlay::Kind, label: &str, key: u64) -> inlay::Hint {
++        inlay::Hint::new(kind, vec![inlay::Part::new(label, inlay::Link::None)], inlay::Key::new(key)).expect("a visible label")
++    }
++
++    fn type_hint(label: &str, key: u64) -> inlay::Hint {
++        hint(inlay::Kind::Type, label, key)
++    }
++
++    fn param_hint(label: &str, key: u64) -> inlay::Hint {
++        hint(inlay::Kind::Parameter, label, key).padding(inlay::Padding { left: false, right: true })
++    }
++
++    /// Install `hints` at the current revision.
++    fn install(d: &mut Document, hints: Vec<(u32, inlay::Hint)>) {
++        let count = hints.len();
++        let placed = hints.into_iter().map(|(offset, hint)| inlay::Placed::new(offset, hint)).collect();
++        let revision = d.revision();
++        assert_eq!(d.set_inlays(revision, placed), inlay::Outcome::Applied { count }, "a current set installs");
++    }
++
++    /// The text with every shown hint spliced in at its render offset,
++    /// padding as spaces: what a reader sees, minus colour.
++    fn with_hints(d: &Document) -> String {
++        let text = d.text().into_owned();
++        let (mut out, mut at) = (String::new(), 0);
++        for shown in d.inlays_in(0..d.buffer().len()) {
++            let offset = shown.offset() as usize;
++            out.push_str(&text[at..offset]);
++            at = offset;
++            let padding = shown.hint().padded();
++            out.push_str(if padding.left { " " } else { "" });
++            shown.hint().parts().iter().for_each(|part| out.push_str(part.text()));
++            out.push_str(if padding.right { " " } else { "" });
++        }
++        out.push_str(&text[at..]);
++        out
++    }
++
++    fn caret(d: &mut Document, offset: u32) {
++        d.set_selections(SelectionSet::new(offset));
++    }
++
++    fn select(d: &mut Document, range: Range<u32>) {
++        d.set_selections(SelectionSet::from_ranges(&[(range.start, range.end)], 0));
++    }
++
++    /// Typing at a suffix hint's offset extends the token it follows, so the
++    /// text lands before the hint.
++    #[test]
++    fn typing_at_a_suffix_hint_lands_before_it() {
++        let mut d = doc("let x = 1;");
++        install(&mut d, vec![(5, type_hint(": i32", 1))]);
++        assert_eq!(with_hints(&d), "let x: i32 = 1;");
++        caret(&mut d, 5);
++        d.type_char('y');
++        assert_eq!(with_hints(&d), "let xy: i32 = 1;", "typed text lands before a suffix hint");
++    }
++
++    /// Typing at a prefix hint's offset extends the token it precedes, so the
++    /// text lands after the hint.
++    #[test]
++    fn typing_at_a_prefix_hint_lands_after_it() {
++        let mut d = doc("foo(x)");
++        install(&mut d, vec![(4, param_hint("n:", 1))]);
++        assert_eq!(with_hints(&d), "foo(n: x)");
++        caret(&mut d, 4);
++        d.type_char('y');
++        assert_eq!(with_hints(&d), "foo(n: yx)", "typed text lands after a prefix hint");
++    }
++
++    /// Enter at the end of a hinted line grows the suffix range over the
++    /// newline and the indent, but the hint stays at the end of its line.
++    #[test]
++    fn enter_at_the_end_of_a_line_keeps_its_hint_on_that_line() {
++        let mut d = doc("    foo()");
++        install(&mut d, vec![(9, type_hint(": u8", 1))]);
++        caret(&mut d, 9);
++        d.enter();
++        assert_eq!(d.text(), "    foo()\n    ");
++        assert_eq!(with_hints(&d), "    foo(): u8\n    ", "the hint stays on its line, not right of the caret");
++    }
++
++    /// Enter typed before an argument carries its prefix hint to the
++    /// argument's new line, past the indent.
++    #[test]
++    fn enter_before_an_argument_moves_its_prefix_hint_to_the_first_non_blank() {
++        let mut d = doc("    foo(a)");
++        install(&mut d, vec![(8, param_hint("n:", 1))]);
++        caret(&mut d, 8);
++        d.enter();
++        let a = d.text().find('a').expect("the argument survives") as u32;
++        let shown: Vec<u32> = d.inlays_in(0..d.buffer().len()).map(|s| s.offset()).collect();
++        assert_eq!(shown, vec![a], "the hint renders before the argument, not before the indent");
++    }
++
++    /// Backspacing the last char of an annotated word shrinks the anchor; the
++    /// hint stays, so a typo fix doesn't make the line jump.
++    #[test]
++    fn backspace_inside_the_anchor_word_keeps_the_hint() {
++        let mut d = doc("let count = 1;");
++        install(&mut d, vec![(9, type_hint(": i32", 1))]);
++        caret(&mut d, 9);
++        d.backspace();
++        assert_eq!(with_hints(&d), "let coun: i32 = 1;", "the hint follows the shortened word");
++    }
++
++    /// Deleting the whole annotated token drops its hint, and undo brings the
++    /// text back without it.
++    #[test]
++    fn deleting_the_anchor_token_drops_the_hint_and_undo_does_not_restore_it() {
++        let mut d = doc("let x = 1;");
++        install(&mut d, vec![(5, type_hint(": i32", 1))]);
++        caret(&mut d, 5);
++        d.backspace();
++        assert_eq!(with_hints(&d), "let  = 1;", "the hint went with its token");
++        assert!(d.undo());
++        assert_eq!(with_hints(&d), "let x = 1;", "undo restores the text, not the hint");
++        assert!(d.redo());
++        assert_eq!(d.inlays_in(0..d.buffer().len()).count(), 0, "redo brings nothing back either");
++        assert_ne!(d.inlays_revision(), Some(d.revision()), "the set is no longer current");
++    }
++
++    /// A hint that survives an edit rides that edit's undo and redo.
++    #[test]
++    fn a_surviving_hint_rides_undo_and_redo() {
++        let mut d = doc("let x = 1;");
++        install(&mut d, vec![(5, type_hint(": i32", 1))]);
++        caret(&mut d, 5);
++        d.type_char('y');
++        assert!(d.undo());
++        assert_eq!(with_hints(&d), "let x: i32 = 1;", "undo moves the hint back");
++        assert!(d.redo());
++        assert_eq!(with_hints(&d), "let xy: i32 = 1;", "redo moves it forward again");
++    }
++
++    /// A suffix hint at a line start and a prefix hint at a line end have no
++    /// token beside them; they keep a zero-width anchor with the same typing
++    /// rule.
++    #[test]
++    fn hints_without_a_neighbour_on_their_line_keep_a_zero_width_anchor() {
++        let mut d = doc("ab\ncd");
++        install(&mut d, vec![(3, type_hint("S", 1)), (5, param_hint("P", 2))]);
++        assert_eq!(with_hints(&d), "ab\nScdP ");
++        caret(&mut d, 3);
++        d.type_char('x');
++        assert_eq!(with_hints(&d), "ab\nxScdP ", "text typed at a suffix point lands before it");
++        caret(&mut d, 6);
++        d.type_char('y');
++        assert_eq!(with_hints(&d), "ab\nxScdP y", "text typed at a prefix point lands after it");
++    }
++
++    /// A paste over a selection replaces whole tokens; the hints anchored to
++    /// them go, on either side.
++    #[test]
++    fn pasting_over_a_selection_drops_the_hints_anchored_there() {
++        let mut d = doc("foo(count, 1)");
++        install(&mut d, vec![(4, param_hint("n:", 1)), (9, type_hint(": i32", 2)), (11, param_hint("m:", 3))]);
++        select(&mut d, 4..9);
++        d.paste("total", false);
++        assert_eq!(with_hints(&d), "foo(total, m: 1)", "both hints on the replaced word go");
++    }
++
++    /// A host edit that replaces a whole line drops the hints on it and leaves
++    /// the other lines' hints alone.
++    #[test]
++    fn a_line_replacing_edit_drops_the_hints_on_that_line() {
++        let mut d = doc("foo(x)\nbar(y)\n");
++        install(&mut d, vec![(4, param_hint("a:", 1)), (11, param_hint("b:", 2))]);
++        d.edit(vec![EditOp::new(0..6, "foo(z)")]).unwrap();
++        assert_eq!(with_hints(&d), "foo(z)\nbar(b: y)\n", "only the replaced line loses its hint");
++    }
++
++    /// Retyping a selected word drops its hint whichever side the hint is on;
++    /// stickiness alone would keep the prefix one at an arbitrary byte.
++    #[test]
++    fn retyping_a_selected_word_drops_its_hint_on_either_side() {
++        let mut d = doc("let x = f(y);");
++        install(&mut d, vec![(5, type_hint(": i32", 1)), (10, param_hint("n:", 2))]);
++        select(&mut d, 4..5);
++        d.type_char('z');
++        select(&mut d, 10..11);
++        d.type_char('w');
++        assert_eq!(with_hints(&d), "let z = f(w);", "both retyped tokens lost their hints");
++    }
++
++    /// Alt+↓ replaces both swapped lines in one edit, so their hints drop
++    /// until the next fetch; a third line keeps its hint.
++    #[test]
++    fn moving_a_line_drops_the_hints_on_both_swapped_lines() {
++        let mut d = doc("a(x)\nb(y)\nc(z)\n");
++        install(&mut d, vec![(2, param_hint("p:", 1)), (7, param_hint("q:", 2)), (12, param_hint("r:", 3))]);
++        caret(&mut d, 0);
++        d.move_line(true);
++        assert_eq!(with_hints(&d), "b(y)\na(x)\nc(r: z)\n", "the swapped lines lost their hints");
++    }
++
++    /// `Other` hints left at `Auto` annotate the text the way rust-analyzer
++    /// means them: adjustments and binding modes the expression or pattern
++    /// after them, lifetimes, discriminants, drops and closing-brace labels
++    /// what comes before. Typing at the hint's offset shows the side.
++    #[test]
++    fn auto_placement_follows_the_text_around_the_hint() {
++        let other = |label: &str, left, right| {
++            hint(inlay::Kind::Other, label, 1).padding(inlay::Padding { left, right })
++        };
++        let cases = [
++            ("let r = &s;", 8, other("&*", false, false), "let r = &*X&s;"),
++            ("fn foo() {}", 6, other("<'0>", false, false), "fn fooX<'0>() {}"),
++            ("fn foo(s: &str) {}", 11, other("'0", false, true), "fn foo(s: &'0 Xstr) {}"),
++            ("enum E { A, B }", 10, other("= 0", true, false), "enum E { AX = 0, B }"),
++            ("{ w }\n", 5, other("drop(w)", true, false), "{ w }X drop(w)\n"),
++            ("let (x, y) = p;", 4, other("&", false, false), "let &X(x, y) = p;"),
++            ("let g = ||f;", 10, other("<fn-item-to-fn-pointer>", false, false), "let g = ||<fn-item-to-fn-pointer>Xf;"),
++            ("fn foo(s: &str) {}", 18, other("// fn foo", true, false), "fn foo(s: &str) {}X // fn foo"),
++        ];
++        for (text, at, h, typed) in cases {
++            let mut d = doc(text);
++            install(&mut d, vec![(at, h)]);
++            caret(&mut d, at);
++            d.type_char('X');
++            assert_eq!(with_hints(&d), typed, "{text} at {at}");
++        }
++    }
++
++    /// Hints at one fetch offset that want both sides all become suffixes in
++    /// server order, so typed text lands before the whole group (Zed's
++    /// `test_colocated_mixed_kind_hints_share_bias`).
++    #[test]
++    fn mixed_sides_at_one_offset_render_as_suffixes_in_server_order() {
++        let text = "fn f() {} fn main() { let c: fn() -> fn() = ||f; }";
++        let at = text.find("||f").expect("the closure") as u32 + 2;
++        let mut d = doc(text);
++        install(&mut d, vec![(at, type_hint(" -> fn()", 1)), (at, hint(inlay::Kind::Other, "<fn-item-to-fn-pointer>", 2))]);
++        assert_eq!(with_hints(&d), "fn f() {} fn main() { let c: fn() -> fn() = || -> fn()<fn-item-to-fn-pointer>f; }");
++        assert!(d.inlays_in(0..d.buffer().len()).all(|s| s.side() == inlay::Side::Suffix), "both are suffixes");
++        caret(&mut d, at);
++        d.type_char('X');
++        assert_eq!(
++            with_hints(&d),
++            "fn f() {} fn main() { let c: fn() -> fn() = ||X -> fn()<fn-item-to-fn-pointer>f; }",
++            "typed text lands before the whole group",
++        );
++    }
++
++    /// Unsorted answers render in offset order; hints at one offset render in
++    /// the order the server sent them, whatever their keys.
++    #[test]
++    fn hints_render_in_offset_order_and_in_server_order_at_one_offset() {
++        let mut d = doc("let x = 1;");
++        install(&mut d, vec![(9, type_hint("C", 7)), (5, type_hint("B", 9)), (5, type_hint("A", 3))]);
++        let keys: Vec<inlay::Key> = d.inlays_in(0..d.buffer().len()).map(|s| s.key()).collect();
++        assert_eq!(keys, vec![inlay::Key::new(9), inlay::Key::new(3), inlay::Key::new(7)], "offset, then server order");
++        assert_eq!(with_hints(&d), "let xBA = 1C;");
++    }
++
++    /// A set computed for an older revision is refused and leaves the current
++    /// set in place.
++    #[test]
++    fn a_stale_hint_set_is_refused_and_changes_nothing() {
++        let mut d = doc("let x = 1;");
++        install(&mut d, vec![(5, type_hint(": i32", 1))]);
++        let installed = d.revision();
++        d.edit(vec![EditOp::insert(10, "\n")]).unwrap();
++        let stale = d.set_inlays(installed, vec![inlay::Placed::new(5, type_hint(": u8", 2))]);
++        assert_eq!(stale, inlay::Outcome::Stale { current: d.revision() }, "an old revision is refused");
++        assert_eq!(with_hints(&d), "let x: i32 = 1;\n", "the installed set is untouched");
++        assert_eq!(d.inlays_revision(), Some(installed), "the set keeps its install revision");
++    }
++
++    /// Clearing empties the set and forgets the revision it was installed at.
++    #[test]
++    fn clear_inlays_empties_the_set_and_forgets_its_revision() {
++        let mut d = doc("let x = 1;");
++        install(&mut d, vec![(5, type_hint(": i32", 1))]);
++        assert_eq!(d.inlays_revision(), Some(d.revision()), "the set is current once installed");
++        d.clear_inlays();
++        assert_eq!(d.inlays_in(0..d.buffer().len()).count(), 0, "no hints left");
++        assert_eq!(d.inlays_revision(), None, "no install revision either");
++    }
++
++    /// `remove_inlay` takes the one keyed hint at its render offset and
++    /// nothing else.
++    #[test]
++    fn remove_inlay_takes_only_the_keyed_hint_at_its_render_offset() {
++        let mut d = doc("let x = 1;");
++        install(&mut d, vec![(5, type_hint("A", 1)), (5, type_hint("B", 2))]);
++        assert!(!d.remove_inlay(inlay::Key::new(1), 4), "a wrong offset removes nothing");
++        assert!(!d.remove_inlay(inlay::Key::new(3), 5), "an unknown key removes nothing");
++        assert!(d.remove_inlay(inlay::Key::new(1), 5), "the keyed hint goes");
++        assert_eq!(with_hints(&d), "let xB = 1;", "its neighbour stays");
++        assert!(!d.remove_inlay(inlay::Key::new(1), 5), "and it is gone for good");
++    }
++
++    /// Offsets past the end or inside a char are clipped before anchoring.
++    #[test]
++    fn installed_hint_offsets_are_clipped_to_the_buffer() {
++        let mut d = doc("aé");
++        install(&mut d, vec![(99, type_hint("E", 1)), (2, type_hint("M", 2))]);
++        let offsets: Vec<u32> = d.inlays_in(0..u32::MAX).map(|s| s.offset()).collect();
++        assert_eq!(offsets, vec![1, 3], "mid-char snaps left, past-the-end clamps");
++    }
+ }
++
+diff --git a/crates/scrive-core/src/intel.rs b/crates/scrive-core/src/intel.rs
+index dc7d012..9090cf1 100644
+--- a/crates/scrive-core/src/intel.rs
++++ b/crates/scrive-core/src/intel.rs
+@@ -1,5 +1,5 @@
+-//! Language services — completion, signature help, hover, and the
+-//! goto-definition, rename and format commands.
++//! Language services — completion, signature help, hover, inlay hints, and
++//! the goto-definition, rename and format commands.
+ //!
+ //! Each service has two ways in. A **provider** is one small trait defined
+ //! here and satisfied by the app (not a god-trait with no-op defaults): the
+@@ -18,6 +18,7 @@ pub mod completion;
+ pub mod definition;
+ pub mod format;
+ pub mod hover;
++pub mod inlay;
+ pub mod providers;
+ pub mod rename;
+ pub mod signature;
+diff --git a/crates/scrive-core/src/intel/inlay.rs b/crates/scrive-core/src/intel/inlay.rs
+new file mode 100644
+index 0000000..3d1dafb
+--- /dev/null
++++ b/crates/scrive-core/src/intel/inlay.rs
+@@ -0,0 +1,764 @@
++//! Inlay hints: short labels a language service places between buffer
++//! characters, such as `: i32` after a binding or `name:` before an argument.
++//! They are not buffer text. A host builds [`Hint`]s, pairs each with the
++//! offset it was computed for ([`Placed`]), and installs the set with
++//! [`Document::set_inlays`](crate::Document::set_inlays). From then on the
++//! document moves every hint with the token it annotates.
++//!
++//! The model holds only what layout and gestures need. Tooltips, locations and
++//! edits stay with the host, which finds them again by [`Key`].
++
++pub mod interaction;
++pub mod request;
++
++pub use interaction::Interaction;
++pub use request::Request;
++
++use std::collections::{HashMap, HashSet};
++use std::ops::Range;
++use std::sync::Arc;
++
++use crate::buffer::{Buffer, Revision};
++use crate::coords::Bias;
++use crate::decorations::{EmptyPolicy, Stickiness};
++use crate::movement::is_word_char;
++
++/// What a hint annotates, which decides the neighbour it sticks to.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Kind {
++    /// A type annotation, following the token before it (`x: i32`).
++    Type,
++    /// A parameter name, preceding the argument after it (`n: 5`).
++    Parameter,
++    /// Anything else: the host's placement, and failing that the text
++    /// around it, decide its side.
++    Other,
++}
++
++/// Which neighbour a hint annotates, before the document has seen the text.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Placement {
++    /// The token ending at the hint's offset.
++    Suffix,
++    /// The token starting at the hint's offset.
++    Prefix,
++    /// Decided against the text at install: [`Side::Suffix`] after a word
++    /// character, or before whitespace, a line end or one of `) ] } , ; .`;
++    /// else [`Side::Prefix`].
++    Auto,
++}
++
++/// Which neighbour an installed hint annotates. Text typed at a
++/// [`Suffix`](Self::Suffix) hint's offset lands before it; at a
++/// [`Prefix`](Self::Prefix) hint's offset, after it.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Side {
++    /// Annotates the token ending at its offset.
++    Suffix,
++    /// Annotates the token starting at its offset.
++    Prefix,
++}
++
++/// Blank cells on either side of a label. Padding is editor background, not
++/// part of the label.
++#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
++pub struct Padding {
++    /// One blank cell before the label.
++    pub left: bool,
++    /// One blank cell after the label.
++    pub right: bool,
++}
++
++/// Whether a label part leads somewhere when activated.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Link {
++    /// The host holds a location for this part.
++    Jumps,
++    /// The part is plain text.
++    None,
++}
++
++/// Whether the host can turn a hint into buffer text.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Insert {
++    /// The host holds edits that insert this hint.
++    Available,
++    /// The hint is display-only.
++    Unavailable,
++}
++
++/// A hint's identity, minted by the host and opaque to the core. The host
++/// finds a hint's tooltip, locations and edits again by its key.
++#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
++pub struct Key(u64);
++
++/// One piece of a hint's label. Its text never holds a control character.
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub struct Part {
++    text: String,
++    link: Link,
++}
++
++/// One inlay hint: what it annotates, its label, and its key. Immutable once
++/// installed.
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub struct Hint {
++    kind: Kind,
++    placement: Placement,
++    label: Vec<Part>,
++    padding: Padding,
++    key: Key,
++    insert: Insert,
++    width: u32,
++}
++
++/// A hint paired with the byte offset it was computed for. This is what a host
++/// hands to [`Document::set_inlays`](crate::Document::set_inlays).
++#[derive(Clone, Debug)]
++pub struct Placed {
++    offset: u32,
++    hint: Hint,
++}
++
++/// An installed hint's place in the document's inlay store: the hint, the
++/// side it annotates, and its position in the set it arrived in. Only the
++/// store creates one, and none ever leaves it.
++#[derive(Clone, Debug)]
++pub struct Anchor {
++    hint: Arc<Hint>,
++    side: Side,
++    anchored: bool,
++    index: u32,
++}
++
++/// One hint as it renders: where, on which side of that offset, and what.
++#[derive(Clone, Debug)]
++pub struct Shown {
++    offset: u32,
++    side: Side,
++    index: u32,
++    hint: Arc<Hint>,
++}
++
++/// The result of installing a hint set.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Outcome {
++    /// The set was current and replaced the previous one.
++    Applied {
++        /// How many hints were installed.
++        count: usize,
++    },
++    /// The set was computed for another revision; nothing changed.
++    Stale {
++        /// The document's revision when the set was refused.
++        current: Revision,
++    },
++}
++
++/// Why a hint could not be built.
++#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
++pub enum Error {
++    /// Every part of the label is empty or whitespace.
++    #[error("an inlay hint label needs visible text")]
++    EmptyLabel,
++}
++
++impl Key {
++    /// The key with the host's raw identity `raw`.
++    #[must_use]
++    pub fn new(raw: u64) -> Self {
++        Self(raw)
++    }
++}
++
++impl Part {
++    /// A label part. Control characters in `text` (tabs and newlines included)
++    /// become spaces, so every char occupies exactly one cell.
++    #[must_use]
++    pub fn new(text: impl Into<String>, link: Link) -> Self {
++        let text = text
++            .into()
++            .chars()
++            .map(|c| if c.is_control() { ' ' } else { c })
++            .collect();
++        Self { text, link }
++    }
++
++    /// The part's text.
++    #[must_use]
++    pub fn text(&self) -> &str {
++        &self.text
++    }
++
++    /// Whether the part leads somewhere.
++    #[must_use]
++    pub fn link(&self) -> Link {
++        self.link
++    }
++}
++
++impl Hint {
++    /// A hint of `kind` labelled `label`, unpadded and display-only.
++    ///
++    /// # Errors
++    ///
++    /// [`Error::EmptyLabel`] when no part has visible text.
++    pub fn new(kind: Kind, label: Vec<Part>, key: Key) -> Result<Self, Error> {
++        if label.iter().all(|part| part.text.trim().is_empty()) {
++            return Err(Error::EmptyLabel);
++        }
++        let padding = Padding::default();
++        Ok(Self {
++            kind,
++            placement: default_placement(kind),
++            width: width(&label, padding),
++            label,
++            padding,
++            key,
++            insert: Insert::Unavailable,
++        })
++    }
++
++    /// The same hint with `padding`, which counts towards the width.
++    #[must_use]
++    pub fn padding(mut self, padding: Padding) -> Self {
++        self.padding = padding;
++        self.width = width(&self.label, padding);
++        self
++    }
++
++    /// The same hint with `insert`.
++    #[must_use]
++    pub fn insert(mut self, insert: Insert) -> Self {
++        self.insert = insert;
++        self
++    }
++
++    /// The same hint, annotating the neighbour `placement` names instead of
++    /// the one its kind implies.
++    #[must_use]
++    pub fn placement(mut self, placement: Placement) -> Self {
++        self.placement = placement;
++        self
++    }
++
++    /// What the hint annotates.
++    #[must_use]
++    pub fn kind(&self) -> Kind {
++        self.kind
++    }
++
++    /// The label's parts, in display order.
++    #[must_use]
++    pub fn parts(&self) -> &[Part] {
++        &self.label
++    }
++
++    /// The blank cells around the label.
++    #[must_use]
++    pub fn padded(&self) -> Padding {
++        self.padding
++    }
++
++    /// The host's key for this hint.
++    #[must_use]
++    pub fn key(&self) -> Key {
++        self.key
++    }
++
++    /// Whether the host can insert this hint as text.
++    #[must_use]
++    pub fn insertable(&self) -> bool {
++        self.insert == Insert::Available
++    }
++
++    /// Cells the hint occupies: its padding plus one cell per char of its
++    /// label.
++    #[must_use]
++    pub fn width(&self) -> u32 {
++        self.width
++    }
++}
++
++impl Placed {
++    /// `hint`, computed for byte `offset` of the revision it will be
++    /// installed at.
++    #[must_use]
++    pub fn new(offset: u32, hint: Hint) -> Self {
++        Self { offset, hint }
++    }
++
++    /// The offset the hint was computed for.
++    #[must_use]
++    pub fn offset(&self) -> u32 {
++        self.offset
++    }
++
++    /// The hint.
++    #[must_use]
++    pub fn hint(&self) -> &Hint {
++        &self.hint
++    }
++
++    pub(crate) fn into_parts(self) -> (u32, Hint) {
++        (self.offset, self.hint)
++    }
++}
++
++impl Anchor {
++    /// Anchor every hint in `placed` to the token it annotates in `buffer`:
++    /// each hint's range, anchor and stickiness for the inlay store, in
++    /// `placed` order.
++    pub(crate) fn install(
++        buffer: &Buffer,
++        placed: Vec<Placed>,
++    ) -> Vec<(Range<u32>, Self, Stickiness)> {
++        let wanted: Vec<(u32, Side, Hint)> = placed
++            .into_iter()
++            .map(|placed| {
++                let (offset, hint) = placed.into_parts();
++                let offset = buffer.clip_offset(offset, Bias::Left);
++                let side = match hint.placement {
++                    Placement::Suffix => Side::Suffix,
++                    Placement::Prefix => Side::Prefix,
++                    Placement::Auto => auto_side(buffer, offset),
++                };
++                (offset, side, hint)
++            })
++            .collect();
++        let mixed = mixed_offsets(&wanted);
++        wanted
++            .into_iter()
++            .enumerate()
++            .map(|(index, (offset, side, hint))| {
++                // The LSP spec shows hints at one position in response order,
++                // and only a shared side keeps that order next to the caret.
++                let side = if mixed.contains(&offset) {
++                    Side::Suffix
++                } else {
++                    side
++                };
++                place(buffer, offset, side, Arc::new(hint), index as u32)
++            })
++            .collect()
++    }
++
++    /// An anchor whose range covers the token its hint annotates.
++    pub(crate) fn token(hint: Arc<Hint>, side: Side, index: u32) -> Self {
++        Self {
++            hint,
++            side,
++            anchored: true,
++            index,
++        }
++    }
++
++    /// A zero-width anchor, for a hint with no token beside it on its line.
++    pub(crate) fn point(hint: Arc<Hint>, side: Side, index: u32) -> Self {
++        Self {
++            hint,
++            side,
++            anchored: false,
++            index,
++        }
++    }
++
++    pub(crate) fn hint(&self) -> &Hint {
++        &self.hint
++    }
++
++    pub(crate) fn is_anchored(&self) -> bool {
++        self.anchored
++    }
++
++    /// A hint anchored to a token goes with it; a zero-width one stays until
++    /// the next set replaces it.
++    pub(crate) fn empty_policy(&self) -> EmptyPolicy {
++        if self.anchored {
++            EmptyPolicy::Drop
++        } else {
++            EmptyPolicy::Keep
++        }
++    }
++
++    /// Where the hint renders on the row spanning bytes `row_start..=row_end`
++    /// with text `line` (no newline), given its stored `range`, or `None`
++    /// when it renders on another row. A suffix renders on the row holding
++    /// its range start, a prefix on the row holding its range end, so each
++    /// hint renders on exactly one row.
++    pub(crate) fn render_offset(
++        &self,
++        range: Range<u32>,
++        row_start: u32,
++        row_end: u32,
++        line: &str,
++    ) -> Option<u32> {
++        debug_assert_eq!(
++            row_end - row_start,
++            line.len() as u32,
++            "the row's bounds are its line's"
++        );
++        let on_row = |offset: u32| (row_start..=row_end).contains(&offset);
++        match self.side {
++            Side::Suffix => on_row(range.start).then(|| range.end.min(row_end)),
++            Side::Prefix => on_row(range.end).then(|| {
++                let first_non_blank = row_end - line.trim_start().len() as u32;
++                range.start.max(range.end.min(first_non_blank))
++            }),
++        }
++    }
++
++    /// This hint as rendered at `offset`.
++    pub(crate) fn shown(&self, offset: u32) -> Shown {
++        Shown {
++            offset,
++            side: self.side,
++            index: self.index,
++            hint: Arc::clone(&self.hint),
++        }
++    }
++}
++
++impl Shown {
++    /// The hint's key.
++    #[must_use]
++    pub fn key(&self) -> Key {
++        self.hint.key
++    }
++
++    /// The byte offset the hint renders at.
++    #[must_use]
++    pub fn offset(&self) -> u32 {
++        self.offset
++    }
++
++    /// Which side of [`offset`](Self::offset) the hint annotates.
++    #[must_use]
++    pub fn side(&self) -> Side {
++        self.side
++    }
++
++    /// The hint.
++    #[must_use]
++    pub fn hint(&self) -> &Hint {
++        &self.hint
++    }
++
++    /// Render order: by offset; at one offset prefixes before suffixes, each
++    /// in the order the set arrived in.
++    pub(crate) fn render_order(&self) -> (u32, bool, u32) {
++        (self.offset, self.side == Side::Suffix, self.index)
++    }
++}
++
++fn width(label: &[Part], padding: Padding) -> u32 {
++    let text: u32 = label
++        .iter()
++        .map(|part| part.text.chars().count() as u32)
++        .sum();
++    u32::from(padding.left) + text + u32::from(padding.right)
++}
++
++/// The neighbour a hint of `kind` annotates unless its host says otherwise.
++fn default_placement(kind: Kind) -> Placement {
++    match kind {
++        Kind::Type => Placement::Suffix,
++        Kind::Parameter => Placement::Prefix,
++        Kind::Other => Placement::Auto,
++    }
++}
++
++/// `Auto`'s rule: a suffix after a word or before a closer, separator or line
++/// end; else a prefix. Measured against every hint kind rust-analyzer emits:
++/// an adjustment such as `&*` before `&`, `*`, `(`, `"`, `[` or `|` annotates
++/// the expression after it.
++fn auto_side(buffer: &Buffer, offset: u32) -> Side {
++    let word_before = buffer.char_before(offset).is_some_and(is_word_char);
++    let closes = buffer
++        .char_at(offset)
++        .is_none_or(|c| c.is_whitespace() || matches!(c, ')' | ']' | '}' | ',' | ';' | '.'));
++    if word_before || closes {
++        Side::Suffix
++    } else {
++        Side::Prefix
++    }
++}
++
++/// The fetch offsets where hints want both sides.
++fn mixed_offsets(wanted: &[(u32, Side, Hint)]) -> HashSet<u32> {
++    let mut first: HashMap<u32, Side> = HashMap::new();
++    let mut mixed = HashSet::new();
++    for &(offset, side, _) in wanted {
++        if *first.entry(offset).or_insert(side) != side {
++            mixed.insert(offset);
++        }
++    }
++    mixed
++}
++
++fn place(
++    buffer: &Buffer,
++    offset: u32,
++    side: Side,
++    hint: Arc<Hint>,
++    index: u32,
++) -> (Range<u32>, Anchor, Stickiness) {
++    match side {
++        Side::Suffix => match token_ending_at(buffer, offset) {
++            Some(start) => (
++                start..offset,
++                Anchor::token(hint, side, index),
++                Stickiness::GrowsOnlyAfter,
++            ),
++            None => (
++                offset..offset,
++                Anchor::point(hint, side, index),
++                Stickiness::GrowsOnlyAfter,
++            ),
++        },
++        Side::Prefix => match token_starting_at(buffer, offset) {
++            Some(end) => (
++                offset..end,
++                Anchor::token(hint, side, index),
++                Stickiness::GrowsOnlyBefore,
++            ),
++            None => (
++                offset..offset,
++                Anchor::point(hint, side, index),
++                Stickiness::NeverGrows,
++            ),
++        },
++    }
++}
++
++/// Where the token ending at `offset` starts: the word there, else the one
++/// char before it. `None` at a line or document start.
++fn token_ending_at(buffer: &Buffer, offset: u32) -> Option<u32> {
++    let mut start = offset;
++    while let Some(c) = buffer.char_before(start).filter(|&c| is_word_char(c)) {
++        start -= c.len_utf8() as u32;
++    }
++    if start < offset {
++        return Some(start);
++    }
++    buffer
++        .char_before(offset)
++        .filter(|&c| c != '\n')
++        .map(|c| offset - c.len_utf8() as u32)
++}
++
++/// Where the token starting at `offset` ends: the word there, else the one
++/// char after it. `None` at a line or document end.
++fn token_starting_at(buffer: &Buffer, offset: u32) -> Option<u32> {
++    let mut end = offset;
++    while let Some(c) = buffer.char_at(end).filter(|&c| is_word_char(c)) {
++        end += c.len_utf8() as u32;
++    }
++    if end > offset {
++        return Some(end);
++    }
++    buffer
++        .char_at(offset)
++        .filter(|&c| c != '\n')
++        .map(|c| offset + c.len_utf8() as u32)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn label(text: &str) -> Vec<Part> {
++        vec![Part::new(text, Link::None)]
++    }
++
++    /// A tab or newline in a label would break the one-cell-per-char grid,
++    /// so every control character becomes a space.
++    #[test]
++    fn control_characters_in_a_label_become_spaces() {
++        assert_eq!(
++            Part::new("a\tb\nc\u{7}", Link::None).text(),
++            "a b c ",
++            "control chars are spaces"
++        );
++    }
++
++    /// An installed hint always has visible text, so it always has width.
++    #[test]
++    fn a_label_without_visible_text_is_rejected() {
++        for parts in [
++            vec![],
++            label(""),
++            label(" \t"),
++            vec![Part::new("", Link::None), Part::new("\n", Link::None)],
++        ] {
++            assert_eq!(
++                Hint::new(Kind::Type, parts, Key::new(1)),
++                Err(Error::EmptyLabel),
++                "no visible text"
++            );
++        }
++        let kept = Hint::new(
++            Kind::Type,
++            vec![Part::new("", Link::None), Part::new("x", Link::None)],
++            Key::new(1),
++        )
++        .expect("one visible part is enough");
++        assert_eq!(kept.parts().len(), 2, "empty parts keep their index");
++    }
++
++    /// Width is padding plus one cell per scalar value, whatever its byte length.
++    #[test]
++    fn width_counts_padding_and_scalar_values() {
++        let hint = Hint::new(
++            Kind::Other,
++            vec![Part::new("ab", Link::None), Part::new("é😀", Link::Jumps)],
++            Key::new(1),
++        )
++        .expect("visible");
++        assert_eq!(hint.width(), 4, "two parts, four chars");
++        assert_eq!(
++            hint.padding(Padding {
++                left: true,
++                right: true
++            })
++            .width(),
++            6,
++            "padding adds a cell each side"
++        );
++    }
++
++    /// A suffix renders at its range end, clamped to the row its range starts
++    /// on; a prefix at the first non-blank of the row its range ends on; and
++    /// neither renders on any other row.
++    #[test]
++    fn render_offset_clamps_each_side_to_its_own_row() {
++        let hint = || Arc::new(Hint::new(Kind::Other, label("h"), Key::new(1)).expect("visible"));
++        // "    foo()\n    " after Enter at the end of row 0: the suffix range grew over the newline.
++        let suffix = Anchor::token(hint(), Side::Suffix, 0);
++        assert_eq!(
++            suffix.render_offset(8..14, 0, 9, "    foo()"),
++            Some(9),
++            "clamped to the end of its start row"
++        );
++        assert_eq!(
++            suffix.render_offset(8..14, 10, 14, "    "),
++            None,
++            "not on the row its range ends on"
++        );
++        // "    foo(\n    a)" after Enter before `a`: the prefix range starts on row 0.
++        let prefix = Anchor::token(hint(), Side::Prefix, 0);
++        assert_eq!(
++            prefix.render_offset(8..14, 9, 15, "    a)"),
++            Some(13),
++            "at the first non-blank of its end row"
++        );
++        assert_eq!(
++            prefix.render_offset(8..14, 0, 8, "    foo("),
++            None,
++            "not on the row its range starts on"
++        );
++        assert_eq!(
++            prefix.render_offset(8..9, 0, 10, "    foo(a)"),
++            Some(8),
++            "on one row it renders at its start"
++        );
++        let point = Anchor::point(hint(), Side::Prefix, 0);
++        assert_eq!(
++            point.render_offset(4..4, 0, 4, "foo("),
++            Some(4),
++            "a point renders where it sits"
++        );
++    }
++
++    /// Type and parameter hints default to their fixed sides and other hints
++    /// to `Auto`; padding never changes that, and `.placement` overrides it.
++    #[test]
++    fn placement_defaults_from_the_kind_and_can_be_overridden() {
++        let hint = |kind| Hint::new(kind, label("h"), Key::new(1)).expect("visible");
++        assert_eq!(
++            hint(Kind::Type).placement,
++            Placement::Suffix,
++            "type hints follow their token"
++        );
++        assert_eq!(
++            hint(Kind::Parameter).placement,
++            Placement::Prefix,
++            "parameter hints precede theirs"
++        );
++        assert_eq!(
++            hint(Kind::Other).placement,
++            Placement::Auto,
++            "other hints wait for the text"
++        );
++        let padded = hint(Kind::Other).padding(Padding {
++            left: false,
++            right: true,
++        });
++        assert_eq!(
++            padded.placement,
++            Placement::Auto,
++            "padding is the host's to read, not core's"
++        );
++        let placed = hint(Kind::Other).placement(Placement::Prefix);
++        assert_eq!(
++            placed.placement,
++            Placement::Prefix,
++            "the host's placement wins"
++        );
++    }
++
++    /// `Auto` resolves against the text at the hint's offset, as measured on
++    /// rust-analyzer's adjustment, lifetime, discriminant and drop hints.
++    #[test]
++    fn auto_side_reads_the_neighbouring_chars() {
++        let cases = [
++            (
++                "let r = &s;",
++                8,
++                Side::Prefix,
++                "`&*` before `&s` annotates the expression after",
++            ),
++            (
++                "fn foo() {}",
++                6,
++                Side::Suffix,
++                "`<'0>` after `foo` annotates the name",
++            ),
++            (
++                "enum E { A, B }",
++                10,
++                Side::Suffix,
++                "`= 0` after `A` annotates the variant",
++            ),
++            (
++                "{ w }\n",
++                5,
++                Side::Suffix,
++                "a drop hint at `}` before a line end annotates the block",
++            ),
++            (
++                "let (x, y) = p;",
++                4,
++                Side::Prefix,
++                "a binding-mode `&` before `(` annotates the pattern",
++            ),
++            (
++                "let g = ||f;",
++                10,
++                Side::Prefix,
++                "an adjustment after `||` annotates `f`",
++            ),
++            ("x.y", 1, Side::Suffix, "before `.` annotates what precedes"),
++            (
++                "a",
++                1,
++                Side::Suffix,
++                "the buffer end annotates what precedes",
++            ),
++        ];
++        for (text, at, side, why) in cases {
++            let buffer = Buffer::new(text).expect("plain text loads");
++            assert_eq!(auto_side(&buffer, at), side, "{why}");
++        }
++    }
++}
+diff --git a/crates/scrive-core/src/intel/inlay/interaction.rs b/crates/scrive-core/src/intel/inlay/interaction.rs
+new file mode 100644
+index 0000000..84897ea
+--- /dev/null
++++ b/crates/scrive-core/src/intel/inlay/interaction.rs
+@@ -0,0 +1,120 @@
++//! A gesture on an installed hint that the host must answer: show a tooltip,
++//! follow a label part's location, or insert the hint as text.
++
++use crate::intel::inlay::Key;
++use crate::intel::ticket::Ticket;
++
++/// One gesture on the hint keyed `key`, recorded under `ticket`. The host
++/// answers it only while its hint set is still the one at the ticket's
++/// revision.
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub struct Interaction {
++    ticket: Ticket,
++    key: Key,
++    gesture: Gesture,
++}
++
++/// What the user did to the hint.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum Gesture {
++    /// The pointer rests on label part `part` of the hint.
++    Tooltip {
++        /// The hovered label part's index.
++        part: u32,
++    },
++    /// Follow label part `part`'s location.
++    Jump {
++        /// The clicked label part's index.
++        part: u32,
++    },
++    /// Insert the hint, which renders at `offset`, as buffer text.
++    Insert {
++        /// The hint's render offset.
++        offset: u32,
++    },
++}
++
++impl Interaction {
++    /// Ask for the tooltip of label part `part` of hint `key`. The host falls
++    /// back to the hint's own tooltip.
++    #[must_use]
++    pub fn tooltip(ticket: Ticket, key: Key, part: u32) -> Self {
++        Self {
++            ticket,
++            key,
++            gesture: Gesture::Tooltip { part },
++        }
++    }
++
++    /// Follow label part `part` of hint `key`.
++    #[must_use]
++    pub fn jump(ticket: Ticket, key: Key, part: u32) -> Self {
++        Self {
++            ticket,
++            key,
++            gesture: Gesture::Jump { part },
++        }
++    }
++
++    /// Insert hint `key`, which renders at `offset`.
++    #[must_use]
++    pub fn insert(ticket: Ticket, key: Key, offset: u32) -> Self {
++        Self {
++            ticket,
++            key,
++            gesture: Gesture::Insert { offset },
++        }
++    }
++
++    /// The ticket the answer must carry.
++    #[must_use]
++    pub fn ticket(&self) -> Ticket {
++        self.ticket
++    }
++
++    /// The hint the gesture targets.
++    #[must_use]
++    pub fn key(&self) -> Key {
++        self.key
++    }
++
++    /// What the user did.
++    #[must_use]
++    pub fn gesture(&self) -> Gesture {
++        self.gesture
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::buffer::Revision;
++    use crate::intel::ticket::Counter;
++
++    /// Every gesture constructor keeps the ticket and key it was given.
++    #[test]
++    fn each_gesture_keeps_its_ticket_and_key() {
++        let ticket = Counter::new().issue(Revision(0));
++        let key = Key::new(7);
++        let cases = [
++            (
++                Interaction::tooltip(ticket, key, 1),
++                Gesture::Tooltip { part: 1 },
++            ),
++            (Interaction::jump(ticket, key, 2), Gesture::Jump { part: 2 }),
++            (
++                Interaction::insert(ticket, key, 9),
++                Gesture::Insert { offset: 9 },
++            ),
++        ];
++        for (interaction, gesture) in cases {
++            assert_eq!(interaction.ticket(), ticket, "the ticket survives");
++            assert_eq!(interaction.key(), key, "the key survives");
++            assert_eq!(
++                interaction.gesture(),
++                gesture,
++                "the gesture is the one asked for"
++            );
++        }
++    }
++}
+diff --git a/crates/scrive-core/src/intel/inlay/request.rs b/crates/scrive-core/src/intel/inlay/request.rs
+new file mode 100644
+index 0000000..764bb66
+--- /dev/null
++++ b/crates/scrive-core/src/intel/inlay/request.rs
+@@ -0,0 +1,53 @@
++//! The fetch an editor records when its inlay hints are due: which bytes to
++//! cover, under which ticket.
++
++use std::ops::Range;
++
++use crate::intel::ticket::Ticket;
++
++/// A request for the hints in a byte span. The answer lands only under its
++/// ticket, at the ticket's revision.
++#[derive(Clone, PartialEq, Eq, Debug)]
++pub struct Request {
++    ticket: Ticket,
++    span: Range<u32>,
++}
++
++impl Request {
++    /// A request for the hints in `span`, made under `ticket`.
++    #[must_use]
++    pub fn new(ticket: Ticket, span: Range<u32>) -> Self {
++        Self { ticket, span }
++    }
++
++    /// The ticket the answer must carry.
++    #[must_use]
++    pub fn ticket(&self) -> Ticket {
++        self.ticket
++    }
++
++    /// The byte span to cover, at the ticket's revision.
++    #[must_use]
++    pub fn span(&self) -> Range<u32> {
++        self.span.clone()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::buffer::Revision;
++    use crate::intel::ticket::Counter;
++
++    /// A request hands back the ticket and span it was made with.
++    #[test]
++    fn a_request_keeps_its_ticket_and_span() {
++        let ticket = Counter::new().issue(Revision(4));
++        let request = Request::new(ticket, 3..9);
++        assert_eq!(
++            (request.ticket(), request.span()),
++            (ticket, 3..9),
++            "ticket and span survive"
++        );
++    }
++}
+diff --git a/crates/scrive-core/src/lib.rs b/crates/scrive-core/src/lib.rs
+index 3b6e303..58fab50 100644
+--- a/crates/scrive-core/src/lib.rs
++++ b/crates/scrive-core/src/lib.rs
+@@ -25,6 +25,7 @@
+ //! - syntax-highlight a line → [`highlight`]
+ //! - attach diagnostics / snippet stops → [`decorations`]
+ //! - complete / hover / signature help → [`intel::providers`]
++//! - show inlay hints → [`intel::inlay`]
+ 
+ #![deny(missing_docs)]
+ #![forbid(unsafe_code)]
+diff --git a/crates/scrive-core/src/perf_gate.rs b/crates/scrive-core/src/perf_gate.rs
+index 8855389..7104cdc 100644
+--- a/crates/scrive-core/src/perf_gate.rs
++++ b/crates/scrive-core/src/perf_gate.rs
+@@ -37,6 +37,7 @@
+ //! criterion benches.
+ 
+ use crate::{Diagnostic, Document, FindQuery, Motion, SelectionSet, Severity};
++use crate::intel::inlay;
+ 
+ /// One foldable block: 3 lines, a `mark` token for find, `fn` for a caret target.
+ const BLOCK: &str = "fn f() {\n    mark = 0\n}\n";
+@@ -418,3 +419,51 @@ fn diagnostic_overview_is_diag_count_independent() {
+     };
+     assert_budget("overview: marks, k diagnostics", Budget::Constant, cell(s), cell(b));
+ }
++
++// ── INLAY HINTS. The hints live in their own store and ride the windowed
++//    mover, so typing next to one costs the same whatever the set's size, and
++//    never re-sorts a store. Installing a set is one sort, charged per hint. ──
++
++/// A `k`-block document with a type hint after each block's `fn`.
++fn hinted(k: usize) -> Document {
++    let mut d = build(k);
++    let placed: Vec<inlay::Placed> = (0..k).map(|i| inlay::Placed::new(block_start(i) + 2, type_hint(i))).collect();
++    let revision = d.revision();
++    let _ = d.set_inlays(revision, placed);
++    d
++}
++
++fn type_hint(i: usize) -> inlay::Hint {
++    let label = vec![inlay::Part::new(": u8", inlay::Link::None)];
++    inlay::Hint::new(inlay::Kind::Type, label, inlay::Key::new(i as u64)).expect("a visible label")
++}
++
++#[test]
++fn typing_next_to_a_hint_is_hint_count_independent() {
++    use crate::decorations::DECORATION_SORTS;
++    let (s, b) = (1000usize, 2000usize);
++    let cell = |k: usize| {
++        let mut d = hinted(k);
++        d.set_selections(SelectionSet::new(block_start(k / 2) + 2));
++        let sorts = DECORATION_SORTS.with(std::cell::Cell::get);
++        let work = meter_of(&mut d, |d| d.type_char('x'));
++        assert_eq!(DECORATION_SORTS.with(std::cell::Cell::get), sorts, "a keystroke never re-sorts a store");
++        work
++    };
++    assert_budget("inlays: type at a hint, k hints", Budget::Constant, cell(s), cell(b));
++}
++
++#[test]
++fn installing_hints_is_linear() {
++    const BLOCKS: usize = 2000;
++    let (s, b) = (1000usize, 2000usize);
++    let cell = |k: usize| {
++        let mut d = build(BLOCKS);
++        let placed: Vec<inlay::Placed> = (0..k).map(|i| inlay::Placed::new(block_start(i) + 2, type_hint(i))).collect();
++        let revision = d.revision();
++        meter_of(&mut d, |d| {
++            let _ = d.set_inlays(revision, placed);
++        })
++    };
++    assert_budget("inlays: install, k hints", Budget::Linear, cell(s), cell(b));
++}
+diff --git a/crates/scrive-core/src/sum_tree.rs b/crates/scrive-core/src/sum_tree.rs
+index 9f6c39d..b36a511 100644
+--- a/crates/scrive-core/src/sum_tree.rs
++++ b/crates/scrive-core/src/sum_tree.rs
+@@ -858,16 +858,16 @@ impl<T: Item> SumTree<T> {
+     /// hook for pruning by a summary field the seek dimension can't express (an
+     /// interval tree's max-end: enter iff `start < hi && start + max_end > lo`).
+     /// O(log n + visited).
+-    pub fn filter_visit<D: Dimension<T::Summary>, F: Fn(&D, &T::Summary) -> bool, G: FnMut(&T, &D)>(
+-        &self,
++    pub fn filter_visit<'s, D: Dimension<T::Summary>, F: Fn(&D, &T::Summary) -> bool, G: FnMut(&'s T, &D)>(
++        &'s self,
+         descend: &F,
+         visit: &mut G,
+     ) {
+         self.filter_visit_from(&D::default(), descend, visit);
+     }
+ 
+-    fn filter_visit_from<D: Dimension<T::Summary>, F: Fn(&D, &T::Summary) -> bool, G: FnMut(&T, &D)>(
+-        &self,
++    fn filter_visit_from<'s, D: Dimension<T::Summary>, F: Fn(&D, &T::Summary) -> bool, G: FnMut(&'s T, &D)>(
++        &'s self,
+         start: &D,
+         descend: &F,
+         visit: &mut G,

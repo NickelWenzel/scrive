@@ -1,0 +1,477 @@
+diff --git a/crates/scrive-iced/src/editor.rs b/crates/scrive-iced/src/editor.rs
+index a07d298..e009aa3 100644
+--- a/crates/scrive-iced/src/editor.rs
++++ b/crates/scrive-iced/src/editor.rs
+@@ -38,7 +38,7 @@ use scrive_core::{
+     HighlightSpan, HoverInfo, Motion, Point as BufPoint, PopupList, RevealMode, RowLayout, Severity,
+     SignatureInfo, HOVER_IDLE_DELAY_MS,
+ };
+-use scrive_core::row_layout::{Edge, Rows};
++use scrive_core::row_layout::{self, Edge, Rows};
+ 
+ use crate::geo::{Geo, ScrollAnchor, CHIP_PILL_RADIUS, TEXT_PAD};
+ use crate::popup;
+@@ -198,6 +198,10 @@ const FOLD_BOX_SCAN_ROWS: u32 = 512;
+ /// text-color tint visible enough to trace a symbol, quiet enough to read past.
+ /// Suppressed while find is live (its amber wash owns the screen then).
+ const OCCURRENCE_MATCH: Color = Color::from_rgba8(0xf7, 0xf1, 0xff, 0.09);
++
++/// Alpha of an inlay hint's label over the text colour: readable on its pill
++/// and on a selection wash, and never mistaken for buffer text.
++const INLAY_TEXT_A: f32 = 0.6;
+ /// Diagnostic squiggle geometry (field-calibrated): the wave's half-period
+ /// (zero-to-zero), amplitude, and stroke, in px.
+ const SQUIGGLE_HALF_PERIOD: f32 = 2.0;
+@@ -1203,6 +1207,19 @@ fn range_covered_by(sels: &[scrive_core::Selection], start: u32, end: u32) -> bo
+     i > 0 && sels[i - 1].end() >= end
+ }
+ 
++/// The edge a selection's caret renders on: an empty selection at the caret
++/// edge, a non-empty one at its wash edge, so it never floats past a boundary
++/// hint the wash excludes.
++fn caret_edge(sel: &scrive_core::Selection) -> Edge {
++    if sel.is_empty() {
++        Edge::Caret
++    } else if sel.head() == sel.end() {
++        Edge::End
++    } else {
++        Edge::Start
++    }
++}
++
+ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Message> {
+     fn tag(&self) -> widget::tree::Tag {
+         widget::tree::Tag::of::<State>()
+@@ -1610,7 +1627,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                         self.draw_spans(renderer, &line, spans, origin, advance, code_clip);
+                     }
+                     _ if !line.is_empty() => {
+-                        self.draw_line(renderer, expand_tabs(&line), origin, text_color, Alignment::Left, code_clip);
++                        self.draw_line(renderer, expand_tabs(&line, 0), origin, text_color, Alignment::Left, code_clip);
+                     }
+                     _ => {}
+                 }
+@@ -1699,11 +1716,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         let match_box = Color { a: 0.45, ..text_color };
+         if let Some((a, b)) = self.doc.brackets().active_pair(self.doc.selections().newest().head()) {
+             for off in [a, b] {
+-                // Route through `offset_xy` so a matched bracket on a collapsed
++                // Through the one projection, so a matched bracket on a collapsed
+                 // fold's closing tail (the `}` inline on the header line) gets boxed
+                 // too, not just the visible opening bracket.
+-                let Some((x, y)) = offset_xy(off, Edge::Start) else { continue };
+-                fill_border(renderer, Rectangle { x, y, width: advance, height: line_h }, match_box, 1.0);
++                let Some(rect) = self.bracket_box(&rows, &geo, off) else { continue };
++                if !window.contains(&fold_map.display_row_at(geo.rows_from_top(rect.y + 1.0)).index()) {
++                    continue;
++                }
++                fill_border(renderer, rect, match_box, 1.0);
+             }
+         }
+ 
+@@ -1737,21 +1757,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 if row < sp_row || row > ep_row {
+                     continue;
+                 }
+-                let row_start = if row == sp_row { start } else { buffer.point_to_offset(BufPoint { row, col: 0 }) };
+-                let row_end = if row == ep_row { end } else { buffer.point_to_offset(BufPoint { row, col: buffer.line_len(row) }) };
+-                // A boundary row a multi-line span doesn't actually cover (its
+-                // end landing at column 0, or an empty interior line) has zero
+-                // width here — skip it so the min-one-cell rule below doesn't
+-                // manufacture a phantom squiggle. A genuinely zero-width
+-                // diagnostic (a point) still gets its one cell.
+-                if row_start == row_end && start != end {
+-                    continue;
+-                }
+-                // Fold-aware endpoints: a diagnostic spanning a collapsed
+-                // inline fold underlines the shifted glyphs, not the raw columns.
+-                let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
+-                let x0 = self.offset_screen_x(&rows, &geo, row_start, from);
+-                let x1 = self.offset_screen_x(&rows, &geo, row_end, if row == ep_row { to } else { Edge::Start }).max(x0 + advance);
++                let Some((x0, x1)) = self.squiggle_extent(&rows, &geo, row, start, end, sp_row, ep_row) else { continue };
+                 let baseline = row_y + line_h - SQUIGGLE_AMPLITUDE - 0.5;
+                 squiggle_spans(x0, x1, baseline, |rect| fill(renderer, rect, color));
+             }
+@@ -1838,14 +1844,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+             // the per-frame cost of a document-scale multi-cursor set to O(visible).
+             let sels = self.doc.selections().all();
+             for sel in &sels[visible_selection_span(sels, vis_start, vis_end)] {
+-                let edge = if sel.is_empty() {
+-                    Edge::Caret
+-                } else if sel.head() == sel.end() {
+-                    Edge::End
+-                } else {
+-                    Edge::Start
+-                };
+-                if let Some((x, y)) = offset_xy(sel.head(), edge) {
++                if let Some((x, y)) = offset_xy(sel.head(), caret_edge(sel)) {
+                     let r = Rectangle { x: x - CARET_WIDTH / 2.0, y: y + 1.0, width: CARET_WIDTH, height: line_h - 2.0 };
+                     fill(renderer, r, text_color);
+                 }
+@@ -2938,6 +2937,24 @@ impl<Message> Editor<'_, Message> {
+         range_covered_by(self.doc.selections().all(), start, end)
+     }
+ 
++    /// Whether offset `p` lies strictly inside some selection (`start < p <
++    /// end`): exactly when a hint there is washed, so its pill would island in
++    /// the wash.
++    fn hint_selected(&self, p: u32) -> bool {
++        p > 0 && range_covered_by(self.doc.selections().all(), p - 1, p + 1)
++    }
++
++    /// The pill behind `inlay`'s label on the row at `row_top`, or `None` where
++    /// a selection wash already backs it.
++    fn inlay_pill(&self, inlay: &row_layout::Inlay<'_>, geo: &Geo, row_top: f32) -> Option<Rectangle> {
++        if self.hint_selected(inlay.offset) {
++            return None;
++        }
++        let first = inlay.cell + u32::from(inlay.padding.left);
++        let label = inlay.width - u32::from(inlay.padding.left) - u32::from(inlay.padding.right);
++        Some(geo.inlay_pill(geo.cell_x(first as f32), geo.cell_x((first + label) as f32), row_top))
++    }
++
+     fn draw_selection(&self, renderer: &mut iced::Renderer, rows: &Rows<'_>, geo: &Geo, start: u32, end: u32, color: Color) {
+         let buffer = self.doc.buffer();
+         let fold_map = rows.folds();
+@@ -2986,12 +3003,23 @@ impl<Message> Editor<'_, Message> {
+             self.draw_fold_tail_wash(renderer, rows, geo, row, a, b, color);
+             return;
+         }
+-        let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
+-        let buffer = self.doc.buffer();
++        let (bounds, line_h) = (geo.bounds(), geo.line_h());
+         let y = geo.row_y(fold_map.to_display_row(BufferRow(row)));
+         if y + line_h < bounds.y || y > bounds.y + bounds.height {
+             return;
+         }
++        let (x0, x1) = self.wash_extent(rows, geo, row, a, b, start, end);
++        fill(renderer, Rectangle { x: x0, y, width: (x1 - x0).max(1.0), height: line_h }, color);
++    }
++
++    /// The `(x0, x1)` screen span a range `start..end` (points `a..b`) washes on
++    /// visible, unfolded buffer `row`: `Start` at its start, `End` at its end,
++    /// `Caret` for both ends of an empty range; an interior row runs to `Start`
++    /// of its line end plus half a cell, or across a collapsed header's
++    /// placeholder.
++    #[allow(clippy::too_many_arguments)] // the wash's row, both points and both offsets are all read
++    fn wash_extent(&self, rows: &Rows<'_>, geo: &Geo, row: u32, a: BufPoint, b: BufPoint, start: u32, end: u32) -> (f32, f32) {
++        let buffer = self.doc.buffer();
+         let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
+         let x0 = if row == a.row { self.offset_screen_x(rows, geo, start, from) } else { geo.cell_x(0.0) };
+         let x1 = if row == b.row {
+@@ -3004,9 +3032,38 @@ impl<Message> Editor<'_, Message> {
+             geo.cell_x(hl.tail_cell() as f32)
+         } else {
+             let line_end = buffer.point_to_offset(scrive_core::Point::new(row, buffer.line_len(row)));
+-            self.offset_screen_x(rows, geo, line_end, Edge::Start) + advance * 0.5
++            self.offset_screen_x(rows, geo, line_end, Edge::Start) + geo.advance() * 0.5
+         };
+-        fill(renderer, Rectangle { x: x0, y, width: (x1 - x0).max(1.0), height: line_h }, color);
++        (x0, x1)
++    }
++
++    /// The `(x0, x1)` screen span diagnostic `start..end` (rows
++    /// `sp_row..=ep_row`) underlines on visible buffer `row`, at least one cell
++    /// wide; `None` on a boundary row the range doesn't actually cover.
++    #[allow(clippy::too_many_arguments)] // the row plus the span's offsets and rows
++    fn squiggle_extent(&self, rows: &Rows<'_>, geo: &Geo, row: u32, start: u32, end: u32, sp_row: u32, ep_row: u32) -> Option<(f32, f32)> {
++        let buffer = self.doc.buffer();
++        let row_start = if row == sp_row { start } else { buffer.point_to_offset(BufPoint { row, col: 0 }) };
++        let row_end = if row == ep_row { end } else { buffer.point_to_offset(BufPoint { row, col: buffer.line_len(row) }) };
++        // A boundary row a multi-line span doesn't actually cover (its end
++        // landing at column 0, or an empty interior line) has zero width here —
++        // skip it so the min-one-cell rule below doesn't manufacture a phantom
++        // squiggle. A genuinely zero-width diagnostic (a point) still gets its
++        // one cell.
++        if row_start == row_end && start != end {
++            return None;
++        }
++        let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
++        let x0 = self.offset_screen_x(rows, geo, row_start, from);
++        let x1 = self.offset_screen_x(rows, geo, row_end, if row == ep_row { to } else { Edge::Start }).max(x0 + geo.advance());
++        Some((x0, x1))
++    }
++
++    /// The matching-bracket outline around the bracket at `offset`, in screen
++    /// space, or `None` if the offset doesn't render.
++    fn bracket_box(&self, rows: &Rows<'_>, geo: &Geo, offset: u32) -> Option<Rectangle> {
++        let p = rows.position(offset, Edge::Start)?;
++        Some(Rectangle { x: geo.cell_x(p.x.cells()), y: geo.row_y(p.row), width: geo.advance(), height: geo.line_h() })
+     }
+ 
+     /// Wash the selected part of a collapsed fold's closing (tail) row, which
+@@ -3081,12 +3138,14 @@ impl<Message> Editor<'_, Message> {
+         rows.hit(row, geo.x_cell(pos.x), scrive_core::Bias::Left)
+     }
+ 
+-    /// Draw a row that has inline (single-line) folds: its highlight spans with a
+-    /// per-fold horizontal collapse — the bytes between each pair's brackets hide,
+-    /// later cells shift left, and a `…` chip fills the gap.
+-    /// The delimiters keep their span color; the closer stays a real position.
+-    /// All cell math comes from the core's one [`RowLayout`] owner.
+-    #[allow(clippy::too_many_arguments)]
++    /// Draw a row that has inline (single-line) folds or inlay hints: its
++    /// highlight spans with a per-fold horizontal collapse — the bytes between
++    /// each pair's brackets hide, later cells shift left, and a `…` chip fills
++    /// the gap — and each hint's label on the cells reserved for it, pushing
++    /// the text after it right. The delimiters keep their span color; the
++    /// closer stays a real position. All cell math comes from the core's one
++    /// [`RowLayout`] owner.
++    #[allow(clippy::too_many_arguments)] // the row's text, spans and layout plus the frame's colors and clip
+     fn draw_row_inline(
+         &self,
+         renderer: &mut iced::Renderer,
+@@ -3100,28 +3159,32 @@ impl<Message> Editor<'_, Message> {
+         clip: Rectangle,
+     ) {
+         let advance = geo.advance();
+-        let seg = |renderer: &mut iced::Renderer, text: &str, start_col: u32, color: Color| {
+-            if text.is_empty() || row_layout.glyph_hidden(start_col) {
+-                return;
++        let hint_cols: Vec<u32> = row_layout.inlays().map(|inlay| inlay.offset - row_layout.row_start()).collect();
++        let seg = |renderer: &mut iced::Renderer, cols: Range<u32>, color: Color| {
++            for run in split_at_columns(cols, &hint_cols) {
++                if row_layout.glyph_hidden(run.start) {
++                    continue;
++                }
++                let x = origin.x + row_layout.display_cell(run.start, Edge::Start) as f32 * advance;
++                let text = &line[run.start as usize..run.end as usize];
++                let phase = display_map::expand(line, run.start, TAB);
++                self.draw_line(renderer, expand_tabs(text, phase), Point::new(x, origin.y), color, Alignment::Left, clip);
+             }
+-            let x = origin.x + row_layout.display_cell(start_col, Edge::Start) as f32 * advance;
+-            self.draw_line(renderer, expand_tabs(text), Point::new(x, origin.y), color, Alignment::Left, clip);
+         };
+         match spans {
+             Some(spans) if !spans.is_empty() => {
+                 for s in spans {
+                     let fg = s.style.fg;
+-                    let text = &line[s.range.start as usize..s.range.end as usize];
+-                    seg(renderer, text, s.range.start, Color::from_rgb8(fg.r, fg.g, fg.b));
++                    seg(renderer, s.range.clone(), Color::from_rgb8(fg.r, fg.g, fg.b));
+                 }
+             }
+             _ => {
+                 let mut cursor = 0u32;
+                 for chip in row_layout.chips() {
+-                    seg(renderer, &line[cursor as usize..=chip.open_col as usize], cursor, text_color);
++                    seg(renderer, cursor..chip.open_col + 1, text_color);
+                     cursor = chip.close_col;
+                 }
+-                seg(renderer, &line[cursor as usize..], cursor, text_color);
++                seg(renderer, cursor..line.len() as u32, text_color);
+             }
+         }
+         // The `…` chip between each pair's brackets, centered on the collapsed gap.
+@@ -3146,6 +3209,20 @@ impl<Message> Editor<'_, Message> {
+             };
+             self.draw_line(renderer, "…".to_string(), Point::new(mid, origin.y), dots, Alignment::Center, clip);
+         }
++        // Padding cells stay editor background, per the LSP spec's
++        // `paddingLeft` / `paddingRight`.
++        let label_color = Color { a: INLAY_TEXT_A, ..text_color };
++        for inlay in row_layout.inlays() {
++            if let Some(pill) = self.inlay_pill(inlay, geo, origin.y) {
++                fill_rounded(renderer, pill, POPUP_SELECT, CHIP_PILL_RADIUS);
++            }
++            let mut cell = inlay.cell + u32::from(inlay.padding.left);
++            for part in inlay.hint.parts() {
++                let text = part.text();
++                self.draw_line(renderer, text.to_owned(), Point::new(origin.x + cell as f32 * advance, origin.y), label_color, Alignment::Left, clip);
++                cell += text.chars().count() as u32;
++            }
++        }
+     }
+ 
+     /// The screen rect of a collapsed fold's `…` chip — an inline `[ … ]` or a block
+@@ -3324,7 +3401,7 @@ impl<Message> Editor<'_, Message> {
+                     let line = buffer.line(r);
+                     let l = line.trim_start();
+                     if !l.is_empty() {
+-                        self.draw_line(renderer, expand_tabs(l), Point::new(rect.x + pad, ry), text_color, Alignment::Left, rect);
++                        self.draw_line(renderer, expand_tabs(l, line_indent_cells(&line)), Point::new(rect.x + pad, ry), text_color, Alignment::Left, rect);
+                     }
+                 }
+             }
+@@ -3357,7 +3434,7 @@ impl<Message> Editor<'_, Message> {
+             let fg = span.style.fg;
+             self.draw_line(
+                 renderer,
+-                expand_tabs(text),
++                expand_tabs(text, cell),
+                 Point::new(x, origin.y),
+                 Color::from_rgb8(fg.r, fg.g, fg.b),
+                 Alignment::Left,
+@@ -3466,15 +3543,16 @@ impl<Message> Editor<'_, Message> {
+     }
+ }
+ 
+-/// Expand tabs to spaces for display (the caret math uses the display map, so
+-/// they agree).
+-fn expand_tabs(line: &str) -> String {
+-    if !line.contains('\t') {
+-        return line.to_owned();
++/// Expand the tabs of a run that starts at raw cell `start_cell` (its
++/// tab-expanded cell before chips and hints shift it), so each tab reaches the
++/// same stop the display map measures.
++fn expand_tabs(run: &str, start_cell: u32) -> String {
++    if !run.contains('\t') {
++        return run.to_owned();
+     }
+-    let mut out = String::with_capacity(line.len());
+-    let mut cell = 0u32;
+-    for ch in line.chars() {
++    let mut out = String::with_capacity(run.len());
++    let mut cell = start_cell;
++    for ch in run.chars() {
+         if ch == '\t' {
+             let w = display_map::tab_width(cell, TAB);
+             for _ in 0..w {
+@@ -3489,6 +3567,23 @@ fn expand_tabs(line: &str) -> String {
+     out
+ }
+ 
++/// `range` cut at every column of `cols` (sorted, duplicates allowed) strictly
++/// inside it: the runs a highlight span paints as, so the text after a hint
++/// starts past the hint.
++fn split_at_columns(range: Range<u32>, cols: &[u32]) -> impl Iterator<Item = Range<u32>> + '_ {
++    let mut from = range.start;
++    cols.iter()
++        .copied()
++        .filter(move |&c| c > range.start && c < range.end)
++        .chain(std::iter::once(range.end))
++        .filter_map(move |c| {
++            if c <= from {
++                return None;
++            }
++            Some(std::mem::replace(&mut from, c)..c)
++        })
++}
++
+ /// Map a key event to an [`Action`], or `None` if it isn't an editor input.
+ /// The glyph a numpad *character* key carries in `text`, or `None` for a
+ /// non-numpad key, a numpad key with no text (NumLock off), or control text
+@@ -3938,6 +4033,7 @@ impl<'a, Message: 'a> From<Editor<'a, Message>>
+ mod tests {
+     use super::*;
+     use iced::advanced::widget::operation;
++    use scrive_core::intel::inlay;
+ 
+     #[test]
+     fn digit_count_is_right() {
+@@ -3985,6 +4081,22 @@ mod tests {
+         }
+     }
+ 
++    /// A run that starts off a tab stop expands its tabs from its own raw cell,
++    /// so it paints exactly as wide as the display map measures it.
++    #[test]
++    fn a_run_expands_its_tabs_from_its_raw_cell() {
++        assert_eq!(expand_tabs("\ty", 1), "   y", "a tab at cell 1 reaches the stop at 4");
++        let line = "a\tbc\t\td\te";
++        let len = line.len() as u32;
++        for start in 0..=len {
++            for end in start..=len {
++                let cell = display_map::expand(line, start, TAB);
++                let painted = expand_tabs(&line[start as usize..end as usize], cell).chars().count() as u32;
++                assert_eq!(cell + painted, display_map::expand(line, end, TAB), "run {start}..{end}");
++            }
++        }
++    }
++
+     #[test]
+     fn numpad_text_prefers_glyph_over_nav() {
+         use iced::keyboard::key::{Code, Physical};
+@@ -4403,6 +4515,73 @@ mod tests {
+         )
+     }
+ 
++    /// `text` with `hints` installed at the current revision, each `(offset,
++    /// kind, label, padding)`. The one place the tests build hints.
++    fn hinted(text: &str, hints: &[(u32, inlay::Kind, &str, inlay::Padding)]) -> Document {
++        let mut doc = Document::new(text).expect("doc fits");
++        let placed = hints
++            .iter()
++            .enumerate()
++            .map(|(i, &(offset, kind, label, padding))| {
++                let hint = inlay::Hint::new(kind, vec![inlay::Part::new(label, inlay::Link::None)], inlay::Key::new(i as u64))
++                    .expect("non-empty label")
++                    .padding(padding);
++                inlay::Placed::new(offset, hint)
++            })
++            .collect();
++        let outcome = doc.set_inlays(doc.revision(), placed);
++        assert!(matches!(outcome, inlay::Outcome::Applied { .. }), "installed at the current revision");
++        doc
++    }
++
++    /// `ab cd\nef\n` with three hints on row 0:
++    /// T = type `: i32` at 2 (Suffix on `ab`, width 5),
++    /// P = parameter `n:` + right padding at 3 (Prefix on `cd`, width 3),
++    /// E = type `: T` at 5, the line end (Suffix on `cd`, width 3).
++    fn fixture() -> Document {
++        hinted(
++            "ab cd\nef\n",
++            &[
++                (2, inlay::Kind::Type, ": i32", inlay::Padding::default()),
++                (3, inlay::Kind::Parameter, "n:", inlay::Padding { left: false, right: true }),
++                (5, inlay::Kind::Type, ": T", inlay::Padding::default()),
++            ],
++        )
++    }
++
++    /// Replace the selections with one from `anchor` to `head`.
++    fn select(doc: &mut Document, anchor: u32, head: u32) {
++        let mut set = scrive_core::SelectionSet::new(0);
++        set.set_single(scrive_core::Selection::from_anchor(scrive_core::SelectionId(0), anchor, head));
++        doc.set_selections(set);
++    }
++
++    /// A span is cut at each hint column strictly inside it; columns at its ends
++    /// and repeated columns cut nothing extra.
++    #[test]
++    fn split_at_columns_cuts_a_run_at_each_inner_column() {
++        let runs: Vec<_> = split_at_columns(0..5, &[0, 2, 3, 3, 5]).collect();
++        assert_eq!(runs, vec![0..2, 2..3, 3..5], "cut at 2 and 3 only");
++        assert_eq!(split_at_columns(2..2, &[2]).count(), 0, "an empty span paints nothing");
++    }
++
++    /// A pill is dropped only where a selection strictly contains the hint's
++    /// offset; a hint at a selection's edge keeps its pill (it is not washed).
++    #[test]
++    fn a_hint_pill_is_dropped_only_strictly_inside_a_selection() {
++        let mut doc = fixture();
++        let pills = |doc: &Document| {
++            let ed = Editor::new(doc, |_: Action| ());
++            let rows = doc.rows();
++            let layout = rows.layout(BufferRow(0));
++            layout.inlays().map(|inlay| ed.inlay_pill(inlay, &test_geo(), 0.0).is_some()).collect::<Vec<_>>()
++        };
++        select(&mut doc, 2, 3);
++        assert_eq!(pills(&doc), vec![true, true, true], "boundary hints keep their pills");
++        select(&mut doc, 1, 4);
++        assert_eq!(pills(&doc), vec![false, false, true], "T and P are washed; E is outside");
++    }
++
+     #[test]
+     fn collapsed_chip_at_windows_to_the_hovered_row() {
+         // The plain-hover chip hit-test resolves the pointer's display row
+diff --git a/crates/scrive-iced/src/geo.rs b/crates/scrive-iced/src/geo.rs
+index c0a33f5..2877c26 100644
+--- a/crates/scrive-iced/src/geo.rs
++++ b/crates/scrive-iced/src/geo.rs
+@@ -180,6 +180,14 @@ impl Geo {
+         }
+     }
+ 
++    /// The rounded pill behind an inlay hint's label, spanning screen x
++    /// `x0..x1` (the label's cells, padding excluded) on the row at `row_top`,
++    /// inset vertically like [`Self::chip_pill`] so the two placeholders line
++    /// up.
++    pub(crate) fn inlay_pill(&self, x0: f32, x1: f32, row_top: f32) -> Rectangle {
++        Rectangle { x: x0, y: row_top + 2.0, width: x1 - x0, height: self.line_h - 4.0 }
++    }
++
+     /// The rounded halo box around an inline bracket span `[x0, x1]` (screen
+     /// x of opener/closer) on the row at `row_top` — the ONE halo formula, so
+     /// every drawn bracket halo has identical padding and rounding.

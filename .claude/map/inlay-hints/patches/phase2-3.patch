@@ -1,0 +1,1780 @@
+diff --git a/crates/scrive-core/src/document.rs b/crates/scrive-core/src/document.rs
+index d738e66..3b7b6fb 100644
+--- a/crates/scrive-core/src/document.rs
++++ b/crates/scrive-core/src/document.rs
+@@ -29,6 +29,7 @@ use crate::highlight::{HighlightCache, HighlightEngine, HighlightSpan, SyntaxDef
+ use crate::history::{GroupingHint, History};
+ use crate::intel::inlay;
+ use crate::movement::{self, ColumnDir, Granularity, Motion};
++use crate::row_layout::{Edge, Rows};
+ use crate::selection::{Selection, SelectionId, SelectionSet};
+ use crate::transaction::{apply, Committed, EditOp, TransactionError};
+ 
+@@ -134,6 +135,13 @@ struct FoldMapCache {
+     map: FoldMap,
+ }
+ 
++/// The cached fold map, borrowed from the cache cell alone so a caller can hold
++/// it beside `&mut` borrows of other `Document` fields. Freshen the cache with
++/// `ensure_fold_map` first.
++fn cached_fold_map(cache: &RefCell<FoldMapCache>) -> Ref<'_, FoldMap> {
++    Ref::map(cache.borrow(), |c| &c.map)
++}
++
+ /// How a reveal request should autoscroll the view to the newest caret.
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+ pub enum RevealMode {
+@@ -153,7 +161,7 @@ pub enum RevealMode {
+ /// display *cells*, not byte columns — tabs and collapsed inline folds make
+ /// the two disagree, and the box is a visual rectangle. Every spanned row
+ /// resolves the same two cells through the one click inverse
+-/// ([`FoldMap::hit_row`]), clamping to its own content, so the box stays
++/// ([`Rows::hit`]), clamping to its own content, so the box stays
+ /// rectangular over ragged lines and shrinks exactly when the active corner
+ /// moves back toward the anchor.
+ #[derive(Copy, Clone, Debug)]
+@@ -345,12 +353,20 @@ impl Document {
+     #[must_use]
+     pub fn fold_map(&self) -> Ref<'_, FoldMap> {
+         self.ensure_fold_map();
+-        Ref::map(self.fold_cache.borrow(), |c| &c.map)
++        cached_fold_map(&self.fold_cache)
++    }
++
++    /// The document's rows as they render (see [`Rows`]): the view every
++    /// on-screen projection goes through. It borrows the fold cache, so take
++    /// one per pass and drop it before editing.
++    #[must_use]
++    pub fn rows(&self) -> Rows<'_> {
++        Rows::new(self.fold_map(), &self.buffer, &self.inlays, self.tab_size())
+     }
+ 
+     /// Rebuild the fold cache iff its inputs changed, leaving it current. Split
+     /// from [`fold_map`](Self::fold_map) so a caller that also needs `&mut` on a
+-    /// sibling field (e.g. `move_carets` mutating `selections`) can freshen the
++    /// sibling field (the selection paths mutating `selections`) can freshen the
+     /// cache and then borrow `fold_cache` and that field disjointly — instead of
+     /// building a throwaway O(folds) `FoldMap::new` per keystroke.
+     fn ensure_fold_map(&self) {
+@@ -449,8 +465,8 @@ impl Document {
+         // `selections` disjointly.
+         self.ensure_fold_map();
+         let tab = self.tab_size();
+-        let cache = self.fold_cache.borrow();
+-        movement::move_selections(&mut self.selections, &self.buffer, &cache.map, tab, motion, extend);
++        let rows = Rows::new(cached_fold_map(&self.fold_cache), &self.buffer, &self.inlays, tab);
++        movement::move_selections(&mut self.selections, &rows, motion, extend);
+     }
+ 
+     /// Add a bare caret at `offset` — the Alt+Click add-caret gesture.
+@@ -606,7 +622,7 @@ impl Document {
+     /// Ctrl+Alt+↑/↓: add a caret one display row above/below EVERY
+     /// existing caret, keeping the current set — the stack-a-column gesture.
+     /// Each landing resolves like a click at that caret's visual column (the
+-    /// `movement::caret_one_display_row` rule → `hit_row`), so tabs, chips,
++    /// `movement::caret_one_display_row` rule → `Rows::hit`), so tabs, chips,
+     /// and collapsed folds behave exactly as plain vertical movement; a caret
+     /// already on the first/last display row adds nothing, and a landing on an
+     /// existing caret merges via the set's rule. Selection-only. (Landings on
+@@ -614,16 +630,18 @@ impl Document {
+     /// presses — a deliberate simplification.)
+     pub fn add_caret_vertical(&mut self, down: bool) {
+         self.reset_transient();
+-        let folds = FoldMap::new(&self.folds, &self.brackets, &self.buffer);
++        self.ensure_fold_map();
+         let tab = self.tab_size();
+         let delta = if down { 1 } else { -1 };
+         let heads: Vec<u32> = self.selections.all().iter().map(Selection::head).collect();
+         let mut added = false;
+-        for head in heads {
+-            if let Some(off) = movement::caret_one_display_row(&self.buffer, &folds, tab, head, delta)
+-            {
+-                self.selections.add_caret(off);
+-                added = true;
++        {
++            let rows = Rows::new(cached_fold_map(&self.fold_cache), &self.buffer, &self.inlays, tab);
++            for head in heads {
++                if let Some(off) = movement::caret_one_display_row(&rows, head, delta) {
++                    self.selections.add_caret(off);
++                    added = true;
++                }
+             }
+         }
+         if added {
+@@ -872,15 +890,16 @@ impl Document {
+         // so it can't go through `reset_transient`.
+         self.history.seal();
+         self.expand_stack.clear();
+-        let folds = FoldMap::new(&self.folds, &self.brackets, &self.buffer);
++        self.ensure_fold_map();
+         let tab = self.tab_size();
++        let rows = Rows::new(cached_fold_map(&self.fold_cache), &self.buffer, &self.inlays, tab);
+         let mut col = self.column.unwrap_or_else(|| {
+-            let corner = self.caret_corner(&folds, tab);
++            let corner = self.caret_corner(&rows);
+             ColumnSelection { anchor: corner, active: corner }
+         });
+-        col.active = Self::step_corner(&folds, col.active, dir);
++        col.active = Self::step_corner(rows.folds(), col.active, dir);
+         self.column = Some(col);
+-        self.rebuild_column_box(&folds, tab, col);
++        self.selections = Self::column_box(&rows, col);
+     }
+ 
+     /// Mouse box (column) selection — Shift+Alt+drag. Sets the box from an
+@@ -896,32 +915,34 @@ impl Document {
+         // Same boundary + ladder rule as `column_select`.
+         self.history.seal();
+         self.expand_stack.clear();
+-        let folds = FoldMap::new(&self.folds, &self.brackets, &self.buffer);
++        self.ensure_fold_map();
++        let tab = self.tab_size();
+         let col = ColumnSelection {
+             anchor: CellCorner { row: anchor.0, cell: anchor.1 },
+             active: CellCorner { row: active.0, cell: active.1 },
+         };
+         self.column = Some(col);
+-        self.rebuild_column_box(&folds, self.tab_size(), col);
++        let rows = Rows::new(cached_fold_map(&self.fold_cache), &self.buffer, &self.inlays, tab);
++        self.selections = Self::column_box(&rows, col);
+     }
+ 
+     /// The primary caret's box corner: its rendered position — the one owner of
+-    /// display geometry, [`FoldMap::display_position`] — as a `(visible buffer
++    /// display geometry, [`Rows::position`] — as a `(visible buffer
+     /// row, display cell)`
+     /// pair. A caret on a collapsed fold's closing tail anchors on the header
+     /// row it renders on. (Fold-time ejection keeps carets visible, so the
+     /// hidden-offset fallback to the raw buffer point is belt and braces.)
+-    fn caret_corner(&self, folds: &FoldMap, tab: u32) -> CellCorner {
++    fn caret_corner(&self, rows: &Rows<'_>) -> CellCorner {
+         let head = self.selections.newest().head();
+-        match folds.display_position(&self.buffer, head, tab) {
++        match rows.position(head, Edge::Caret) {
+             Some(p) => CellCorner {
+-                row: folds.to_buffer_row(p.row).0,
++                row: rows.folds().to_buffer_row(p.row).0,
+                 cell: crate::row_layout::virtual_cell(p.x.cells()),
+             },
+             None => {
+                 let p = self.buffer.offset_to_point(head);
+-                let layout = folds.row_layout(&self.buffer, BufferRow(p.row), tab);
+-                CellCorner { row: p.row, cell: layout.display_cell(p.col) }
++                let layout = rows.layout(BufferRow(p.row));
++                CellCorner { row: p.row, cell: layout.display_cell(p.col, Edge::Caret) }
+             }
+         }
+     }
+@@ -1029,14 +1050,15 @@ impl Document {
+         }
+     }
+ 
+-    /// Install the box `col` as the selection set: one selection per spanned
++    /// The box `col` as a selection set: one selection per spanned
+     /// *display* row (a collapsed fold's hidden rows get none), each corner cell
+     /// resolved to its byte offset through the one click inverse
+-    /// ([`FoldMap::hit_row`]: tab snapping, chip resolution, header gap/tail) —
++    /// ([`Rows::hit`]: tab snapping, chip resolution, header gap/tail) —
+     /// so the box selects exactly what its rectangle crosses on screen, clamped
+     /// to each row's content. The active row's selection is the newest
+     /// (autoscroll target).
+-    fn rebuild_column_box(&mut self, folds: &FoldMap, tab: u32, col: ColumnSelection) {
++    fn column_box(rows: &Rows<'_>, col: ColumnSelection) -> SelectionSet {
++        let folds = rows.folds();
+         let da = folds.to_display_row(BufferRow(col.anchor.row)).index();
+         let dv = folds.to_display_row(BufferRow(col.active.row)).index();
+         let (d0, d1) = (da.min(dv), da.max(dv));
+@@ -1044,14 +1066,14 @@ impl Document {
+         let mut newest = 0;
+         for d in d0..=d1 {
+             let row = folds.to_buffer_row(DisplayRow(d));
+-            let anchor_off = folds.hit_row(&self.buffer, row, col.anchor.cell as f32, Bias::Left, tab);
+-            let head_off = folds.hit_row(&self.buffer, row, col.active.cell as f32, Bias::Left, tab);
++            let anchor_off = rows.hit(row, col.anchor.cell as f32, Bias::Left);
++            let head_off = rows.hit(row, col.active.cell as f32, Bias::Left);
+             if d == dv {
+                 newest = ranges.len();
+             }
+             ranges.push((anchor_off, head_off));
+         }
+-        self.selections = SelectionSet::from_ranges(&ranges, newest);
++        SelectionSet::from_ranges(&ranges, newest)
+     }
+ 
+     /// The full document text (LF-only). Shorthand for `self.buffer().text()`
+@@ -1569,7 +1591,7 @@ impl Document {
+                     // entry edge — the header line's end, just before the `…`
+                     // placeholder (the block analog of the inline pull-out
+                     // above), so typing can never edit invisible text. "Hidden"
+-                    // comes from the one owner: `display_position` is `None`
++                    // comes from the one owner: `renders` is false
+                     // exactly for offsets in a fold's gap.
+                     // The one tab-width owner (hoisted above the destructure that
+                     // borrows the fields — `self.tab_size()` can't be called after).
+@@ -1580,7 +1602,7 @@ impl Document {
+                     let entry = buffer.point_to_offset(Point::new(header, buffer.line_len(header)));
+                     selections.map_each(|s| {
+                         let inside = s.head() > opener && s.head() < close;
+-                        if inside && fold_map.display_position(buffer, s.head(), tab).is_none() {
++                        if inside && !fold_map.renders(buffer, s.head(), tab) {
+                             s.move_to_caret(entry);
+                         }
+                     });
+@@ -2414,7 +2436,7 @@ impl Document {
+     /// offset renders: a jump-class caret placement — find navigation, bracket
+     /// jump, select-all-matches — must land on a VISIBLE position. The jump twin
+     /// of the edit path's `expand_folds_touched`. Visibility is judged by the one
+-    /// owner ([`FoldMap::display_position`]); already-visible offsets (a
++    /// owner ([`FoldMap::renders`]); already-visible offsets (a
+     /// collapsed tail, a chip edge) unfold nothing.
+     fn unfold_to_reveal(&mut self, offset: u32) -> bool {
+         let tab = self.tab_size();
+@@ -2422,11 +2444,11 @@ impl Document {
+         loop {
+             let fm = FoldMap::new(&self.folds, &self.brackets, &self.buffer);
+             // "Visible" for a JUMP is stricter than "renders somewhere":
+-            // `display_position` clips a chip-hidden column to the chip's
+-            // center, so an offset inside a collapsed INLINE fold still gets a
+-            // position — but the text itself is hidden, and a jump target must
++            // `renders` is true for a chip-hidden column (it gets the chip's
++            // center), so an offset inside a collapsed INLINE fold still
++            // renders — but the text itself is hidden, and a jump target must
+             // be readable, so the gap rule is checked too.
+-            let renders = fm.display_position(&self.buffer, offset, tab).is_some();
++            let renders = fm.renders(&self.buffer, offset, tab);
+             // Only the inline fold opening just before `offset` can hide it (roots
+             // are disjoint) — an O(log) tree probe, not a full-set scan.
+             let chip_hidden = fm.inline_fold_before(offset).is_some_and(|f| f.hides_caret_at(offset));
+@@ -2529,7 +2551,7 @@ fn expand_folds_touched(
+     // answer; compute it once (O(points · log folds)) instead of re-scanning every
+     // edit for every candidate, which would be O(carets²) even when nothing is
+     // hidden.
+-    let any_hidden = pts.iter().any(|&p| fold_map.display_position(buffer, p, tab).is_none());
++    let any_hidden = pts.iter().any(|&p| !fold_map.renders(buffer, p, tab));
+     // Inline candidates test their own bracket span against the edit STARTS (only a
+     // start reveals an inline pair): "∃ start in (opener, close]", binary-searched.
+     let mut starts: Vec<u32> = committed.patch().edits().iter().map(|e| e.new.start).collect();
+@@ -2543,7 +2565,7 @@ fn expand_folds_touched(
+                 // `[` itself or past `]` doesn't — a start in (opener, close].
+                 starts.partition_point(|&s| s <= close) > starts.partition_point(|&s| s <= opener)
+             } else {
+-                // Block: `display_position` is `None` exactly in the gap; an edit
++                // Block: `renders` is false exactly in the gap; an edit
+                 // straddling INTO the gap has an endpoint there, one swallowing the
+                 // whole fold broke the pair. Candidate-independent (see above).
+                 any_hidden
+@@ -2968,9 +2990,8 @@ mod tests {
+         assert!(d.toggle_fold_opener(2));
+         d.shrink_selection(); // ladder cleared by the toggle → no-op…
+         let head = d.selections().newest().head();
+-        let fm = crate::fold_map::FoldMap::new(d.folds(), d.brackets(), d.buffer());
+         assert!(
+-            fm.display_position(d.buffer(), head, d.tab_size()).is_some(),
++            d.rows().position(head, Edge::Caret).is_some(),
+             "…so the caret cannot be restored into the collapsed fold"
+         );
+         // And the toggle sealed the typing group: the later run undoes alone.
+@@ -2981,7 +3002,7 @@ mod tests {
+ 
+     #[test]
+     fn find_navigation_expands_a_collapsed_inline_fold() {
+-        // display_position clips a chip-hidden column to the chip center, so an
++        // Rows::position clips a chip-hidden column to the chip center, so an
+         // offset inside a collapsed inline fold still reports a position;
+         // unfold_to_reveal must expand the fold anyway so a find jump lands on
+         // visible text, not inside the chip.
+@@ -3180,9 +3201,8 @@ mod tests {
+         d.set_find_query(Some(FindQuery { text: "needle".into(), case_sensitive: false, ..Default::default() }), 0);
+         let m = d.find_next(0).expect("the match exists");
+         assert!(!d.folds().is_folded(opener), "the fold expanded to reveal the match");
+-        let fm = crate::fold_map::FoldMap::new(d.folds(), d.brackets(), d.buffer());
+         assert!(
+-            fm.display_position(d.buffer(), m.end, d.tab_size()).is_some(),
++            d.rows().position(m.end, Edge::Caret).is_some(),
+             "the match head renders"
+         );
+         // A match on VISIBLE ground (the header line) leaves folds alone.
+@@ -6375,4 +6395,3 @@ mod tests {
+         assert_eq!(offsets, vec![1, 3], "mid-char snaps left, past-the-end clamps");
+     }
+ }
+-
+diff --git a/crates/scrive-core/src/fold_map.rs b/crates/scrive-core/src/fold_map.rs
+index f153333..e8e089a 100644
+--- a/crates/scrive-core/src/fold_map.rs
++++ b/crates/scrive-core/src/fold_map.rs
+@@ -846,7 +846,7 @@ impl FoldMap {
+     /// block's header line end, or an inline gap's left landable edge; `None` when
+     /// visible. `O(log folds)` (regions and inline roots are sorted and disjoint),
+     /// so a multi-caret fold pulls every hidden caret out in one `O(carets·log
+-    /// folds)` pass instead of an `O(carets·folds)` [`Self::display_position`]
++    /// folds)` pass instead of an `O(carets·folds)` [`Rows::position`](crate::row_layout::Rows::position)
+     /// probe each — the "collapse all" ejection at document scale.
+     #[must_use]
+     pub fn entry_edge_if_hidden(&self, buffer: &Buffer, offset: u32) -> Option<u32> {
+diff --git a/crates/scrive-core/src/lib.rs b/crates/scrive-core/src/lib.rs
+index 58fab50..1e8ff12 100644
+--- a/crates/scrive-core/src/lib.rs
++++ b/crates/scrive-core/src/lib.rs
+@@ -22,6 +22,8 @@
+ //! - move or extend the caret → [`selection`], [`movement`]
+ //! - type / paste / indent → [`verbs`]
+ //! - expand tabs to columns → [`display_map`]
++//! - place something on screen (row layouts, offset ↔ cell) → [`row_layout::Rows`],
++//!   from [`Document::rows`]
+ //! - syntax-highlight a line → [`highlight`]
+ //! - attach diagnostics / snippet stops → [`decorations`]
+ //! - complete / hover / signature help → [`intel::providers`]
+diff --git a/crates/scrive-core/src/movement.rs b/crates/scrive-core/src/movement.rs
+index 3427d6e..3804deb 100644
+--- a/crates/scrive-core/src/movement.rs
++++ b/crates/scrive-core/src/movement.rs
+@@ -19,6 +19,7 @@ use crate::buffer::Buffer;
+ use crate::coords::{Bias, Point};
+ use crate::display_map::{self, BufferRow, DisplayRow};
+ use crate::fold_map::FoldMap;
++use crate::row_layout::{Edge, Rows};
+ use crate::selection::SelectionSet;
+ 
+ /// A caret motion.
+@@ -83,11 +84,11 @@ pub enum ColumnDir {
+ /// Apply `motion` to every selection in `set`. With `extend`, each selection's
+ /// head moves and its anchor stays (grow/shrink); without, each collapses to a
+ /// caret at the motion target. Re-merges afterward (a move can make two
+-/// selections coincide). `tab` is the document's tab-stop width — vertical
+-/// motion keeps a *visual* goal column, so it needs the display projection.
+-pub fn move_selections(set: &mut SelectionSet, buffer: &Buffer, folds: &FoldMap, tab: u32, motion: Motion, extend: bool) {
++/// selections coincide). `rows` is the document's display projection; vertical
++/// motion keeps a *visual* goal column, so it needs it.
++pub fn move_selections(set: &mut SelectionSet, rows: &Rows<'_>, motion: Motion, extend: bool) {
+     set.map_each(|s| {
+-        let (target, goal) = motion_target(buffer, folds, tab, s.head(), s.goal, motion);
++        let (target, goal) = motion_target(rows, s.head(), s.goal, motion);
+         if extend {
+             s.set_head(target);
+             s.goal = goal;
+@@ -105,14 +106,15 @@ pub fn move_selections(set: &mut SelectionSet, buffer: &Buffer, folds: &FoldMap,
+ /// Compute a motion's target offset and the goal *display cell* it should
+ /// leave behind (`Some` only for vertical motions, which preserve it;
+ /// everything else clears it by returning `None`).
+-fn motion_target(buffer: &Buffer, folds: &FoldMap, tab: u32, head: u32, goal: Option<u32>, motion: Motion) -> (u32, Option<u32>) {
++fn motion_target(rows: &Rows<'_>, head: u32, goal: Option<u32>, motion: Motion) -> (u32, Option<u32>) {
++    let (buffer, folds) = (rows.buffer(), rows.folds());
+     match motion {
+         Motion::Left => (char_left(buffer, folds, head), None),
+         Motion::Right => (char_right(buffer, folds, head), None),
+-        Motion::Up => vertical_by(buffer, folds, tab, head, goal, -1),
+-        Motion::Down => vertical_by(buffer, folds, tab, head, goal, 1),
+-        Motion::PageUp(rows) => vertical_by(buffer, folds, tab, head, goal, -(rows as i32)),
+-        Motion::PageDown(rows) => vertical_by(buffer, folds, tab, head, goal, rows as i32),
++        Motion::Up => vertical_by(rows, head, goal, -1),
++        Motion::Down => vertical_by(rows, head, goal, 1),
++        Motion::PageUp(n) => vertical_by(rows, head, goal, -(n as i32)),
++        Motion::PageDown(n) => vertical_by(rows, head, goal, n as i32),
+         Motion::WordLeft => (skip_fold_left(buffer, folds, word_left(buffer, head)), None),
+         Motion::WordRight => (skip_fold_right(buffer, folds, word_right(buffer, head)), None),
+         Motion::LineStart => (line_start_smart_folded(buffer, folds, head), None),
+@@ -194,21 +196,22 @@ fn skip_fold_right(buffer: &Buffer, folds: &FoldMap, off: u32) -> u32 {
+ /// inline folds, and a collapsed block's one-line placeholder. Stepping happens
+ /// in DISPLAY rows (a folded interior is not a display row, so the caret can
+ /// never land inside a fold), and the landing resolves through the standard
+-/// inverse projection ([`FoldMap::hit_row`]) — exactly like a click at the goal
++/// inverse projection ([`Rows::hit`]) — exactly like a click at the goal
+ /// cell: a goal in a collapsed header's gap clamps to the header's end, one
+ /// over the tail lands on the tail's real offset, one on a chip snaps to its
+ /// landable left edge, one mid-tab snaps by bias, and past-EOL clamps.
+ /// Overshooting the top lands at the document start, the bottom at the
+ /// document end — so a single-row move at an edge lands on the nearest document
+ /// end, and page moves that overshoot collapse to those same ends.
+-fn vertical_by(buffer: &Buffer, folds: &FoldMap, tab: u32, offset: u32, goal: Option<u32>, delta: i32) -> (u32, Option<u32>) {
++fn vertical_by(rows: &Rows<'_>, offset: u32, goal: Option<u32>, delta: i32) -> (u32, Option<u32>) {
++    let (buffer, folds) = (rows.buffer(), rows.folds());
+     // The caret's display position (fold/tab aware). A caret can only rest on
+     // a visible slot, but fall back to the raw expansion defensively.
+-    let (row, cell) = match folds.display_position(buffer, offset, tab) {
++    let (row, cell) = match rows.position(offset, Edge::Caret) {
+         Some(p) => (p.row, p.x.cells()),
+         None => {
+             let p = buffer.offset_to_point(offset);
+-            (folds.to_display_row(BufferRow(p.row)), display_map::expand(&buffer.line(p.row), p.col, tab) as f32)
++            (folds.to_display_row(BufferRow(p.row)), display_map::expand(&buffer.line(p.row), p.col, rows.tab()) as f32)
+         }
+     };
+     let goal_cell = goal.unwrap_or_else(|| cell.round() as u32);
+@@ -221,7 +224,7 @@ fn vertical_by(buffer: &Buffer, folds: &FoldMap, tab: u32, offset: u32, goal: Op
+         return (buffer.len(), Some(goal_cell)); // past the bottom → document end
+     }
+     let new_row = folds.to_buffer_row(DisplayRow(target as u32));
+-    let off = folds.hit_row(buffer, new_row, goal_cell as f32, Bias::Left, tab);
++    let off = rows.hit(new_row, goal_cell as f32, Bias::Left);
+     (off, Some(goal_cell))
+ }
+ 
+@@ -230,16 +233,11 @@ fn vertical_by(buffer: &Buffer, folds: &FoldMap, tab: u32, offset: u32, goal: Op
+ /// display row (nothing to add there). The landing for add-cursor-above/below:
+ /// one call into [`vertical_by`], so tabs, chips, and collapsed headers
+ /// resolve exactly as plain vertical movement does.
+-pub(crate) fn caret_one_display_row(
+-    buffer: &Buffer,
+-    folds: &FoldMap,
+-    tab: u32,
+-    offset: u32,
+-    delta: i32,
+-) -> Option<u32> {
+-    let (off, _) = vertical_by(buffer, folds, tab, offset, None, delta);
++pub(crate) fn caret_one_display_row(rows: &Rows<'_>, offset: u32, delta: i32) -> Option<u32> {
++    let (off, _) = vertical_by(rows, offset, None, delta);
+     // vertical_by clamps an over-the-edge step to the doc start/end — which
+     // stays on the source's display row; reject that instead of adding there.
++    let (buffer, folds) = (rows.buffer(), rows.folds());
+     let row_of = |o: u32| folds.to_display_row(BufferRow(buffer.offset_to_point(o).row));
+     (row_of(off) != row_of(offset)).then_some(off)
+ }
+@@ -509,14 +507,10 @@ mod tests {
+     /// `document` tests.
+     fn mv(set: &mut SelectionSet, b: &Buffer, motion: Motion, extend: bool) {
+         use crate::fold_map::{FoldMap, FoldSet};
+-        move_selections(
+-            set,
+-            b,
+-            &FoldMap::new(&FoldSet::new(), &crate::bracket::Brackets::default(), b),
+-            display_map::default_tab_size(),
+-            motion,
+-            extend,
+-        );
++        let folds = std::cell::RefCell::new(FoldMap::new(&FoldSet::new(), &crate::bracket::Brackets::default(), b));
++        let inlays = crate::decorations::DecorationStore::new();
++        let rows = Rows::new(folds.borrow(), b, &inlays, display_map::default_tab_size());
++        move_selections(set, &rows, motion, extend);
+     }
+ 
+     /// Offset of `(row, col)`.
+diff --git a/crates/scrive-core/src/perf.rs b/crates/scrive-core/src/perf.rs
+index c5e13c2..ec2d5c0 100644
+--- a/crates/scrive-core/src/perf.rs
++++ b/crates/scrive-core/src/perf.rs
+@@ -3,7 +3,7 @@
+ //!
+ //! Instrumented hot-path primitives (`Buffer::offset_to_point`/`point_to_offset`,
+ //! `Patch::map_offset`/`map_many`, the bracket enclosing walk,
+-//! `FoldMap::display_position`, `FoldMap::new`, every document-scale
++//! `FoldMap::renders`, `Rows::position`, `FoldMap::new`, every document-scale
+ //! `sort`/`retain`/`dedup`) charge the meter by the *units of work they touch*.
+ //! A matrix test runs each representative editor operation at 2× every scale
+ //! dimension (document size, caret count, fold count) and asserts the meter grows
+diff --git a/crates/scrive-core/src/perf_gate.rs b/crates/scrive-core/src/perf_gate.rs
+index 7104cdc..0548bef 100644
+--- a/crates/scrive-core/src/perf_gate.rs
++++ b/crates/scrive-core/src/perf_gate.rs
+@@ -7,7 +7,7 @@
+ //! meter grows within that operation's declared budget. Coverage comes from the
+ //! meter sitting on the shared *semantic* primitives every hot path flows through
+ //! (`offset_to_point`, the per-query `map_offset`, the bracket enclosing-walk
+-//! step, `display_position`, the document-scale `sort`/`retain`), so ANY function
++//! step, `Rows::position`, the document-scale `sort`/`retain`), so ANY function
+ //! — named or not, present or future — that does superlinear work makes its
+ //! operation trip here. The contracts double as documentation of what a keystroke
+ //! is *allowed* to cost.
+diff --git a/crates/scrive-core/src/row_layout.rs b/crates/scrive-core/src/row_layout.rs
+index f4d67f5..e3faa3c 100644
+--- a/crates/scrive-core/src/row_layout.rs
++++ b/crates/scrive-core/src/row_layout.rs
+@@ -14,15 +14,19 @@
+ //! remaining job is `x = origin + cell × advance` (and its inverse).
+ 
+ use std::borrow::Cow;
++use std::cell::{Ref, RefCell};
++use std::collections::HashMap;
++use std::rc::Rc;
+ 
+ use crate::buffer::Buffer;
+ use crate::coords::{Bias, Point};
++use crate::decorations::DecorationStore;
+ use crate::display_map::{self, BufferRow, DisplayRow};
+ use crate::fold_map::{FoldMap, InlineFold};
+ 
+-// Op-count canary: counts `display_position` probes on this thread so a test
+-// can assert `expand_folds_touched` calls it O(edit points) per commit — once
+-// per point, for the hidden-gap check — and never O(candidates · edits), which
++// Op-count canary: counts `FoldMap::renders` and `Rows::position` probes on
++// this thread so a test can assert `expand_folds_touched` probes O(edit points)
++// per commit — once per point, for the hidden-gap check — and never O(candidates · edits), which
+ // would make a document-scale multi-caret edit over a folded document cost the
+ // product of the two. Debug/test only; zero-cost in release.
+ #[cfg(any(test, debug_assertions))]
+@@ -62,10 +66,26 @@ impl CaretCell {
+     }
+ }
+ 
++/// Which side of the inlay hints at one buffer offset a projection lands on.
++/// Hints take cells but no bytes, so an offset with hints spans several cells;
++/// each projection names the one it means. With no hints there, every edge is
++/// the same cell.
++#[derive(Copy, Clone, PartialEq, Eq, Debug)]
++pub enum Edge {
++    /// After every hint at the offset: glyphs, brackets and their boxes, popup
++    /// anchors at a word start, and the start of a range.
++    Start,
++    /// Before every hint at the offset: the end of a range.
++    End,
++    /// After the offset's prefix hints and before its suffix hints, where the
++    /// next typed character lands: carets, autoscroll, vertical motion.
++    Caret,
++}
++
+ /// Where a buffer offset renders: its display row plus its horizontal
+ /// [`CaretCell`]. THE owner of "where does offset O show on screen" — a caret,
+ /// selection endpoint, squiggle bound, popup anchor, and autoscroll target all
+-/// read the same value (see [`FoldMap::display_position`]).
++/// read the same value (see [`Rows::position`]).
+ #[derive(Copy, Clone, PartialEq, Debug)]
+ pub struct DisplayPosition {
+     /// The visible display row (a hidden closing tail resolves to its header's).
+@@ -174,12 +194,11 @@ struct InlineSpan {
+ 
+ /// A visible buffer row's horizontal projection: byte column ↔ display cell,
+ /// with tab expansion *and* the horizontal collapse of every root inline fold
+-/// on the row. Built per use by [`FoldMap::row_layout`]; holds only the row's
+-/// text (a [`Cow`] — borrowed straight off the backing when the row is stored
+-/// contiguously, owned only when it spans a chunk boundary) and copies of the
+-/// row's folds, so it carries no derived state that could drift out of sync
+-/// with the document. Like [`FoldMap`], it is cheap to rebuild and never
+-/// stored.
++/// on the row. Built by [`Rows::layout`], which shares it for the view's
++/// lifetime; holds only the row's text (a [`Cow`] — borrowed straight off the
++/// backing when the row is stored contiguously, owned only when it spans a
++/// chunk boundary) and copies of the row's folds, so it carries no derived
++/// state that could drift out of sync with the document.
+ pub struct RowLayout<'a> {
+     line: Cow<'a, str>,
+     /// Byte offset of the row's first character (column 0), for offset-space
+@@ -238,11 +257,12 @@ impl<'a> RowLayout<'a> {
+         (raw_cell as i32 - self.shift_at(raw_cell)).max(0) as u32
+     }
+ 
+-    /// Byte column → display cell (tab-expanded, inline-collapsed). Total and
+-    /// monotone; a column hidden inside a chip maps into the chip's span (use
+-    /// [`Self::caret_cell`] for caret placement, which clips to the center).
++    /// Byte column → display cell (tab-expanded, inline-collapsed), on the
++    /// `edge` side of any hints at `col`. Total and monotone; a column hidden
++    /// inside a chip maps into the chip's span (use [`Self::caret_cell`] for
++    /// caret placement, which clips to the center).
+     #[must_use]
+-    pub fn display_cell(&self, col: u32) -> u32 {
++    pub fn display_cell(&self, col: u32, _edge: Edge) -> u32 {
+         self.cell_of(display_map::expand(&self.line, col, self.tab))
+     }
+ 
+@@ -255,7 +275,7 @@ impl<'a> RowLayout<'a> {
+             Some(s) => CaretCell::ChipCenter(
+                 self.cell_of(s.open_cell + 1) as f32 + INLINE_CHIP_CELLS as f32 / 2.0,
+             ),
+-            None => CaretCell::Cell(self.display_cell(col)),
++            None => CaretCell::Cell(self.display_cell(col, Edge::Caret)),
+         }
+     }
+ 
+@@ -296,7 +316,7 @@ impl<'a> RowLayout<'a> {
+     /// this — see [`HeaderLayout::tail_cell`].
+     #[must_use]
+     pub fn width(&self) -> u32 {
+-        self.display_cell(self.line.len() as u32)
++        self.display_cell(self.line.len() as u32, Edge::Start)
+     }
+ 
+     /// The row's collapsed chips, in display order.
+@@ -319,8 +339,9 @@ impl<'a> RowLayout<'a> {
+ /// caret placement on the tail, selection washes, hit-testing, the hover-chip
+ /// rect, and the preview anchor, so they agree to the pixel by construction.
+ pub struct HeaderLayout<'a> {
+-    /// The header row's own horizontal projection.
+-    head: RowLayout<'a>,
++    /// The header row's own horizontal projection, shared with the view that
++    /// built it.
++    head: Rc<RowLayout<'a>>,
+     /// The fold's last buffer row — the line the tail glyphs come from.
+     last: BufferRow,
+     tail_line: Cow<'a, str>,
+@@ -330,6 +351,12 @@ pub struct HeaderLayout<'a> {
+ }
+ 
+ impl<'a> HeaderLayout<'a> {
++    fn new(head: Rc<RowLayout<'a>>, last: BufferRow, buffer: &'a Buffer, tab: u32) -> Self {
++        let tail_line = buffer.line(last.0);
++        let tail_lead = tail_start_col(&tail_line);
++        Self { head, last, tail_line, tail_lead, tab }
++    }
++
+     /// The header row's projection (for hits resolving to [`HeaderHit::Head`]).
+     #[must_use]
+     pub fn head(&self) -> &RowLayout<'a> {
+@@ -426,54 +453,46 @@ impl<'a> HeaderLayout<'a> {
+ }
+ 
+ impl FoldMap {
+-    /// The horizontal projection of visible buffer `row` — built per use,
+-    /// like the `FoldMap` itself; never store it.
++    /// A fresh horizontal projection of visible buffer `row`; [`Rows::layout`]
++    /// shares one per row for a view's lifetime.
+     #[must_use]
+-    pub fn row_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> RowLayout<'a> {
++    pub(crate) fn row_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> RowLayout<'a> {
+         RowLayout::new(self, buffer, row, tab)
+     }
+ 
+     /// The `head … tail` one-line layout of `row`, iff it is a collapsed block
+     /// fold's header.
+     #[must_use]
+-    pub fn header_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> Option<HeaderLayout<'a>> {
++    pub(crate) fn header_layout<'a>(&self, buffer: &'a Buffer, row: BufferRow, tab: u32) -> Option<HeaderLayout<'a>> {
+         let last = self.fold_at_header(row)?;
+-        let head = self.row_layout(buffer, row, tab);
+-        let tail_line = buffer.line(last.0);
+-        let tail_lead = tail_start_col(&tail_line);
+-        Some(HeaderLayout { head, last, tail_line, tail_lead, tab })
++        Some(HeaderLayout::new(Rc::new(self.row_layout(buffer, row, tab)), last, buffer, tab))
+     }
+ 
+-    /// THE owner of "where does buffer `offset` render": its display row and
+-    /// horizontal cell. Follows a collapsed block's closing tail to the header
+-    /// row; clips a column hidden in an inline fold to its chip center. `None`
+-    /// iff the offset is genuinely hidden — inside a block fold's gap, or on
+-    /// the last row before the visible tail.
++    /// Whether buffer `offset` renders anywhere: `false` only inside a
++    /// collapsed block's gap or before the visible tail on its last row.
++    /// Hint-free, so it answers inside `rebase_views` while the inlay store is
++    /// being moved; geometry goes through [`Rows::position`].
+     #[must_use]
+-    pub fn display_position(&self, buffer: &Buffer, offset: u32, tab: u32) -> Option<DisplayPosition> {
++    pub(crate) fn renders(&self, buffer: &Buffer, offset: u32, tab: u32) -> bool {
+         #[cfg(any(test, debug_assertions))]
+         DISPLAY_POSITION_PROBES.with(|c| c.set(c.get() + 1));
+         crate::perf::charge(1); // complexity gate: one display-map probe
+         let p = buffer.offset_to_point(offset);
+         let row = BufferRow(p.row);
+         if !self.is_folded(row) {
+-            let layout = self.row_layout(buffer, row, tab);
+-            return Some(DisplayPosition { row: self.to_display_row(row), x: layout.caret_cell(p.col) });
++            return true;
+         }
+-        // Hidden row: only a collapsed fold's closing tail is representable —
+-        // it rides the header's display line.
+-        let hdr = self.header_of_tail(row)?;
+-        let layout = self.header_layout(buffer, hdr, tab)?;
+-        let cell = layout.tail_col_cell(p.col)?;
+-        Some(DisplayPosition { row: self.to_display_row(hdr), x: CaretCell::Cell(cell) })
++        self.header_of_tail(row)
++            .and_then(|hdr| self.header_layout(buffer, hdr, tab))
++            .is_some_and(|layout| layout.tail_col_cell(p.col).is_some())
+     }
+ 
+-    /// Inverse of [`Self::display_position`] on one visible row: a (fractional,
++    /// Inverse of [`Rows::position`] on one visible row: a (fractional,
+     /// unrounded) display cell → the byte offset a click there lands on,
+     /// resolving a collapsed header's gap (→ header line end) and tail
+     /// (→ the last row's column) before the plain row projection.
+     #[must_use]
+-    pub fn hit_row(&self, buffer: &Buffer, row: BufferRow, cell: f32, bias: Bias, tab: u32) -> u32 {
++    pub(crate) fn hit_row(&self, buffer: &Buffer, row: BufferRow, cell: f32, bias: Bias, tab: u32) -> u32 {
+         if let Some(layout) = self.header_layout(buffer, row, tab) {
+             match layout.hit(cell, bias) {
+                 HeaderHit::Tail(col) => return buffer.point_to_offset(Point::new(layout.last_row().0, col)),
+@@ -500,6 +519,94 @@ impl FoldMap {
+     }
+ }
+ 
++/// A document's rows as they render: the fold projection, the buffer, the
++/// inlay hints and the tab width in one view, so no geometry query can leave
++/// one of them out. Get it from [`Document::rows`](crate::Document::rows) and
++/// keep it for one pass (a frame, an event, an edit): it borrows the
++/// document's fold cache.
++///
++/// Each row's layout is built once per view and shared, so the passes of one
++/// frame don't rebuild it.
++pub struct Rows<'a> {
++    folds: Ref<'a, FoldMap>,
++    buffer: &'a Buffer,
++    _inlays: &'a DecorationStore,
++    tab: u32,
++    built: RefCell<HashMap<BufferRow, Rc<RowLayout<'a>>>>,
++}
++
++impl<'a> Rows<'a> {
++    pub(crate) fn new(folds: Ref<'a, FoldMap>, buffer: &'a Buffer, inlays: &'a DecorationStore, tab: u32) -> Self {
++        Self { folds, buffer, _inlays: inlays, tab, built: RefCell::new(HashMap::new()) }
++    }
++
++    /// The fold projection: buffer ↔ display rows, visible rows, fold lookups.
++    #[must_use]
++    pub fn folds(&self) -> &FoldMap {
++        &self.folds
++    }
++
++    pub(crate) fn buffer(&self) -> &'a Buffer {
++        self.buffer
++    }
++
++    pub(crate) fn tab(&self) -> u32 {
++        self.tab
++    }
++
++    /// The horizontal projection of visible buffer `row`, built on first use
++    /// and shared afterwards.
++    #[must_use]
++    pub fn layout(&self, row: BufferRow) -> Rc<RowLayout<'a>> {
++        let cached = self.built.borrow().get(&row).cloned();
++        if let Some(layout) = cached {
++            return layout;
++        }
++        let layout = Rc::new(self.folds.row_layout(self.buffer, row, self.tab));
++        self.built.borrow_mut().insert(row, Rc::clone(&layout));
++        layout
++    }
++
++    /// The `head … tail` layout of `row`, iff it is a collapsed block fold's
++    /// header. Its head is [`Self::layout`]'s.
++    #[must_use]
++    pub fn header(&self, row: BufferRow) -> Option<HeaderLayout<'a>> {
++        let last = self.folds.fold_at_header(row)?;
++        Some(HeaderLayout::new(self.layout(row), last, self.buffer, self.tab))
++    }
++
++    /// Where buffer `offset` renders, on the `edge` side of any hints there:
++    /// its display row and cell. Follows a collapsed block's closing tail to
++    /// the header row and clips a column hidden in an inline fold to its chip
++    /// center. `None` iff the offset is hidden: inside a block fold's gap, or
++    /// on the last row before the visible tail.
++    #[must_use]
++    pub fn position(&self, offset: u32, _edge: Edge) -> Option<DisplayPosition> {
++        #[cfg(any(test, debug_assertions))]
++        DISPLAY_POSITION_PROBES.with(|c| c.set(c.get() + 1));
++        crate::perf::charge(1); // complexity gate: one display-map probe
++        let p = self.buffer.offset_to_point(offset);
++        let row = BufferRow(p.row);
++        if !self.folds.is_folded(row) {
++            return Some(DisplayPosition { row: self.folds.to_display_row(row), x: self.layout(row).caret_cell(p.col) });
++        }
++        // A hidden row renders only a collapsed fold's closing tail, on the
++        // header's display line.
++        let hdr = self.folds.header_of_tail(row)?;
++        let cell = self.header(hdr)?.tail_col_cell(p.col)?;
++        Some(DisplayPosition { row: self.folds.to_display_row(hdr), x: CaretCell::Cell(cell) })
++    }
++
++    /// The inverse of [`Self::position`] on visible `row`: a fractional
++    /// display cell → the byte offset a click there lands on. A collapsed
++    /// header's gap resolves to the header line's end, its tail to the last
++    /// row's column.
++    #[must_use]
++    pub fn hit(&self, row: BufferRow, cell: f32, bias: Bias) -> u32 {
++        self.folds.hit_row(self.buffer, row, cell, bias, self.tab)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -533,7 +640,7 @@ mod tests {
+         // col 3 (strict interior) clips to the chip center: cell 2 + 1.5.
+         assert_eq!(rl.caret_cell(3), CaretCell::ChipCenter(2.0 + INLINE_CHIP_CELLS as f32 / 2.0));
+         // col 7 == close: the RIGHT landable edge.
+-        assert_eq!(rl.caret_cell(7), CaretCell::Cell(rl.display_cell(7)));
++        assert_eq!(rl.caret_cell(7), CaretCell::Cell(rl.display_cell(7, Edge::Caret)));
+         // Glyphs: open+1's glyph hides even though its caret slot is landable.
+         assert!(rl.glyph_hidden(2));
+         assert!(!rl.glyph_hidden(7), "the closing bracket stays visible");
+@@ -560,7 +667,7 @@ mod tests {
+             if rl.glyph_hidden(col) {
+                 continue; // interior columns resolve to the chip instead
+             }
+-            assert_eq!(rl.hit(rl.display_cell(col) as f32, Bias::Left), col, "round-trip col {col}");
++            assert_eq!(rl.hit(rl.display_cell(col, Edge::Start) as f32, Bias::Left), col, "round-trip col {col}");
+         }
+         // Every cell strictly on a chip resolves to just after its `[`. The
+         // second chip is the discriminating case: it resolves correctly only
+@@ -612,28 +719,28 @@ mod tests {
+         }
+     }
+ 
+-    // ── display_position: the one offset→(row, x) owner — an offset below a
++    // ── Rows::position: the one offset→(row, x) owner — an offset below a
+     //    fold resolves onto its visible display-space row ──
+ 
+     #[test]
+-    fn display_position_follows_tail_and_hides_gap() {
++    fn position_follows_tail_and_hides_gap() {
+         let text = "a {\nhidden\n} tail\nafter\n";
+         let block_open = text.find('{').unwrap() as u32;
+         let doc = doc_with_folds(text, &[block_open]);
+-        let fm = fold_map(&doc);
++        let rows = doc.rows();
+         let buffer = doc.buffer();
+         // An offset inside the fold's gap is unrepresentable.
+         let hidden = buffer.point_to_offset(Point::new(1, 2));
+-        assert_eq!(fm.display_position(buffer, hidden, 4), None);
++        assert_eq!(rows.position(hidden, Edge::Caret), None);
+         // The tail `}` rides the header's display row at the tail cell.
+         let tail = buffer.point_to_offset(Point::new(2, 0));
+-        let p = fm.display_position(buffer, tail, 4).expect("tail is visible");
++        let p = rows.position(tail, Edge::Caret).expect("tail is visible");
+         assert_eq!(p.row, DisplayRow(0));
+-        let hl = fm.header_layout(buffer, BufferRow(0), 4).unwrap();
++        let hl = rows.header(BufferRow(0)).unwrap();
+         assert_eq!(p.x, CaretCell::Cell(hl.tail_cell()));
+         // A row below the fold is shifted up by the hidden count.
+         let after = buffer.point_to_offset(Point::new(3, 0));
+-        let p = fm.display_position(buffer, after, 4).expect("visible");
++        let p = rows.position(after, Edge::Caret).expect("visible");
+         assert_eq!(p.row, DisplayRow(1), "rows 1..=2 hidden ⇒ row 3 displays at 1");
+     }
+ 
+@@ -673,9 +780,67 @@ mod tests {
+         let fm = fold_map(&doc);
+         let rl = fm.row_layout(doc.buffer(), BufferRow(0), 4);
+         assert!(rl.is_plain());
+-        assert_eq!(rl.display_cell(0), 0);
+-        assert_eq!(rl.display_cell(1), 4, "tab expands to the stop");
++        assert_eq!(rl.display_cell(0, Edge::Start), 0);
++        assert_eq!(rl.display_cell(1, Edge::Start), 4, "tab expands to the stop");
+         assert_eq!(rl.width(), 4 + "x = 1".len() as u32);
+         assert_eq!(rl.hit(4.0, Bias::Left), 1);
+     }
++
++    // ── Rows: the view every geometry projection goes through ──
++
++    /// One build per row per view, and a collapsed header's head is that build.
++    #[test]
++    fn rows_build_each_row_once_and_the_header_shares_it() {
++        let text = "a {\nhidden\n} tail\nafter\n";
++        let doc = doc_with_folds(text, &[text.find('{').unwrap() as u32]);
++        let rows = doc.rows();
++        let head = rows.layout(BufferRow(0));
++        assert!(Rc::ptr_eq(&head, &rows.layout(BufferRow(0))), "a second query reuses the first build");
++        let hl = rows.header(BufferRow(0)).expect("row 0 is a collapsed header");
++        assert!(std::ptr::eq(hl.head(), &*head), "the header's head is the memoised layout");
++        assert!(rows.header(BufferRow(3)).is_none(), "a plain row has no header layout");
++    }
++
++    /// The view's fold projection is the document's cached one.
++    #[test]
++    fn rows_folds_is_the_documents_fold_map() {
++        let doc = doc_with_folds("a {\nb\n}\nc\n", &[2]);
++        assert_eq!(*doc.rows().folds(), *doc.fold_map(), "the view reads the cached fold map");
++    }
++
++    /// Without hints every edge is the same cell, and `renders` agrees with
++    /// `position` on every offset.
++    #[test]
++    fn rows_position_is_one_cell_on_every_edge_and_renders_agrees() {
++        let text = "f([a, b]) {\ninner\n} tail\nafter\n";
++        let inline_open = text.find('[').unwrap() as u32;
++        let block_open = text.find('{').unwrap() as u32;
++        let doc = doc_with_folds(text, &[inline_open, block_open]);
++        let rows = doc.rows();
++        for offset in 0..=doc.buffer().len() {
++            let caret = rows.position(offset, Edge::Caret);
++            assert_eq!(rows.position(offset, Edge::Start), caret, "offset {offset}: Start");
++            assert_eq!(rows.position(offset, Edge::End), caret, "offset {offset}: End");
++            assert_eq!(rows.folds().renders(doc.buffer(), offset, doc.tab_size()), caret.is_some(), "offset {offset}: renders");
++        }
++    }
++
++    /// `hit` lands back on every landable offset `position` projected, across an
++    /// inline chip, a collapsed header and its tail.
++    #[test]
++    fn rows_hit_inverts_position_on_landable_offsets() {
++        let text = "f([a, b]) {\ninner\n}\nafter\n";
++        let inline_open = text.find('[').unwrap() as u32;
++        let close = text.find(']').unwrap() as u32;
++        let block_open = text.find('{').unwrap() as u32;
++        let doc = doc_with_folds(text, &[inline_open, block_open]);
++        let rows = doc.rows();
++        let tail = doc.buffer().point_to_offset(Point::new(2, 0));
++        let after = doc.buffer().point_to_offset(Point::new(3, 2));
++        for offset in [0, inline_open + 1, close, block_open, tail, after] {
++            let p = rows.position(offset, Edge::Caret).expect("landable offset");
++            let row = rows.folds().to_buffer_row(p.row);
++            assert_eq!(rows.hit(row, p.x.cells(), Bias::Left), offset, "offset {offset} round-trips");
++        }
++    }
+ }
+diff --git a/crates/scrive-iced/src/editor.rs b/crates/scrive-iced/src/editor.rs
+index 94bb0e8..a07d298 100644
+--- a/crates/scrive-iced/src/editor.rs
++++ b/crates/scrive-iced/src/editor.rs
+@@ -38,6 +38,7 @@ use scrive_core::{
+     HighlightSpan, HoverInfo, Motion, Point as BufPoint, PopupList, RevealMode, RowLayout, Severity,
+     SignatureInfo, HOVER_IDLE_DELAY_MS,
+ };
++use scrive_core::row_layout::{Edge, Rows};
+ 
+ use crate::geo::{Geo, ScrollAnchor, CHIP_PILL_RADIUS, TEXT_PAD};
+ use crate::popup;
+@@ -795,14 +796,12 @@ impl<'a, Message> Editor<'a, Message> {
+     /// The screen x of buffer `offset` — the one fold-aware horizontal
+     /// projection. Tab expansion, inline-fold collapse, chip-center clipping,
+     /// and collapsed-tail following all come from the core's one owner
+-    /// ([`FoldMap::display_position`]); the pixel affix is [`Geo::cell_x`]'s.
+-    /// An offset genuinely hidden inside a fold (callers never pass one —
+-    /// carets, selection endpoints on visible rows, and popup anchors are
+-    /// visible by construction) falls back to the text origin.
+-    fn offset_screen_x(&self, fold_map: &FoldMap, geo: &Geo, offset: u32) -> f32 {
+-        let cells = fold_map
+-            .display_position(self.doc.buffer(), offset, TAB)
+-            .map_or(0.0, |p| p.x.cells());
++    /// ([`Rows::position`], on the `edge` side of any hints); the pixel affix
++    /// is [`Geo::cell_x`]'s. An offset genuinely hidden inside a fold (callers
++    /// never pass one — carets, selection endpoints on visible rows, and popup
++    /// anchors are visible by construction) falls back to the text origin.
++    fn offset_screen_x(&self, rows: &Rows<'_>, geo: &Geo, offset: u32, edge: Edge) -> f32 {
++        let cells = rows.position(offset, edge).map_or(0.0, |p| p.x.cells());
+         geo.cell_x(cells)
+     }
+ 
+@@ -812,16 +811,16 @@ impl<'a, Message> Editor<'a, Message> {
+     /// display-space by construction, so a panel anchors at the display row and
+     /// cannot sit too low below a fold; each panel keeps its own flip/clamp
+     /// choice on top.
+-    fn popup_anchor(&self, fold_map: &FoldMap, geo: &Geo, offset: u32) -> (f32, f32, f32) {
+-        let top = match fold_map.display_position(self.doc.buffer(), offset, TAB) {
++    fn popup_anchor(&self, rows: &Rows<'_>, geo: &Geo, offset: u32, edge: Edge) -> (f32, f32, f32) {
++        let top = match rows.position(offset, edge) {
+             Some(p) => geo.row_y(p.row),
+             // Hidden offset (callers don't pass one): clip to its fold's header row.
+             None => {
+                 let row = self.doc.buffer().offset_to_point(offset).row;
+-                geo.row_y(fold_map.to_display_row(BufferRow(row)))
++                geo.row_y(rows.folds().to_display_row(BufferRow(row)))
+             }
+         };
+-        (self.offset_screen_x(fold_map, geo, offset), top, top + geo.line_h())
++        (self.offset_screen_x(rows, geo, offset, edge), top, top + geo.line_h())
+     }
+ 
+     /// The document's memoized fold-aware row converter — O(1) unless the
+@@ -840,10 +839,11 @@ impl<'a, Message> Editor<'a, Message> {
+     fn any_caret_on_screen(
+         &self,
+         buffer: &scrive_core::Buffer,
+-        fold_map: &FoldMap,
++        rows: &Rows<'_>,
+         top_rows: f64,
+         viewport_rows: f64,
+     ) -> bool {
++        let fold_map = rows.folds();
+         let first_buf = fold_map.to_buffer_row(fold_map.display_row_at(top_rows)).0;
+         let last_buf = fold_map.to_buffer_row(fold_map.display_row_at(top_rows + viewport_rows)).0;
+         let vis_start = buffer.point_to_offset(BufPoint { row: first_buf, col: 0 });
+@@ -852,9 +852,7 @@ impl<'a, Message> Editor<'a, Message> {
+         // The partially-scrolled top row still counts as visible (floor it).
+         let band = top_rows.floor()..(top_rows + viewport_rows);
+         sels[visible_selection_span(sels, vis_start, vis_end)].iter().any(|s| {
+-            fold_map
+-                .display_position(buffer, s.head(), TAB)
+-                .is_some_and(|p| band.contains(&f64::from(p.row.index())))
++            rows.position(s.head(), Edge::Caret).is_some_and(|p| band.contains(&f64::from(p.row.index())))
+         })
+     }
+ 
+@@ -873,7 +871,8 @@ impl<'a, Message> Editor<'a, Message> {
+     /// inline pair bounds its bracket span. `None` for an all-blank block or a pair
+     /// whose header is itself hidden inside an outer collapsed fold. (Collapsed folds
+     /// use [`collapsed_chip_rect`](Self::collapsed_chip_rect) instead.)
+-    fn collapsible_box_rect(&self, fold_map: &FoldMap, geo: &Geo, open: u32, close: u32, header: u32, last: u32) -> Option<Rectangle> {
++    fn collapsible_box_rect(&self, rows: &Rows<'_>, geo: &Geo, open: u32, close: u32, header: u32, last: u32) -> Option<Rectangle> {
++        let fold_map = rows.folds();
+         let buffer = self.doc.buffer();
+         let code_left = geo.code_left();
+         if fold_map.is_folded(BufferRow(header)) {
+@@ -895,7 +894,7 @@ impl<'a, Message> Editor<'a, Message> {
+                     continue;
+                 }
+                 lo = lo.min(line_indent_cells(&l));
+-                hi = hi.max(fold_map.row_layout(buffer, BufferRow(r), TAB).width());
++                hi = hi.max(rows.layout(BufferRow(r)).width());
+             }
+             if lo == u32::MAX {
+                 return None;
+@@ -906,8 +905,8 @@ impl<'a, Message> Editor<'a, Message> {
+             Some(Rectangle { x: x0, y: y - 1.0, width: (x1 - x0).max(geo.advance()), height: (yl + geo.line_h()) - y + 1.0 })
+         } else {
+             // Inline: the bracket span on the one row (shared cell projection).
+-            let xo = self.offset_screen_x(fold_map, geo, open);
+-            let xc = self.offset_screen_x(fold_map, geo, close);
++            let xo = self.offset_screen_x(rows, geo, open, Edge::Start);
++            let xc = self.offset_screen_x(rows, geo, close, Edge::Start);
+             Some(geo.inline_halo(xo.min(xc), xo.max(xc), y))
+         }
+     }
+@@ -918,8 +917,8 @@ impl<'a, Message> Editor<'a, Message> {
+     /// instead, [`collapsed_chip_at`](Self::collapsed_chip_at)). Keying on pixel
+     /// containment — not byte range — keeps the finger and click confined to the
+     /// boxes you can see. The caller picks the innermost by `close - open`.
+-    fn armed_boxes(&self, geo: &Geo, pos: Point) -> Vec<(u32, u32, Rectangle)> {
+-        let fold_map = self.fold_map();
++    fn armed_boxes(&self, rows: &Rows<'_>, geo: &Geo, pos: Point) -> Vec<(u32, u32, Rectangle)> {
++        let fold_map = rows.folds();
+         let display = fold_map.display_row_at(geo.rows_from_top(pos.y));
+         let pr = fold_map.to_buffer_row(display).0;
+         // Windowed: a pair spanning `pr` is headed at a row <= pr; query only
+@@ -931,7 +930,7 @@ impl<'a, Message> Editor<'a, Message> {
+             .into_iter()
+             .filter(|&(_, _, header, last)| pr >= header && pr <= last) // cheap row pre-filter
+             .filter_map(|(open, close, header, last)| {
+-                let rect = self.collapsible_box_rect(&fold_map, geo, open, close, header, last)?;
++                let rect = self.collapsible_box_rect(rows, geo, open, close, header, last)?;
+                 rect.contains(pos).then_some((open, close, rect))
+             })
+             .collect()
+@@ -957,16 +956,15 @@ impl<'a, Message> Editor<'a, Message> {
+     /// only the visible rows, never every line, per frame / layout / wheel tick).
+     /// If the adaptive feel fails the field gate, the fallback is a document-owned
+     /// line-width index (exact global max, 4 B/line).
+-    fn max_line_px(&self, advance: f32, line_h: f32, bounds: Rectangle, scroll_rows: f64) -> f32 {
+-        let buffer = self.doc.buffer();
+-        let fold_map = self.fold_map();
++    fn max_line_px(&self, rows: &Rows<'_>, advance: f32, line_h: f32, bounds: Rectangle, scroll_rows: f64) -> f32 {
++        let fold_map = rows.folds();
+         let window = fold_map
+             .display_window(scroll_rows, scroll_rows + f64::from(bounds.height) / f64::from(line_h));
+         fold_map
+             .visible_rows(window)
+-            .map(|vr| match fold_map.header_layout(buffer, vr.buffer_row, TAB) {
++            .map(|vr| match rows.header(vr.buffer_row) {
+                 Some(hl) => hl.width(),
+-                None => fold_map.row_layout(buffer, vr.buffer_row, TAB).width(),
++                None => rows.layout(vr.buffer_row).width(),
+             })
+             .max()
+             .unwrap_or(0) as f32
+@@ -982,8 +980,8 @@ impl<'a, Message> Editor<'a, Message> {
+ 
+     /// Max horizontal scroll: how far the widest line overhangs the code area (a
+     /// trailing `TEXT_PAD` so the last glyph isn't flush against the edge).
+-    fn max_scroll_x(&self, bounds: Rectangle, advance: f32, line_h: f32, scroll_rows: f64) -> f32 {
+-        (self.max_line_px(advance, line_h, bounds, scroll_rows) + TEXT_PAD
++    fn max_scroll_x(&self, rows: &Rows<'_>, bounds: Rectangle, advance: f32, line_h: f32, scroll_rows: f64) -> f32 {
++        (self.max_line_px(rows, advance, line_h, bounds, scroll_rows) + TEXT_PAD
+             - self.code_area_width(bounds, advance, line_h, scroll_rows))
+         .max(0.0)
+     }
+@@ -1034,8 +1032,8 @@ impl<'a, Message> Editor<'a, Message> {
+     /// track spans the code area (gutter edge → vertical-scrollbar edge), so the
+     /// two bars meet at the corner without overlapping. The mirror of
+     /// `scrollbar()` on the X axis.
+-    fn hscrollbar(&self, bounds: Rectangle, advance: f32, line_h: f32, scroll_x: f32, scroll_rows: f64) -> Option<HScrollbar> {
+-        let max_scroll = self.max_scroll_x(bounds, advance, line_h, scroll_rows);
++    fn hscrollbar(&self, rows: &Rows<'_>, bounds: Rectangle, advance: f32, line_h: f32, scroll_x: f32, scroll_rows: f64) -> Option<HScrollbar> {
++        let max_scroll = self.max_scroll_x(rows, bounds, advance, line_h, scroll_rows);
+         if max_scroll <= 0.0 {
+             return None;
+         }
+@@ -1260,6 +1258,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         let size = limits.bounds();
+         let state = tree.state.downcast_mut::<State>();
+         self.ensure_metrics(state);
++        let rows = self.doc.rows();
+         let (advance, line_h) = (state.metrics.advance, state.metrics.line_height);
+         // Viewport rect for the scroll math (origin-independent — it uses widths
+         // and the vertical-overflow test only).
+@@ -1276,14 +1275,13 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         if state.autoscroll {
+             let buffer = self.doc.buffer();
+             let head = self.doc.selections().newest().head();
+-            let fold_map = self.fold_map();
+             // Both reveal axes read the one fold-aware projection: the row
+             // in display space, the cell inline-collapse-aware — a caret past a
+             // collapsed chip or riding a fold's tail reveals where it renders.
+             // A HIDDEN caret (inside a fold) reveals nothing — jump verbs
+             // unfold their targets first; anything else holds the viewport
+             // rather than scrolling to a fake row 0.
+-            if let Some(p) = fold_map.display_position(buffer, head, TAB) {
++            if let Some(p) = rows.position(head, Edge::Caret) {
+                 // Row units end to end (the ScrollAnchor model): the caret's
+                 // display row is exact, the viewport is a small row count.
+                 let caret_row = f64::from(p.row.index());
+@@ -1303,7 +1301,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                         f64::from(default_autoscroll_margin()),
+                     )
+                 };
+-                let rows = match mode {
++                let target_rows = match mode {
+                     // Find/diagnostic jumps center the target row.
+                     RevealMode::Center => caret_row + 0.5 - viewport_rows / 2.0,
+                     // Ctrl+D: jump to the just-added cursor even if others show.
+@@ -1314,10 +1312,10 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                     // the user can already see one (as mainstream editors do). A
+                     // lone off-screen caret has none on screen and falls through
+                     // to fit it, so single-cursor typing/moves are unchanged.
+-                    RevealMode::Fit if self.any_caret_on_screen(buffer, &fold_map, cur, viewport_rows) => cur,
++                    RevealMode::Fit if self.any_caret_on_screen(buffer, &rows, cur, viewport_rows) => cur,
+                     RevealMode::Fit => fit(),
+                 };
+-                state.scroll = ScrollAnchor::from_rows(rows, line_h);
++                state.scroll = ScrollAnchor::from_rows(target_rows, line_h);
+                 // Horizontal (both reveal classes): keep cells [col−1,
+                 // col+2] inside the code area, minimally; a band wider than
+                 // the viewport is the reveal_fit no-op case.
+@@ -1340,7 +1338,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+             line_h,
+         );
+         state.scroll_x =
+-            state.scroll_x.clamp(0.0, self.max_scroll_x(vp, advance, line_h, state.scroll.rows(line_h)));
++            state.scroll_x.clamp(0.0, self.max_scroll_x(&rows, vp, advance, line_h, state.scroll.rows(line_h)));
+         tree.size = size;
+     }
+ 
+@@ -1399,7 +1397,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         // Folds: rows hidden inside a fold are not produced. `first`/`last`
+         // are DISPLAY rows (the visible window); the render iterates display rows
+         // and maps each back to its buffer row.
+-        let fold_map = self.fold_map();
++        let rows = self.doc.rows();
++        let fold_map = rows.folds();
+         // The visible display-row window — floor/ceil/clamp policy lives with
+         // the fold map; the widget only supplies fractional rows from pixels.
+         let window = fold_map
+@@ -1419,8 +1418,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         // projection (tab expansion, inline collapse, chip-center clipping,
+         // collapsed-tail following), culled to the visible display window. `None`
+         // if the offset is genuinely hidden (in a fold's gap) or scrolled out.
+-        let offset_xy = |off: u32| -> Option<(f32, f32)> {
+-            let p = fold_map.display_position(buffer, off, TAB)?;
++        let offset_xy = |off: u32, edge: Edge| -> Option<(f32, f32)> {
++            let p = rows.position(off, edge)?;
+             window.contains(&p.row.index()).then(|| (geo.cell_x(p.x.cells()), geo.row_y(p.row)))
+         };
+ 
+@@ -1508,7 +1507,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         let sels = self.doc.selections().all();
+         for sel in &sels[visible_selection_span(sels, vis_start, vis_end)] {
+             if !sel.is_empty() {
+-                self.draw_selection(renderer, &geo, sel.start(), sel.end(), selection_color);
++                self.draw_selection(renderer, &rows, &geo, sel.start(), sel.end(), selection_color);
+             }
+         }
+         // Word-under-caret occurrence wash — highlight every occurrence of the
+@@ -1517,7 +1516,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         if self.doc.find_query().is_none() {
+             // The visible window bounds the scan, so it stays O(viewport).
+             for span in self.doc.caret_word_occurrences(vis_start..vis_end) {
+-                self.draw_selection(renderer, &geo, span.start, span.end, OCCURRENCE_MATCH);
++                self.draw_selection(renderer, &rows, &geo, span.start, span.end, OCCURRENCE_MATCH);
+             }
+         }
+         // Find-in-selection: shade the scope UNDER the match washes, so an
+@@ -1527,12 +1526,12 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         if let Some(scope) = self.doc.find_scope() {
+             let (s, e) = (scope.start.max(vis_start), scope.end.min(vis_end));
+             if s < e {
+-                self.draw_selection(renderer, &geo, s, e, FIND_SCOPE);
++                self.draw_selection(renderer, &rows, &geo, s, e, FIND_SCOPE);
+             }
+         }
+         for (span, is_active) in self.doc.find_matches_in(vis_start..vis_end) {
+             let color = if is_active { FIND_MATCH_ACTIVE } else { FIND_MATCH };
+-            self.draw_selection(renderer, &geo, span.start, span.end, color);
++            self.draw_selection(renderer, &rows, &geo, span.start, span.end, color);
+         }
+ 
+         // Indentation guides (on by default): monochrome 1 px vertical lines at
+@@ -1602,7 +1601,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+             let spans = self.doc.highlight_line_spans(row);
+             // Rows with an inline (single-line) fold draw collapsed — the interior
+             // between the brackets hides behind a `…` chip, the rest shifts left.
+-            let row_layout = fold_map.row_layout(buffer, BufferRow(row), TAB);
++            let row_layout = rows.layout(BufferRow(row));
+             if !row_layout.is_plain() {
+                 self.draw_row_inline(renderer, &line, spans, origin, &geo, &row_layout, dim, text_color, code_clip);
+             } else {
+@@ -1622,9 +1621,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 // closing tail. Every cell comes from the core's one
+                 // `HeaderLayout` owner, so the painted glyphs, caret placement,
+                 // hit-testing, and selection washes agree by construction.
+-                let hl = fold_map
+-                    .header_layout(buffer, BufferRow(row), TAB)
+-                    .expect("is_fold_header rows have a header layout");
++                let hl = rows.header(BufferRow(row)).expect("is_fold_header rows have a header layout");
+                 let mid = geo.cell_x(hl.gap_center());
+                 // Where the selection runs through the fold, the wash now spans the
+                 // gap (see `draw_wash_row`), so drop the idle pill — else it islands
+@@ -1676,7 +1673,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+             } else {
+                 buffer.len() + 1 // sentinel: a bracket at the final byte is inside
+             };
+-            let row_layout = fold_map.row_layout(buffer, BufferRow(row), TAB);
++            let row_layout = rows.layout(BufferRow(row));
+             for br in self.doc.brackets().in_range_iter(row_start..row_end) {
+                 let col = br.offset - row_start;
+                 let Some(ch) = buffer.char_at(br.offset) else { continue };
+@@ -1685,7 +1682,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 if row_layout.glyph_hidden(col) {
+                     continue;
+                 }
+-                let x = geo.cell_x(row_layout.display_cell(col) as f32);
++                let x = geo.cell_x(row_layout.display_cell(col, Edge::Start) as f32);
+                 let color = if br.partner.is_none() {
+                     UNMATCHED_BRACKET
+                 } else {
+@@ -1705,7 +1702,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 // Route through `offset_xy` so a matched bracket on a collapsed
+                 // fold's closing tail (the `}` inline on the header line) gets boxed
+                 // too, not just the visible opening bracket.
+-                let Some((x, y)) = offset_xy(off) else { continue };
++                let Some((x, y)) = offset_xy(off, Edge::Start) else { continue };
+                 fill_border(renderer, Rectangle { x, y, width: advance, height: line_h }, match_box, 1.0);
+             }
+         }
+@@ -1752,8 +1749,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 }
+                 // Fold-aware endpoints: a diagnostic spanning a collapsed
+                 // inline fold underlines the shifted glyphs, not the raw columns.
+-                let x0 = self.offset_screen_x(&fold_map, &geo, row_start);
+-                let x1 = self.offset_screen_x(&fold_map, &geo, row_end).max(x0 + advance);
++                let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
++                let x0 = self.offset_screen_x(&rows, &geo, row_start, from);
++                let x1 = self.offset_screen_x(&rows, &geo, row_end, if row == ep_row { to } else { Edge::Start }).max(x0 + advance);
+                 let baseline = row_y + line_h - SQUIGGLE_AMPLITUDE - 0.5;
+                 squiggle_spans(x0, x1, baseline, |rect| fill(renderer, rect, color));
+             }
+@@ -1786,7 +1784,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 // what folds"); the innermost box the pointer is actually over is
+                 // bright + washed (the Ctrl+Click target), drawn last so it wins.
+                 let active = self
+-                    .armed_boxes(&geo, pos)
++                    .armed_boxes(&rows, &geo, pos)
+                     .into_iter()
+                     .min_by_key(|&(o, c, _)| c - o)
+                     .map(|(o, ..)| o);
+@@ -1801,7 +1799,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                     if last_row < first_buf || header > last_buf {
+                         continue; // wholly off-screen
+                     }
+-                    let Some(rect) = self.collapsible_box_rect(&fold_map, &geo, open, close, header, last_row) else {
++                    let Some(rect) = self.collapsible_box_rect(&rows, &geo, open, close, header, last_row) else {
+                         continue;
+                     };
+                     if active == Some(open) {
+@@ -1824,7 +1822,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         // span (`collapsed_chip_rect`); only the visual is this tight.
+         if !state.modifiers.command() {
+             if let Some(opener) = state.hover_chip {
+-                if let Some(pill) = self.chip_pill_rect(&fold_map, &geo, opener) {
++                if let Some(pill) = self.chip_pill_rect(&rows, &geo, opener) {
+                     fill_rounded(renderer, pill, Color { a: CHIP_HOVER_A, ..text_color }, CHIP_PILL_RADIUS);
+                 }
+             }
+@@ -1840,7 +1838,14 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+             // the per-frame cost of a document-scale multi-cursor set to O(visible).
+             let sels = self.doc.selections().all();
+             for sel in &sels[visible_selection_span(sels, vis_start, vis_end)] {
+-                if let Some((x, y)) = offset_xy(sel.head()) {
++                let edge = if sel.is_empty() {
++                    Edge::Caret
++                } else if sel.head() == sel.end() {
++                    Edge::End
++                } else {
++                    Edge::Start
++                };
++                if let Some((x, y)) = offset_xy(sel.head(), edge) {
+                     let r = Rectangle { x: x - CARET_WIDTH / 2.0, y: y + 1.0, width: CARET_WIDTH, height: line_h - 2.0 };
+                     fill(renderer, r, text_color);
+                 }
+@@ -1955,7 +1960,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         // Horizontal scrollbar thumb (bottom edge, only on horizontal overflow) —
+         // the same translucent thumb as the vertical bar, no overview markers. Its
+         // track stops at the vertical bar, so the two meet at the corner cleanly.
+-        if let Some(hb) = self.hscrollbar(bounds, advance, line_h, scroll_x, state.scroll.rows(line_h)) {
++        if let Some(hb) = self.hscrollbar(&rows, bounds, advance, line_h, scroll_x, state.scroll.rows(line_h)) {
+             let thumb = if state.hscrollbar_grab.is_some() { SCROLLBAR_THUMB_ACTIVE } else { SCROLLBAR_THUMB };
+             fill(renderer, Rectangle { x: hb.thumb_x, y: hb.y, width: hb.thumb_w, height: SCROLLBAR_WIDTH }, thumb);
+         }
+@@ -2001,6 +2006,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         let state = tree.state.downcast_mut::<State>();
+         self.ensure_metrics(state);
+         let (advance, line_h) = (state.metrics.advance, state.metrics.line_height);
++        let rows = self.doc.rows();
+ 
+         // Report the visible range to the app — the view reports its viewport to
+         // the model: highlighting runs only down to what is on screen,
+@@ -2068,7 +2074,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 }
+                 // Same for the bottom horizontal bar (checked after the vertical
+                 // one, which owns the corner).
+-                if let Some(hb) = self.hscrollbar(bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h)) {
++                if let Some(hb) = self.hscrollbar(&rows, bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h)) {
+                     if hb.contains_y(pos.y) {
+                         let grab = if hb.thumb_contains_x(pos.x) {
+                             pos.x - hb.thumb_x
+@@ -2100,7 +2106,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 // reads as toggling the collapsed span. (Ctrl is the collapse gesture,
+                 // below; a modified click falls through to selection.)
+                 if !state.modifiers.command() && !state.modifiers.shift() && !state.modifiers.alt() {
+-                    if let Some(opener) = self.collapsed_chip_at(&geo, pos) {
++                    if let Some(opener) = self.collapsed_chip_at(&rows, &geo, pos) {
+                         shell.publish((self.on_action)(Action::ToggleFold { opener }));
+                         shell.capture_event();
+                         return;
+@@ -2111,7 +2117,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 // adds carets, Shift extends; plain Ctrl is otherwise just a caret.
+                 if SHOW_CTRL_COLLAPSE_AFFORDANCE && state.modifiers.command() && !state.modifiers.shift() && !state.modifiers.alt() {
+                     let target = self
+-                        .armed_boxes(&geo, pos)
++                        .armed_boxes(&rows, &geo, pos)
+                         .into_iter()
+                         .min_by_key(|&(o, c, _)| c - o)
+                         .map(|(o, ..)| o);
+@@ -2121,7 +2127,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                         return;
+                     }
+                 }
+-                let offset = self.hit_test(&geo, pos);
++                let offset = self.hit_test(&rows, &geo, pos);
+                 // Alt+Click adds a caret. Otherwise the click count (iced
+                 // `mouse::Click`) selects a caret / word / line; a single click
+                 // also arms a drag-select anchored here (extended on CursorMoved).
+@@ -2189,7 +2195,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 // Track the collapsed chip under the (non-Ctrl) pointer for the
+                 // immediate plain-hover expand highlight — repaint only when it changes.
+                 let chip = (!state.modifiers.command())
+-                    .then(|| cursor.position_over(bounds).and_then(|p| self.collapsed_chip_at(&geo, p)))
++                    .then(|| cursor.position_over(bounds).and_then(|p| self.collapsed_chip_at(&rows, &geo, p)))
+                     .flatten();
+                 if chip != state.hover_chip {
+                     state.hover_chip = chip;
+@@ -2223,7 +2229,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 } else if let Some(grab) = state.hscrollbar_grab {
+                     // Bottom-bar thumb drag — the X-axis mirror of the above.
+                     if let (Some(hb), Some(pos)) = (
+-                        self.hscrollbar(bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h)),
++                        self.hscrollbar(&rows, bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h)),
+                         cursor.position(),
+                     ) {
+                         state.scroll_x = hb.scroll_for_thumb_left(pos.x - grab);
+@@ -2237,7 +2243,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                     shell.publish((self.on_action)(Action::ColumnDrag { anchor, active }));
+                     shell.capture_event();
+                 } else if let (Some(drag), Some(pos)) = (state.drag, cursor.position()) {
+-                    let head = self.hit_test(&geo, pos);
++                    let head = self.hit_test(&rows, &geo, pos);
+                     state.autoscroll = true;
+                     shell.publish((self.on_action)(Action::DragSelect {
+                         granularity: drag.granularity,
+@@ -2255,7 +2261,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                     // over the open hover's word, keep it; otherwise dismiss and
+                     // re-arm the timer for the new position (accurate `now` stamped
+                     // on the next RedrawRequested).
+-                    let off = self.hit_test(&geo, pos);
++                    let off = self.hit_test(&rows, &geo, pos);
+                     // Keep the hover open while the pointer is over its word OR over
+                     // the hover box itself — so it can be moved into and scrolled —
+                     // and keep an unanswered request while the pointer stays on
+@@ -2348,7 +2354,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 // Predominant-axis lock: the larger-magnitude delta wins, so a
+                 // trackpad flick doesn't drift diagonally.
+                 if dx.abs() > dy.abs() {
+-                    let max_x = self.max_scroll_x(bounds, advance, line_h, state.scroll.rows(line_h));
++                    let max_x = self.max_scroll_x(&rows, bounds, advance, line_h, state.scroll.rows(line_h));
+                     state.scroll_x = (state.scroll_x - dx).clamp(0.0, max_x);
+                 } else {
+                     // Row-space wheel step: shift by dy/line_h rows, then
+@@ -2584,7 +2590,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                             // hidden content — a widget-drawn panel. Otherwise
+                             // the pointer's word drives the app hover query.
+                             let geo = self.geo(state, bounds);
+-                            if let Some(opener) = self.collapsed_chip_at(&geo, pos) {
++                            if let Some(opener) = self.collapsed_chip_at(&rows, &geo, pos) {
+                                 if state.fold_preview != Some(opener) {
+                                     state.fold_preview = Some(opener);
+                                     shell.request_redraw();
+@@ -2594,7 +2600,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                                     shell.publish((self.on_action)(Action::HoverDismiss));
+                                 }
+                             } else {
+-                                let off = self.hit_test(&geo, pos);
++                                let off = self.hit_test(&rows, &geo, pos);
+                                 state.hover_queried = true;
+                                 shell.publish((self.on_action)(Action::HoverQuery(off)));
+                             }
+@@ -2627,10 +2633,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         }
+         let line_h = state.metrics.line_height;
+         let geo = self.geo(state, bounds);
++        let rows = self.doc.rows();
+         // Ctrl held over a collapsible → the finger cursor (Ctrl+Click folds it).
+         if SHOW_CTRL_COLLAPSE_AFFORDANCE && state.modifiers.command() {
+             if let Some(p) = cursor.position_over(bounds).filter(|p| !geo.in_gutter(p.x)) {
+-                if !self.armed_boxes(&geo, p).is_empty() {
++                if !self.armed_boxes(&rows, &geo, p).is_empty() {
+                     return mouse::Interaction::Pointer;
+                 }
+             }
+@@ -2639,7 +2646,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+         // expands it).
+         if !state.modifiers.command() {
+             if let Some(p) = cursor.position_over(bounds).filter(|p| !geo.in_gutter(p.x)) {
+-                if self.collapsed_chip_at(&geo, p).is_some() {
++                if self.collapsed_chip_at(&rows, &geo, p).is_some() {
+                     return mouse::Interaction::Pointer;
+                 }
+             }
+@@ -2666,7 +2673,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
+                 if !geo.in_gutter(p.x)
+                     && !self.scrollbar(bounds, line_h, state.scroll.rows(line_h)).is_some_and(|sb| sb.contains_x(p.x))
+                     && !self
+-                        .hscrollbar(bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h))
++                        .hscrollbar(&rows, bounds, advance, line_h, state.scroll_x, state.scroll.rows(line_h))
+                         .is_some_and(|hb| hb.contains_y(p.y)) =>
+             {
+                 mouse::Interaction::Text
+@@ -2712,10 +2719,9 @@ impl<Message> Editor<'_, Message> {
+     /// The completion popup's top-left and size for the current caret/metrics —
+     /// shared by `draw_popup` and mouse hit-testing so they agree on where it is.
+     fn popup_layout(&self, list: &PopupList, geo: &Geo) -> (Point, Size) {
+-        let fold_map = self.fold_map();
+         // The anchor (the completed word's start) shares the caret's row, so the
+         // shared display-space anchor covers both x and y.
+-        let (anchor_x, row_top, row_bottom) = self.popup_anchor(&fold_map, geo, list.anchor);
++        let (anchor_x, row_top, row_bottom) = self.popup_anchor(&self.doc.rows(), geo, list.anchor, Edge::Start);
+         let size = popup::extent(list, geo.advance(), geo.line_h());
+         let origin = popup::place(anchor_x, row_top, row_bottom, size, geo.bounds());
+         (origin, size)
+@@ -2743,10 +2749,9 @@ impl<Message> Editor<'_, Message> {
+         let width = inner_w + 2.0 * pad_x + sb_w;
+         let height = visible as f32 * line_h + 2.0 * pad_y;
+ 
+-        let fold_map = self.fold_map();
+         // The shared display-space anchor; the hover keeps its own
+         // above-first flip below.
+-        let (word_x, word_top, word_bottom) = self.popup_anchor(&fold_map, geo, info.range.start);
++        let (word_x, word_top, word_bottom) = self.popup_anchor(&self.doc.rows(), geo, info.range.start, Edge::Start);
+         let y = if word_top - height >= bounds.y { word_top - height } else { word_bottom };
+         let x = word_x.clamp(bounds.x, (bounds.x + bounds.width - width).max(bounds.x));
+ 
+@@ -2825,11 +2830,10 @@ impl<Message> Editor<'_, Message> {
+         text_color: Color,
+     ) {
+         let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
+-        let fold_map = self.fold_map();
+         let head = self.doc.selections().newest().head();
+         // The shared display-space anchor; the signature keeps its own
+         // above-first flip below.
+-        let (caret_x, caret_top, caret_bottom) = self.popup_anchor(&fold_map, geo, head);
++        let (caret_x, caret_top, caret_bottom) = self.popup_anchor(&self.doc.rows(), geo, head, Edge::Caret);
+ 
+         let dim = Color { a: 0.7, ..text_color };
+         let active = Color::from_rgb8(0x66, 0xd9, 0xef); // cyan — the active param
+@@ -2934,14 +2938,14 @@ impl<Message> Editor<'_, Message> {
+         range_covered_by(self.doc.selections().all(), start, end)
+     }
+ 
+-    fn draw_selection(&self, renderer: &mut iced::Renderer, geo: &Geo, start: u32, end: u32, color: Color) {
++    fn draw_selection(&self, renderer: &mut iced::Renderer, rows: &Rows<'_>, geo: &Geo, start: u32, end: u32, color: Color) {
+         let buffer = self.doc.buffer();
+-        let fold_map = self.fold_map();
++        let fold_map = rows.folds();
+         let (a, b) = (buffer.offset_to_point(start), buffer.offset_to_point(end));
+         // Single-row selection — the common case (a bare caret, a word
+         // occurrence, a find match): wash it directly, no window walk.
+         if a.row == b.row {
+-            self.draw_wash_row(renderer, &fold_map, geo, a.row, a, b, start, end, color);
++            self.draw_wash_row(renderer, rows, geo, a.row, a, b, start, end, color);
+             return;
+         }
+         // Multi-row: iterate the VISIBLE DISPLAY rows, never the selection's
+@@ -2959,11 +2963,11 @@ impl<Message> Editor<'_, Message> {
+         let sel = a.row..=b.row;
+         for vr in fold_map.visible_rows(window) {
+             if sel.contains(&vr.buffer_row.0) {
+-                self.draw_wash_row(renderer, &fold_map, geo, vr.buffer_row.0, a, b, start, end, color);
++                self.draw_wash_row(renderer, rows, geo, vr.buffer_row.0, a, b, start, end, color);
+             }
+             if let Some(tail) = vr.last_folded {
+                 if sel.contains(&tail.0) {
+-                    self.draw_fold_tail_wash(renderer, &fold_map, geo, tail.0, a, b, color);
++                    self.draw_fold_tail_wash(renderer, rows, geo, tail.0, a, b, color);
+                 }
+             }
+         }
+@@ -2973,12 +2977,13 @@ impl<Message> Editor<'_, Message> {
+     /// to [`draw_fold_tail_wash`] (its `}` tail rides a header line); otherwise
+     /// fill the selected span, endpoints via the one `offset_screen_x` projection.
+     #[allow(clippy::too_many_arguments)] // a renderer-side wash genuinely needs all of them
+-    fn draw_wash_row(&self, renderer: &mut iced::Renderer, fold_map: &FoldMap, geo: &Geo, row: u32, a: BufPoint, b: BufPoint, start: u32, end: u32, color: Color) {
++    fn draw_wash_row(&self, renderer: &mut iced::Renderer, rows: &Rows<'_>, geo: &Geo, row: u32, a: BufPoint, b: BufPoint, start: u32, end: u32, color: Color) {
+         // The choke point every washed row flows through — count it so the draw
+         // budget trips if a caller ever washes O(document) rows.
+         draw_budget::bump_rows(1);
++        let fold_map = rows.folds();
+         if fold_map.is_folded(BufferRow(row)) {
+-            self.draw_fold_tail_wash(renderer, fold_map, geo, row, a, b, color);
++            self.draw_fold_tail_wash(renderer, rows, geo, row, a, b, color);
+             return;
+         }
+         let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
+@@ -2987,10 +2992,11 @@ impl<Message> Editor<'_, Message> {
+         if y + line_h < bounds.y || y > bounds.y + bounds.height {
+             return;
+         }
+-        let x0 = if row == a.row { self.offset_screen_x(fold_map, geo, start) } else { geo.cell_x(0.0) };
++        let (from, to) = if start == end { (Edge::Caret, Edge::Caret) } else { (Edge::Start, Edge::End) };
++        let x0 = if row == a.row { self.offset_screen_x(rows, geo, start, from) } else { geo.cell_x(0.0) };
+         let x1 = if row == b.row {
+-            self.offset_screen_x(fold_map, geo, end)
+-        } else if let Some(hl) = fold_map.header_layout(buffer, BufferRow(row), TAB) {
++            self.offset_screen_x(rows, geo, end, to)
++        } else if let Some(hl) = rows.header(BufferRow(row)) {
+             // A collapsed block header the selection runs THROUGH (it continues into
+             // the folded interior below): wash straight across the ` … ` placeholder
+             // gap so the collapsed `head … tail` line has no unwashed hole. The tail
+@@ -2998,7 +3004,7 @@ impl<Message> Editor<'_, Message> {
+             geo.cell_x(hl.tail_cell() as f32)
+         } else {
+             let line_end = buffer.point_to_offset(scrive_core::Point::new(row, buffer.line_len(row)));
+-            self.offset_screen_x(fold_map, geo, line_end) + advance * 0.5
++            self.offset_screen_x(rows, geo, line_end, Edge::Start) + advance * 0.5
+         };
+         fill(renderer, Rectangle { x: x0, y, width: (x1 - x0).max(1.0), height: line_h }, color);
+     }
+@@ -3009,14 +3015,15 @@ impl<Message> Editor<'_, Message> {
+     /// scrolled off. Split out so both the windowed loop and the single-row path
+     /// reuse the exact same tail projection.
+     #[allow(clippy::too_many_arguments)] // a renderer-side wash genuinely needs all of them
+-    fn draw_fold_tail_wash(&self, renderer: &mut iced::Renderer, fold_map: &FoldMap, geo: &Geo, tail_row: u32, a: BufPoint, b: BufPoint, color: Color) {
++    fn draw_fold_tail_wash(&self, renderer: &mut iced::Renderer, rows: &Rows<'_>, geo: &Geo, tail_row: u32, a: BufPoint, b: BufPoint, color: Color) {
+         draw_budget::bump_rows(1); // choke point — counted for the draw budget
++        let fold_map = rows.folds();
+         let (bounds, advance, line_h) = (geo.bounds(), geo.advance(), geo.line_h());
+         let buffer = self.doc.buffer();
+         // Hidden interior rows show nothing — only a collapsed fold's closing
+         // (tail) row rides a header line.
+         let Some(hdr) = fold_map.header_of_tail(BufferRow(tail_row)) else { return };
+-        let Some(hl) = fold_map.header_layout(buffer, hdr, TAB) else { return };
++        let Some(hl) = rows.header(hdr) else { return };
+         let lead = hl.tail_start_col();
+         let sel_a = if tail_row == a.row { a.col } else { 0 };
+         let sel_b = if tail_row == b.row { b.col } else { buffer.line_len(tail_row) };
+@@ -3065,13 +3072,13 @@ impl<Message> Editor<'_, Message> {
+ 
+     /// Pixel → buffer offset: the y half resolves through the ONE row-inversion
+     /// policy ([`FoldMap::display_row_at`]), the x half through the ONE
+-    /// cell-inversion owner ([`FoldMap::hit_row`]: collapsed header gap/tail
++    /// cell-inversion owner ([`Rows::hit`]: collapsed header gap/tail
+     /// resolution, chip clicks, tab snapping). The widget's only contribution is
+     /// px → (fractional row, fractional cell) via [`Geo`].
+-    fn hit_test(&self, geo: &Geo, pos: Point) -> u32 {
+-        let fold_map = self.fold_map();
++    fn hit_test(&self, rows: &Rows<'_>, geo: &Geo, pos: Point) -> u32 {
++        let fold_map = rows.folds();
+         let row = fold_map.to_buffer_row(fold_map.display_row_at(geo.rows_from_top(pos.y)));
+-        fold_map.hit_row(self.doc.buffer(), row, geo.x_cell(pos.x), scrive_core::Bias::Left, TAB)
++        rows.hit(row, geo.x_cell(pos.x), scrive_core::Bias::Left)
+     }
+ 
+     /// Draw a row that has inline (single-line) folds: its highlight spans with a
+@@ -3097,7 +3104,7 @@ impl<Message> Editor<'_, Message> {
+             if text.is_empty() || row_layout.glyph_hidden(start_col) {
+                 return;
+             }
+-            let x = origin.x + row_layout.display_cell(start_col) as f32 * advance;
++            let x = origin.x + row_layout.display_cell(start_col, Edge::Start) as f32 * advance;
+             self.draw_line(renderer, expand_tabs(text), Point::new(x, origin.y), color, Alignment::Left, clip);
+         };
+         match spans {
+@@ -3146,7 +3153,8 @@ impl<Message> Editor<'_, Message> {
+     /// the highlight, the finger, the click, and the hover preview all measure against
+     /// it, so they agree. `None` if `opener` isn't collapsed or its line is itself
+     /// hidden inside an outer collapsed fold.
+-    fn collapsed_chip_rect(&self, fold_map: &FoldMap, geo: &Geo, opener: u32) -> Option<Rectangle> {
++    fn collapsed_chip_rect(&self, rows: &Rows<'_>, geo: &Geo, opener: u32) -> Option<Rectangle> {
++        let fold_map = rows.folds();
+         if !self.doc.folds().is_folded(opener) {
+             return None;
+         }
+@@ -3165,7 +3173,7 @@ impl<Message> Editor<'_, Message> {
+             // `}`. End at the CLOSER's cell, NOT `hl.width()` (the whole tail line):
+             // text typed after the `}` on the last line is outside the collapsed
+             // region and must not join the fold's hover / expand target.
+-            let hl = fold_map.header_layout(buffer, BufferRow(header), TAB)?;
++            let hl = rows.header(BufferRow(header))?;
+             let x0 = geo.cell_x((hl.head_cells() as f32 - 1.0).max(0.0)) - 2.0;
+             let last_start = buffer.point_to_offset(BufPoint { row: last, col: 0 });
+             let close_cell = hl.tail_col_cell(close - last_start).unwrap_or_else(|| hl.tail_cell());
+@@ -3183,8 +3191,8 @@ impl<Message> Editor<'_, Message> {
+             // `inline_fold_at` is an O(log F) offset-keyed descent, so a hover /
+             // preview frame costs O(log F), never an O(F) decode of every inline fold.
+             fold_map.inline_fold_at(opener)?;
+-            let xo = self.offset_screen_x(fold_map, geo, opener);
+-            let xc = self.offset_screen_x(fold_map, geo, close);
++            let xo = self.offset_screen_x(rows, geo, opener, Edge::Start);
++            let xc = self.offset_screen_x(rows, geo, close, Edge::Start);
+             Some(geo.inline_halo(xo.min(xc), xo.max(xc), y))
+         }
+     }
+@@ -3195,7 +3203,8 @@ impl<Message> Editor<'_, Message> {
+     /// from the same owners the painter reads (`gap_center` / `chips` /
+     /// [`Geo::chip_pill`]). `None` when the fold has no on-screen pill (not
+     /// collapsed, hidden inside an outer fold, or nested away).
+-    fn chip_pill_rect(&self, fold_map: &FoldMap, geo: &Geo, opener: u32) -> Option<Rectangle> {
++    fn chip_pill_rect(&self, rows: &Rows<'_>, geo: &Geo, opener: u32) -> Option<Rectangle> {
++        let fold_map = rows.folds();
+         if !self.doc.folds().is_folded(opener) {
+             return None;
+         }
+@@ -3209,10 +3218,10 @@ impl<Message> Editor<'_, Message> {
+         }
+         let y = geo.row_y(fold_map.to_display_row(BufferRow(header)));
+         let mid = if last > header {
+-            geo.cell_x(fold_map.header_layout(buffer, BufferRow(header), TAB)?.gap_center())
++            geo.cell_x(rows.header(BufferRow(header))?.gap_center())
+         } else {
+             let row_start = buffer.point_to_offset(BufPoint { row: header, col: 0 });
+-            let layout = fold_map.row_layout(buffer, BufferRow(header), TAB);
++            let layout = rows.layout(BufferRow(header));
+             let chip = layout.chips().find(|c| c.open_col == opener - row_start)?;
+             geo.cell_x(chip.center)
+         };
+@@ -3221,8 +3230,8 @@ impl<Message> Editor<'_, Message> {
+ 
+     /// The collapsed fold whose `…` chip is under `pos` — the plain-hover expand
+     /// target. Chips are disjoint on screen, so the first match wins.
+-    fn collapsed_chip_at(&self, geo: &Geo, pos: Point) -> Option<u32> {
+-        let fold_map = self.fold_map();
++    fn collapsed_chip_at(&self, rows: &Rows<'_>, geo: &Geo, pos: Point) -> Option<u32> {
++        let fold_map = rows.folds();
+         // A `…` chip renders only on its fold's header (opener) row, so only a
+         // pair headed on the pointer's display row can sit under `pos`. Resolve
+         // that one buffer row and test just the pairs headed there
+@@ -3235,7 +3244,7 @@ impl<Message> Editor<'_, Message> {
+             .foldable_pairs_in_rows(row..row + 1)
+             .into_iter()
+             .map(|(open, ..)| open)
+-            .find(|&o| self.collapsed_chip_rect(&fold_map, geo, o).is_some_and(|r| r.contains(pos)))
++            .find(|&o| self.collapsed_chip_rect(rows, geo, o).is_some_and(|r| r.contains(pos)))
+     }
+ 
+     /// Draw the hover preview of a collapsed fold's hidden content: a floating
+@@ -3295,7 +3304,7 @@ impl<Message> Editor<'_, Message> {
+         // opens under the thing the pointer is on (a mid-line inline chip
+         // included, not the row's end). Flip above when it would overflow the
+         // bottom, and clamp horizontally.
+-        let Some(chip) = self.collapsed_chip_rect(&fold_map, geo, opener) else {
++        let Some(chip) = self.collapsed_chip_rect(&self.doc.rows(), geo, opener) else {
+             return; // no chip on screen (nested away) ⇒ nothing to anchor to
+         };
+         let code_left = geo.code_left();
+@@ -4405,16 +4414,16 @@ mod tests {
+         let doc = folded_doc(); // block collapsed; header at buffer row 1
+         let ed = Editor::new(&doc, |_: Action| ());
+         let geo = test_geo();
+-        let fm = ed.fold_map();
++        let rows = doc.rows();
+         let opener = doc.buffer().text().find('{').unwrap() as u32;
+         // Hover the exact chip rect the painter uses.
+-        let rect = ed.collapsed_chip_rect(&fm, &geo, opener).expect("collapsed header has a chip");
++        let rect = ed.collapsed_chip_rect(&rows, &geo, opener).expect("collapsed header has a chip");
+         let center = Point::new(rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+-        assert_eq!(ed.collapsed_chip_at(&geo, center), Some(opener), "hover over the chip finds it");
++        assert_eq!(ed.collapsed_chip_at(&rows, &geo, center), Some(opener), "hover over the chip finds it");
+         // A point far right of the chip on the same row is off it.
+-        assert_eq!(ed.collapsed_chip_at(&geo, Point::new(rect.x + rect.width + 200.0, center.y)), None);
++        assert_eq!(ed.collapsed_chip_at(&rows, &geo, Point::new(rect.x + rect.width + 200.0, center.y)), None);
+         // A point on display row 0 ("x", no fold) resolves a fold-less row.
+-        assert_eq!(ed.collapsed_chip_at(&geo, Point::new(center.x, 5.0)), None);
++        assert_eq!(ed.collapsed_chip_at(&rows, &geo, Point::new(center.x, 5.0)), None);
+     }
+ 
+     #[test]
+@@ -4428,12 +4437,12 @@ mod tests {
+         assert!(doc.toggle_fold_opener(opener)); // block: `{` row 1 … `}` row 4
+         let ed = Editor::new(&doc, |_: Action| ());
+         let geo = test_geo();
+-        let fm = ed.fold_map();
+-        let rect = ed.collapsed_chip_rect(&fm, &geo, opener).expect("collapsed header has a chip");
++        let rows = doc.rows();
++        let rect = ed.collapsed_chip_rect(&rows, &geo, opener).expect("collapsed header has a chip");
+         let cy = rect.y + rect.height / 2.0;
+         // The `…` chip is still the expand target.
+         assert_eq!(
+-            ed.collapsed_chip_at(&geo, Point::new(rect.x + rect.width / 2.0, cy)),
++            ed.collapsed_chip_at(&rows, &geo, Point::new(rect.x + rect.width / 2.0, cy)),
+             Some(opener),
+         );
+         // The box ends at the closer: `a {`(3) + ` … `(4) + `}`(1) ≈ 8 cells, far
+@@ -4445,7 +4454,7 @@ mod tests {
+             rect.width
+         );
+         assert_eq!(
+-            ed.collapsed_chip_at(&geo, Point::new(geo.cell_x(16.0), cy)),
++            ed.collapsed_chip_at(&rows, &geo, Point::new(geo.cell_x(16.0), cy)),
+             None,
+             "text after the closing brace is not part of the fold's hover area"
+         );
+@@ -4528,11 +4537,11 @@ mod tests {
+         doc.set_selections(set);
+         let ed = Editor::new(&doc, |_: Action| ());
+         let geo = test_geo();
+-        let fm = ed.fold_map();
++        let rows = doc.rows();
+ 
+         // The one shared anchor must be display-space: row 2 × 10 px, NOT buffer
+         // row 5 × 10 px — so a popup below a fold sits at the right height.
+-        let (x, top, bottom) = ed.popup_anchor(&fm, &geo, head);
++        let (x, top, bottom) = ed.popup_anchor(&rows, &geo, head, Edge::Caret);
+         assert_eq!((top, bottom), (20.0, 30.0), "display row 2, not buffer row 5");
+         assert_eq!(x, 56.0, "gutter 50 + TEXT_PAD 6 + col 0");
+ 
+@@ -4560,7 +4569,7 @@ mod tests {
+         assert!(doc.toggle_fold_opener(block_open));
+         let ed = Editor::new(&doc, |_: Action| ());
+         let geo = test_geo();
+-        let fm = ed.fold_map();
++        let rows = doc.rows();
+         let buffer = doc.buffer();
+         let tail = buffer.point_to_offset(BufPoint::new(2, 0)); // the real `}`
+         let after = buffer.point_to_offset(BufPoint::new(3, 2)); // below the fold
+@@ -4568,9 +4577,9 @@ mod tests {
+         // hit-test the same pixel back. Fails against either a fold-blind x
+         // or a buffer-space chip compare.
+         for off in [0, inline_open + 1, close, block_open, tail, after] {
+-            let p = fm.display_position(buffer, off, TAB).expect("landable offset");
+-            let pos = Point::new(ed.offset_screen_x(&fm, &geo, off), geo.row_y(p.row) + 5.0);
+-            assert_eq!(ed.hit_test(&geo, pos), off, "offset {off} round-trips");
++            let p = rows.position(off, Edge::Caret).expect("landable offset");
++            let pos = Point::new(ed.offset_screen_x(&rows, &geo, off, Edge::Caret), geo.row_y(p.row) + 5.0);
++            assert_eq!(ed.hit_test(&rows, &geo, pos), off, "offset {off} round-trips");
+         }
+     }
+ 
+@@ -4617,13 +4626,13 @@ mod tests {
+         let vp = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 600.0 };
+         let text = "f() {\n    a_very_long_interior_line_wwwwwwwwwwwwwww\n}\nshort\n";
+         let mut doc = Document::new(text).unwrap();
+-        let unfolded = Editor::new(&doc, |_: Action| ()).max_line_px(10.0, 20.0, vp, 0.0);
++        let unfolded = Editor::new(&doc, |_: Action| ()).max_line_px(&doc.rows(), 10.0, 20.0, vp, 0.0);
+         let opener = text.find('{').unwrap() as u32;
+         assert!(doc.toggle_fold_opener(opener));
+         let ed = Editor::new(&doc, |_: Action| ());
+-        let folded = ed.max_line_px(10.0, 20.0, vp, 0.0);
+-        let fm = ed.fold_map();
+-        let hl = fm.header_layout(doc.buffer(), BufferRow(0), TAB).unwrap();
++        let rows = doc.rows();
++        let folded = ed.max_line_px(&rows, 10.0, 20.0, vp, 0.0);
++        let hl = rows.header(BufferRow(0)).unwrap();
+         assert_eq!(folded, hl.width() as f32 * 10.0);
+         assert!(folded < unfolded, "collapsing the widest line shrinks the h-range");
+     }
+@@ -4640,10 +4649,11 @@ mod tests {
+         text.push('\n');
+         let doc = Document::new(&text).unwrap();
+         let ed = Editor::new(&doc, |_: Action| ());
++        let rows = doc.rows();
+         let two_rows = Rectangle { x: 0.0, y: 0.0, width: 800.0, height: 40.0 };
+-        assert_eq!(ed.max_line_px(10.0, 20.0, two_rows, 0.0), 2.0 * 10.0, "only visible rows count");
++        assert_eq!(ed.max_line_px(&rows, 10.0, 20.0, two_rows, 0.0), 2.0 * 10.0, "only visible rows count");
+         // Scrolled down 2 rows to the wide line, the range adapts up.
+-        assert_eq!(ed.max_line_px(10.0, 20.0, two_rows, 2.0), 200.0 * 10.0);
++        assert_eq!(ed.max_line_px(&rows, 10.0, 20.0, two_rows, 2.0), 200.0 * 10.0);
+     }
+ 
+     /// A headless tiny-skia renderer with the icon font loaded, as the

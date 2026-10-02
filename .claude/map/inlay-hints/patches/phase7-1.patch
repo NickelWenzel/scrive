@@ -1,0 +1,715 @@
+diff --git a/crates/scrive-iced/examples/lsp/main.rs b/crates/scrive-iced/examples/lsp/main.rs
+index 98549d7..8ea25d8 100644
+--- a/crates/scrive-iced/examples/lsp/main.rs
++++ b/crates/scrive-iced/examples/lsp/main.rs
+@@ -141,7 +141,9 @@ impl App {
+                     return Task::none();
+                 };
+                 let task = tab.editor.update(event, now).map(Message::Editor.with(id));
+-                let outgoing = tab.editor.sync_lsp(client);
++                let synced = tab.editor.sync_lsp(client);
++                let mut outgoing = synced.messages;
++                outgoing.extend(follow(tabs, active, client, transport, synced.jump));
+                 Task::batch([task, transport.send(outgoing)])
+             }
+             Message::Lsp(message) => {
+@@ -168,34 +170,7 @@ impl App {
+                             if let Some(refusal) = applied.refused {
+                                 transport.note(format!("refused: {refusal}"));
+                             }
+-                            match applied.jump {
+-                                Some(lsp::update::Jump::Open(open)) => {
+-                                    let Some(target) = tabs.iter_mut().find(|tab| {
+-                                        tab.editor.document().doc_id() == open.doc_id()
+-                                    }) else {
+-                                        continue;
+-                                    };
+-                                    match target.editor.jump(client, open) {
+-                                        Ok(messages) => {
+-                                            outgoing.extend(messages);
+-                                            *active = target.id;
+-                                        }
+-                                        Err(refusal) => {
+-                                            transport.note(format!("jump refused: {refusal}"))
+-                                        }
+-                                    }
+-                                }
+-                                // A host with files would read this one, open a tab, `open_lsp`
+-                                // it, then `select(unopened.span(&text))`. Every demo file is
+-                                // open, and wasm has no disk.
+-                                Some(lsp::update::Jump::Unopened(unopened)) => {
+-                                    transport.note(format!(
+-                                        "definition in unopened {}",
+-                                        unopened.uri().as_str()
+-                                    ));
+-                                }
+-                                None => {}
+-                            }
++                            outgoing.extend(follow(tabs, active, client, transport, applied.jump));
+                         }
+                         // A host with files writes `edits.apply(&disk_text)` back to disk.
+                         lsp::Update::FileEdits(edits) => {
+@@ -294,6 +269,44 @@ impl Transport {
+     }
+ }
+ 
++/// Route `jump` to the tab whose document holds it, and so on for any jump that tab's sync
++/// returns. Returns the messages to send. A host with files would read an unopened one, open a
++/// tab, `open_lsp` it, then `select(unopened.span(&text))`; every demo file is open, and wasm
++/// has no disk, so it is only noted.
++fn follow(
++    tabs: &mut [Tab],
++    active: &mut tab::Id,
++    client: &mut lsp::Client,
++    transport: &mut Transport,
++    mut jump: Option<lsp::update::Jump>,
++) -> Vec<lsp::Message> {
++    let mut outgoing = Vec::new();
++    while let Some(next) = jump.take() {
++        match next {
++            lsp::update::Jump::Open(open) => {
++                let Some(target) = tabs
++                    .iter_mut()
++                    .find(|tab| tab.editor.document().doc_id() == open.doc_id())
++                else {
++                    break;
++                };
++                match target.editor.jump(client, open) {
++                    Ok(applied) => {
++                        outgoing.extend(applied.messages);
++                        jump = applied.jump;
++                        *active = target.id;
++                    }
++                    Err(refusal) => transport.note(format!("jump refused: {refusal}")),
++                }
++            }
++            lsp::update::Jump::Unopened(unopened) => {
++                transport.note(format!("definition in unopened {}", unopened.uri().as_str()));
++            }
++        }
++    }
++    outgoing
++}
++
+ fn tab_button(tab: &Tab, active: tab::Id) -> Element<'_, Message> {
+     let style = if tab.id == active {
+         button::primary
+diff --git a/crates/scrive-iced/examples/rust_analyzer.rs b/crates/scrive-iced/examples/rust_analyzer.rs
+index 9fbb2df..bd877ec 100644
+--- a/crates/scrive-iced/examples/rust_analyzer.rs
++++ b/crates/scrive-iced/examples/rust_analyzer.rs
+@@ -478,7 +478,11 @@ fn main() {
+             match message {
+                 Message::Editor(event) => {
+                     let task = editor.update(event, now).map(Message::Editor);
+-                    link.send(editor.sync_lsp(client));
++                    let synced = editor.sync_lsp(client);
++                    link.send(synced.messages);
++                    if let Some(line) = jumped(synced.jump) {
++                        *status = line;
++                    }
+                     task
+                 }
+                 Message::Save => {
+@@ -486,7 +490,11 @@ fn main() {
+                     // The buffer holds LF; a CRLF file is written back as CRLF.
+                     match std::fs::write(&*file, doc.serialize(doc.buffer().eol_flavor())) {
+                         Ok(()) => {
+-                            link.send(editor.save_lsp(client));
++                            let saved = editor.save_lsp(client);
++                            link.send(saved.messages);
++                            if let Some(line) = jumped(saved.jump) {
++                                *status = line;
++                            }
+                             let name = file.file_name().unwrap_or(file.as_os_str()).display();
+                             *status = match link {
+                                 Link::Connected(_) => {
+@@ -526,19 +534,8 @@ fn main() {
+                                 if let Some(refusal) = applied.refused {
+                                     *status = format!("refused: {refusal}");
+                                 }
+-                                match applied.jump {
+-                                    // A host with several editors hands this to the one that
+-                                    // owns `open.doc_id()`; here every open document is local.
+-                                    Some(lsp::update::Jump::Open(_)) => {
+-                                        *status = "definition in another open document".to_owned();
+-                                    }
+-                                    Some(lsp::update::Jump::Unopened(unopened)) => {
+-                                        *status = format!(
+-                                            "definition in {}, which is not open",
+-                                            unopened.uri()
+-                                        );
+-                                    }
+-                                    None => {}
++                                if let Some(line) = jumped(applied.jump) {
++                                    *status = line;
+                                 }
+                             }
+                             lsp::Update::FileEdits(edits) => {
+@@ -654,6 +651,17 @@ fn main() {
+         }
+     }
+ 
++    /// The status line a jump earns. A host with several editors hands `Jump::Open` to the one
++    /// that owns `open.doc_id()`; here every open document is local.
++    fn jumped(jump: Option<lsp::update::Jump>) -> Option<String> {
++        match jump? {
++            lsp::update::Jump::Open(_) => Some("definition in another open document".to_owned()),
++            lsp::update::Jump::Unopened(unopened) => {
++                Some(format!("definition in {}, which is not open", unopened.uri()))
++            }
++        }
++    }
++
+     /// The status line a server notification earns: `window/showMessage` text, and the title of
+     /// a `$/progress` report.
+     fn headline(notification: &lsp::message::Notification) -> Option<String> {
+@@ -920,13 +928,13 @@ fn main() {
+             let fixed = lsp::update::Stamp::Revision(doc.revision());
+             let saved = editor.save_lsp(&mut client);
+             assert!(
+-                saved.iter().any(|message| {
++                saved.messages.iter().any(|message| {
+                     matches!(message, lsp::Message::Notification(n) if n.method == "textDocument/didSave")
+                 }),
+                 "rust-analyzer asks for saves, so the didSave goes out",
+             );
+             eprintln!("{:?}: saved", started.elapsed());
+-            sender.send(saved);
++            sender.send(saved.messages);
+ 
+             let deadline = Instant::now() + Duration::from_secs(120);
+             let mut cleared = false;
+diff --git a/crates/scrive-iced/src/code_editor/lsp.rs b/crates/scrive-iced/src/code_editor/lsp.rs
+index a69f953..a4369ff 100644
+--- a/crates/scrive-iced/src/code_editor/lsp.rs
++++ b/crates/scrive-iced/src/code_editor/lsp.rs
+@@ -1,11 +1,13 @@
+ //! A [`CodeEditor`]'s side of a [`scrive_lsp::Client`].
+ //!
+ //! A host calls [`open_lsp`](CodeEditor::open_lsp) once per document,
+-//! [`sync_lsp`](CodeEditor::sync_lsp) after every [`update`](CodeEditor::update), and
++//! [`sync_lsp`](CodeEditor::sync_lsp) after every [`update`](CodeEditor::update),
+ //! [`apply_lsp`](CodeEditor::apply_lsp) for each `Update::Document` the client returns, and
+ //! [`save_lsp`](CodeEditor::save_lsp) after writing the document to disk. Each call returns the
+-//! messages to send; the transport stays the host's.
++//! messages to send, and all but `open_lsp` a jump into another document for the host to route;
++//! the transport stays the host's.
+ 
++use iced::time::Duration;
+ use scrive_core::DiagnosticsOutcome;
+ use scrive_lsp::lsp_types::Uri;
+ use scrive_lsp::update::{self, Change, Refusal, Stamp, Target};
+@@ -47,28 +49,55 @@ impl CodeEditor {
+             "the log starts at the registered snapshot",
+         );
+         self.lsp_client = Some(client.id());
+-        Ok(self.route(output))
++        self.wait_inlays(Duration::ZERO, None);
++        let routed = self.route(output);
++        debug_assert!(routed.jump.is_none(), "an open lands cached diagnostics only");
++        Ok(routed.messages)
+     }
+ 
+     /// Mirror every edit since the last sync to `client`, then send each request the editor
+-    /// recorded: completion, signature help, hover, definition, rename and format. Call it
+-    /// after every [`update`](CodeEditor::update); with nothing new it returns no messages.
+-    /// Answers the client gives without asking the server, such as declines and reused
+-    /// completion lists, land before it returns.
++    /// recorded: completion, signature help, hover, definition, rename, format, an inlay hint
++    /// fetch and a gesture on a hint. Call it after every [`update`](CodeEditor::update); with
++    /// nothing new it returns nothing.
++    ///
++    /// Answers the client gives without asking the server land before it returns: declines,
++    /// reused completion lists, and a hint's label jump or text edits. An edit that lands this
++    /// way is synced in the same call. A label jump into another document comes back as
++    /// [`Applied::jump`](update::Applied::jump) for the host to route; `refused` is always
++    /// `None`.
+     ///
+     /// On an editor that is not registered, before [`open_lsp`](CodeEditor::open_lsp) or after
+-    /// [`close_lsp`](CodeEditor::close_lsp), it does nothing and returns no messages. Its
+-    /// `client` must be the one the editor was opened with.
+-    #[must_use = "the messages must be sent to the server"]
+-    pub fn sync_lsp(&mut self, client: &mut Client) -> Vec<Message> {
++    /// [`close_lsp`](CodeEditor::close_lsp), it does nothing. Its `client` must be the one the
++    /// editor was opened with.
++    #[must_use = "Applied.messages must be sent, and Applied.jump routed"]
++    pub fn sync_lsp(&mut self, client: &mut Client) -> update::Applied {
++        let mut synced = update::Applied::default();
+         let Some(registered) = self.lsp_client else {
+-            return Vec::new();
++            return synced;
+         };
+         debug_assert_eq!(
+             registered,
+             client.id(),
+             "sync_lsp needs the Client this editor was opened with",
+         );
++        // An inserted hint's edit lands inside a pass, so its didChange and the requests it
++        // recorded go out on the next. That pass lands no edit: only a gesture's interaction
++        // edits, and the hint fetch the edit scheduled waits for a wake.
++        let mut passes = 0;
++        loop {
++            passes += 1;
++            debug_assert!(passes <= 2, "only the first pass lands an edit");
++            let revision = self.doc.revision();
++            absorb(&mut synced, self.sync_pass(client));
++            if self.doc.revision() == revision {
++                return synced;
++            }
++        }
++    }
++
++    /// Sync the edits, send every recorded request against one snapshot, then land the
++    /// client's local answers in order.
++    fn sync_pass(&mut self, client: &mut Client) -> update::Applied {
+         let snapshot = self.doc.snapshot();
+         // The client ignores a request from a revision it has not been synced to.
+         let mut outputs = vec![client.sync(&snapshot, self.doc.drain_changes())];
+@@ -90,46 +119,60 @@ impl CodeEditor {
+         if let Some(request) = self.take_format_request() {
+             outputs.push(client.format(&snapshot, &request));
+         }
+-        let mut messages = Vec::new();
++        if let Some(request) = self.take_inlay_request() {
++            outputs.push(client.inlays(&snapshot, &request));
++        }
++        // Last, so an insert's edit lands after the answers made at the revision it moves.
++        if let Some(interaction) = self.take_inlay_interaction() {
++            outputs.push(client.interact(&snapshot, &interaction));
++        }
++        let mut passed = update::Applied::default();
+         for output in outputs {
+-            messages.extend(self.route(output));
++            absorb(&mut passed, self.route(output));
+         }
+-        messages
++        passed
+     }
+ 
+     /// Tell `client` that the document was saved, syncing first so the server holds the saved
+-    /// text. Call it after writing the document to disk. Returns the messages to send: the
+-    /// sync's, then a `didSave` when the server asks for saves.
++    /// text. Call it after writing the document to disk. Returns the sync's messages and jump,
++    /// then a `didSave` when the server asks for saves.
+     ///
+-    /// On an editor that is not registered it does nothing and returns no messages.
+-    #[must_use = "the didChange and didSave must be sent to the server"]
+-    pub fn save_lsp(&mut self, client: &mut Client) -> Vec<Message> {
++    /// On an editor that is not registered it does nothing.
++    #[must_use = "Applied.messages must be sent, and Applied.jump routed"]
++    pub fn save_lsp(&mut self, client: &mut Client) -> update::Applied {
+         if self.lsp_client.is_none() {
+-            return Vec::new();
++            return update::Applied::default();
+         }
+-        let mut messages = self.sync_lsp(client);
++        let mut saved = self.sync_lsp(client);
+         let output = client.save(&self.doc.snapshot());
+-        messages.extend(self.route(output));
+-        messages
++        absorb(&mut saved, self.route(output));
++        saved
+     }
+ 
+     /// Apply one document update from [`Client::receive`], then sync. The update is refused
+     /// when it is for another document, stale, or an edit batch that does not apply. A
+     /// definition in another document comes back as [`Applied::jump`](update::Applied::jump)
+-    /// for the host to route.
++    /// for the host to route, as does a hint's label jump that the sync landed; the update's
++    /// own jump wins over the sync's.
+     #[must_use = "Applied.messages must be sent, and Applied.jump routed"]
+     pub fn apply_lsp(
+         &mut self,
+         client: &mut Client,
+         document: update::Document,
+     ) -> update::Applied {
+-        let mut applied = self.land(document);
+-        applied.messages = self.sync_lsp(client);
+-        applied
++        let landed = self.land(document);
++        let synced = self.sync_lsp(client);
++        update::Applied {
++            messages: synced.messages,
++            // The host is waiting on the answer it passed in.
++            jump: landed.jump.or(synced.jump),
++            refused: landed.refused,
++        }
+     }
+ 
+     /// Select a definition that another editor's [`apply_lsp`](CodeEditor::apply_lsp) returned
+-    /// as [`Jump::Open`](update::Jump::Open), then sync. Returns the messages to send.
++    /// as [`Jump::Open`](update::Jump::Open), then sync. Returns what the sync after the
++    /// selection produced.
+     ///
+     /// # Errors
+     /// [`Refusal::Foreign`] when `open` is in another document, and [`Refusal::Stale`] when
+@@ -138,7 +181,7 @@ impl CodeEditor {
+         &mut self,
+         client: &mut Client,
+         open: update::jump::Open,
+-    ) -> Result<Vec<Message>, Refusal> {
++    ) -> Result<update::Applied, Refusal> {
+         if open.doc_id() != self.doc.doc_id() {
+             return Err(Refusal::Foreign);
+         }
+@@ -151,7 +194,8 @@ impl CodeEditor {
+ 
+     /// Unregister this editor's document from `client`. Mirroring stops, the rename field, the
+     /// completion popup, the signature box and the hover card close, requests in flight are
+-    /// forgotten, and the server's diagnostics are cleared.
++    /// forgotten, the server's diagnostics are cleared, the inlay hints and their tooltip are
++    /// cleared, and a scheduled hint fetch is dropped.
+     /// Returns the messages to send: the `didClose`, and cancellations for requests in flight.
+     /// F2 stays as [`rename`](CodeEditor::rename) set it, for a later
+     /// [`open_lsp`](CodeEditor::open_lsp).
+@@ -169,6 +213,14 @@ impl CodeEditor {
+         self.abandon(Awaited::Definition);
+         self.pending_rename_request = None;
+         self.pending_format_request = None;
++        self.inlay_card = None;
++        self.abandon(Awaited::Inlays);
++        self.abandon(Awaited::InlayTooltip);
++        self.abandon(Awaited::InlayInsert);
++        self.pending_inlay_interaction = None;
++        self.inlays.wait = None;
++        self.inlays.window = None;
++        self.doc.clear_inlays();
+         let _ = self.set_diagnostics(self.doc.revision(), Vec::new());
+         self.lsp_client = None;
+         let output = client.close(self.doc.doc_id());
+@@ -179,9 +231,11 @@ impl CodeEditor {
+         output.messages
+     }
+ 
+-    /// Land `output`'s updates and return its messages. `open` and the request methods answer
+-    /// only the document they were given, under its current ticket or revision.
+-    fn route(&mut self, output: Output) -> Vec<Message> {
++    /// Land `output`'s updates, and return its messages with the jump a landed definition
++    /// points to. `open` and the request methods answer only the document they were given,
++    /// under its current ticket or revision; a refused local answer is dropped, as a late
++    /// reply would be.
++    fn route(&mut self, output: Output) -> update::Applied {
+         let Output { messages, updates } = output;
+         debug_assert!(
+             updates
+@@ -189,16 +243,19 @@ impl CodeEditor {
+                 .all(|update| matches!(update, Update::Document(_))),
+             "open and requests answer with document updates only",
+         );
++        let mut routed = update::Applied {
++            messages,
++            ..update::Applied::default()
++        };
+         for update in updates {
+             if let Update::Document(document) = update {
+-                let applied = self.land(document);
+-                debug_assert!(
+-                    applied.jump.is_none(),
+-                    "a local answer never points into another document",
+-                );
++                let landed = self.land(document);
++                if routed.jump.is_none() {
++                    routed.jump = landed.jump;
++                }
+             }
+         }
+-        messages
++        routed
+     }
+ 
+     /// Check `document`'s identity and stamp against this editor, then apply its change. It
+@@ -286,6 +343,23 @@ impl CodeEditor {
+                 if revision != self.doc.revision() {
+                     return refused(Refusal::Stale);
+                 }
++                let inserting = match stamp {
++                    Stamp::Ticket(ticket) => self.accepts(Awaited::InlayInsert, ticket),
++                    Stamp::Revision(_) => false,
++                };
++                if inserting && ops.is_empty() {
++                    // A declined insert: `try_edit`'s tail would close the popup and the hover
++                    // card for no edit.
++                    self.abandon(Awaited::InlayInsert);
++                    return update::Applied::default();
++                }
++                if inserting {
++                    // The edits spell out the hint's label at its offset, so the hint would
++                    // render beside its own text; `try_edit`'s tail clears the slot naming it.
++                    if let Some((_, key, offset)) = self.awaiting.inlay_insert.take() {
++                        let _ = self.doc.remove_inlay(key, offset);
++                    }
++                }
+                 match self.try_edit(ops) {
+                     Ok(()) => update::Applied::default(),
+                     Err(_) => refused(Refusal::Overlap),
+@@ -324,6 +398,14 @@ impl CodeEditor {
+     }
+ }
+ 
++/// Append `routed` to `into`: its messages follow, and `into` keeps an earlier jump.
++fn absorb(into: &mut update::Applied, routed: update::Applied) {
++    into.messages.extend(routed.messages);
++    if into.jump.is_none() {
++        into.jump = routed.jump;
++    }
++}
++
+ /// An update that was not applied, and why.
+ fn refused(refusal: Refusal) -> update::Applied {
+     update::Applied {
+@@ -335,6 +417,7 @@ fn refused(refusal: Refusal) -> update::Applied {
+ #[cfg(test)]
+ mod tests {
+     use iced::time::Instant;
++    use scrive_core::intel::inlay::Key;
+     use scrive_core::CompletionState;
+     use serde_json::{json, Value};
+ 
+@@ -342,6 +425,7 @@ mod tests {
+     use scrive_lsp::update::{self, Refusal};
+     use scrive_lsp::{Client, Error, Message, Output, Update};
+ 
++    use crate::code_editor::INLAY_EDIT_DELAY;
+     use crate::editor::Action;
+     use crate::{CodeEditor, Event};
+ 
+@@ -413,8 +497,7 @@ mod tests {
+     /// A client past the handshake: every provider, incremental sync, and byte columns (utf-8),
+     /// so fixture positions are byte offsets.
+     fn ready() -> Client {
+-        let (mut client, initialize) = Client::builder().root(uri("file:///w/")).build();
+-        let result = json!({ "capabilities": {
++        handshake(json!({
+             "positionEncoding": "utf-8",
+             "textDocumentSync": { "openClose": true, "change": 2, "save": {} },
+             "completionProvider": { "triggerCharacters": ["."] },
+@@ -423,7 +506,28 @@ mod tests {
+             "definitionProvider": true,
+             "renameProvider": true,
+             "documentFormattingProvider": true,
+-        }});
++        }))
++    }
++
++    /// The capabilities `ready` negotiates, plus an inlay hint provider that resolves tooltips.
++    fn ready_with_hints() -> Client {
++        handshake(json!({
++            "positionEncoding": "utf-8",
++            "textDocumentSync": { "openClose": true, "change": 2, "save": {} },
++            "completionProvider": { "triggerCharacters": ["."] },
++            "signatureHelpProvider": { "triggerCharacters": ["("] },
++            "hoverProvider": true,
++            "definitionProvider": true,
++            "renameProvider": true,
++            "documentFormattingProvider": true,
++            "inlayHintProvider": { "resolveProvider": true },
++        }))
++    }
++
++    /// A client whose server answered `initialize` with `capabilities`.
++    fn handshake(capabilities: Value) -> Client {
++        let (mut client, initialize) = Client::builder().root(uri("file:///w/")).build();
++        let result = json!({ "capabilities": capabilities });
+         let output = client
+             .receive(reply(&wire(&initialize), result))
+             .expect("the initialize result decodes");
+@@ -447,9 +551,32 @@ mod tests {
+     /// Feed `event` through the editor's real update path, then sync.
+     fn drive(editor: &mut CodeEditor, client: &mut Client, event: Event) -> Vec<Message> {
+         let _ = editor.update(event, Instant::now());
++        editor.sync_lsp(client).messages
++    }
++
++    /// Feed `action` through the editor's update path, then sync, keeping the jump.
++    fn gesture(editor: &mut CodeEditor, client: &mut Client, action: Action) -> update::Applied {
++        let _ = editor.update(Event::Editor(action), Instant::now());
+         editor.sync_lsp(client)
+     }
+ 
++    /// Fire the editor's scheduled hint fetch, as its widget does once the delay passes, then
++    /// sync. Returns what went out.
++    fn fetch_inlays(editor: &mut CodeEditor, client: &mut Client) -> Vec<Message> {
++        let generation = editor.pending_wake().expect("a fetch is scheduled").generation;
++        drive(editor, client, Event::Editor(Action::Wake(generation)))
++    }
++
++    /// The hints `editor` shows, as `(render offset, key)`.
++    fn shown(editor: &CodeEditor) -> Vec<(u32, Key)> {
++        let len = editor.document().buffer().len();
++        editor
++            .document()
++            .inlays_in(0..len)
++            .map(|hint| (hint.offset(), hint.key()))
++            .collect()
++    }
++
+     /// The document updates in `output`, one per touched document, in order.
+     fn documents(output: Output) -> Vec<update::Document> {
+         output
+@@ -846,8 +973,9 @@ mod tests {
+         let (mut a, _) = opened(&mut client, A, "f();\n");
+         let (mut b, _) = opened(&mut client, B, "fn f() {}\n");
+         let open = jump_into_b(&mut a, &mut client);
+-        let messages = b.jump(&mut client, open).expect("B has not moved");
+-        assert!(messages.is_empty(), "a selection sends nothing");
++        let applied = b.jump(&mut client, open).expect("B has not moved");
++        assert!(applied.messages.is_empty(), "a selection sends nothing");
++        assert!(applied.jump.is_none(), "a selection jumps nowhere else");
+         assert_eq!(b.selection(), 3..4, "the definition is selected in B");
+     }
+ 
+@@ -860,9 +988,8 @@ mod tests {
+         let open = jump_into_b(&mut a, &mut client);
+         let _ = b.update(Event::Editor(Action::Type('z')), Instant::now());
+         let before = b.selection();
+-        assert_eq!(
+-            b.jump(&mut client, open),
+-            Err(Refusal::Stale),
++        assert!(
++            matches!(b.jump(&mut client, open), Err(Refusal::Stale)),
+             "B moved since the answer",
+         );
+         assert_eq!(b.selection(), before, "nothing is selected");
+@@ -943,7 +1070,7 @@ mod tests {
+         let _ = ed.update(Event::Editor(Action::Type('q')), Instant::now());
+         assert!(ed.drain_changes().is_empty(), "edits are no longer logged");
+         assert!(
+-            ed.sync_lsp(&mut client).is_empty(),
++            ed.sync_lsp(&mut client).messages.is_empty(),
+             "a closed editor syncs nothing"
+         );
+     }
+@@ -999,7 +1126,7 @@ mod tests {
+         let (mut ed, messages) = opened(&mut client, A, "\n");
+         let opened_at = version(&sent(&messages, "textDocument/didOpen"));
+         let _ = ed.update(Event::Editor(Action::Type(';')), Instant::now());
+-        let messages: Vec<Value> = ed.save_lsp(&mut client).iter().map(wire).collect();
++        let messages: Vec<Value> = ed.save_lsp(&mut client).messages.iter().map(wire).collect();
+         let methods: Vec<&Value> = messages.iter().map(|message| &message["method"]).collect();
+         assert_eq!(
+             methods,
+@@ -1024,7 +1151,7 @@ mod tests {
+         let mut client = ready();
+         let mut ed = CodeEditor::new("\n");
+         let _ = ed.update(Event::Editor(Action::Type(';')), Instant::now());
+-        assert!(ed.save_lsp(&mut client).is_empty(), "nothing is sent");
++        assert!(ed.save_lsp(&mut client).messages.is_empty(), "nothing is sent");
+     }
+ 
+     /// `sync_lsp` on an editor that was never opened sends nothing and keeps its requests.
+@@ -1033,10 +1160,113 @@ mod tests {
+         let mut client = ready();
+         let mut ed = CodeEditor::new("\n");
+         let _ = ed.update(Event::Editor(Action::Type('g')), Instant::now());
+-        assert!(ed.sync_lsp(&mut client).is_empty(), "nothing is sent");
++        assert!(ed.sync_lsp(&mut client).messages.is_empty(), "nothing is sent");
+         assert!(
+             ed.take_completion_request().is_some(),
+             "the recorded request is left for the host",
+         );
+     }
++
++    /// A `let` whose `x` the `hinted` answer annotates.
++    const LET_X: &str = "let x = f();\n";
++
++    /// `: Foo` after `x`: insertable, and `Foo` links into a file no editor opened.
++    fn hinted() -> Value {
++        json!([{
++            "position": { "line": 0, "character": 5 },
++            "kind": 1,
++            "label": [
++                { "value": ": " },
++                {
++                    "value": "Foo",
++                    "location": { "uri": "file:///w/foo.rs", "range": on_line(0, 7, 10) },
++                },
++            ],
++            "textEdits": [{ "range": on_line(0, 5, 5), "newText": ": Foo" }],
++        }])
++    }
++
++    /// An editor over `LET_X` with hints on, opened on a hint-aware client, its hints fetched
++    /// and landed. Returns the editor, the `didOpen`'s version and the hint's key.
++    fn with_hint(client: &mut Client) -> (CodeEditor, Value, Key) {
++        let mut ed = CodeEditor::new(LET_X).inlay_hints(true);
++        let opened = ed.open_lsp(client, &uri(A), "rust").expect("the URI is free");
++        let request = sent(&fetch_inlays(&mut ed, client), "textDocument/inlayHint");
++        let document = one_document(client, reply(&request, hinted()));
++        let applied = ed.apply_lsp(client, document);
++        assert_eq!(applied.refused, None, "the hints are current");
++        let [(offset, key)] = shown(&ed)[..] else {
++            panic!("one hint shows, got {:?}", shown(&ed));
++        };
++        assert_eq!(offset, 5, "the hint renders after `x`");
++        (ed, version(&sent(&opened, "textDocument/didOpen")), key)
++    }
++
++    /// A Ctrl+click on a label part that points into a file nobody opened comes back from
++    /// `sync_lsp` itself, with no request to the server.
++    #[test]
++    fn sync_lsp_returns_an_inlay_label_jump_into_an_unopened_file() {
++        let mut client = ready_with_hints();
++        let (mut ed, _, key) = with_hint(&mut client);
++        let applied = gesture(&mut ed, &mut client, Action::InlayJump { key, part: 1 });
++        match &applied.jump {
++            Some(update::Jump::Unopened(unopened)) => assert_eq!(
++                unopened.uri().as_str(),
++                "file:///w/foo.rs",
++                "the jump names the part's file",
++            ),
++            other => panic!("expected a jump into an unopened file, got {other:?}"),
++        }
++        assert_eq!(applied.refused, None, "a sync refuses nothing");
++        assert!(
++            all_sent(&applied.messages, "textDocument/definition").is_empty(),
++            "the client answers from the hint, without asking the server",
++        );
++    }
++
++    /// A double-clicked hint inserts its text once: the hint goes before the text lands, and the
++    /// edit's didChange leaves in the same `sync_lsp` call.
++    #[test]
++    fn an_inlay_insert_lands_once_and_syncs_in_the_same_call() {
++        let mut client = ready_with_hints();
++        let (mut ed, opened_at, key) = with_hint(&mut client);
++        let applied = gesture(&mut ed, &mut client, Action::InlayInsert { key, offset: 5 });
++        assert_eq!(ed.document().text(), "let x: Foo = f();\n", "the hint's text is inserted");
++        assert!(shown(&ed).is_empty(), "the inserted hint no longer shows");
++        let change = sent(&applied.messages, "textDocument/didChange");
++        assert_eq!(
++            version(&change),
++            json!(opened_at.as_i64().expect("versions are integers") + 1),
++            "the insert is synced at the next version",
++        );
++        assert!(applied.jump.is_none(), "an insert jumps nowhere");
++    }
++
++    /// `close_lsp` drops the shown hints and every inlay slot, so nothing waits on a reply that
++    /// can no longer land.
++    #[test]
++    fn close_lsp_clears_the_hints_and_their_slots() {
++        let mut client = ready_with_hints();
++        let (mut ed, _, key) = with_hint(&mut client);
++        let _ = ed.update(
++            Event::Editor(Action::InlayHover { key, part: 1 }),
++            Instant::now(),
++        );
++        ed.wait_inlays(INLAY_EDIT_DELAY, None);
++        assert!(
++            ed.awaiting.inlay_tooltip.is_some() && ed.pending_wake().is_some(),
++            "a tooltip and a fetch are pending before the close",
++        );
++        let _closed = ed.close_lsp(&mut client);
++        assert!(shown(&ed).is_empty(), "the hints are cleared");
++        assert!(ed.take_inlay_interaction().is_none(), "the hover gesture is forgotten");
++        assert!(ed.take_inlay_request().is_none(), "no fetch is left to pull");
++        assert!(ed.pending_wake().is_none(), "the scheduled fetch is dropped");
++        assert!(
++            ed.awaiting.inlays.is_none()
++                && ed.awaiting.inlay_tooltip.is_none()
++                && ed.awaiting.inlay_insert.is_none(),
++            "every inlay slot is settled",
++        );
++    }
+ }
