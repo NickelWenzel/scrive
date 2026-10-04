@@ -4,8 +4,9 @@
 //!
 //! The core is **language-agnostic**: the grammar is an app-supplied
 //! `.sublime-syntax`, injected as text (`SyntaxDef::from_sublime_syntax`), and
-//! the theme an app-supplied `.tmTheme` (`TokenTheme::from_tm_theme`);
-//! scrive-core ships neither.
+//! the theme an app-supplied `.tmTheme` (`TokenTheme::from_tm_theme`) or
+//! capture styles built in code (`TokenTheme::builder`); scrive-core ships
+//! neither.
 //!
 //! # Two entry points
 //!
@@ -27,7 +28,6 @@
 //! [`HighlightCache`] for the mechanics.
 
 use core::ops::Range;
-use std::io::Cursor;
 use std::sync::Arc;
 
 use crate::buffer::Snapshot;
@@ -35,9 +35,13 @@ use crate::sum_tree::{Dimension, Item, Summary, SumTree};
 
 use syntect::highlighting::{
     FontStyle, HighlightState, Highlighter as SyntectHighlighter, RangedHighlightIterator, Style,
-    Theme, ThemeSet,
 };
 use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet, SyntaxSetBuilder};
+
+pub mod token_theme;
+mod vocabulary;
+
+pub use token_theme::{ThemeError, TokenTheme};
 
 /// A GUI-free color; scrive-iced maps it to `iced::Color` at render time.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -81,11 +85,6 @@ pub struct HighlightSpan {
 #[error("invalid .sublime-syntax grammar: {0}")]
 pub struct SyntaxError(String);
 
-/// Failed to parse a `.tmTheme`.
-#[derive(Debug, thiserror::Error)]
-#[error("invalid .tmTheme: {0}")]
-pub struct ThemeError(String);
-
 /// A parsed grammar. The app supplies a validated `.sublime-syntax` definition;
 /// scrive-core ships no grammar of its own and stays language-agnostic.
 pub struct SyntaxDef {
@@ -117,33 +116,20 @@ impl SyntaxDef {
 /// Convert a syntect `(Style, byte range)` to a public [`HighlightSpan`] — the
 /// one place a resolved style crosses out of syntect.
 fn span_from(style: Style, range: Range<usize>) -> HighlightSpan {
-    HighlightSpan {
-        range: range.start as u32..range.end as u32,
-        style: SpanStyle {
-            fg: Rgba {
-                r: style.foreground.r,
-                g: style.foreground.g,
-                b: style.foreground.b,
-                a: style.foreground.a,
-            },
-            bold: style.font_style.contains(FontStyle::BOLD),
-            italic: style.font_style.contains(FontStyle::ITALIC),
-        },
-    }
+    HighlightSpan { range: range.start as u32..range.end as u32, style: style_from(style) }
 }
 
-/// A parsed highlight theme — opaque over syntect's `Theme`. `Clone` is cheap
-/// (a syntect `Theme` is a small style table), so an integrating widget can
-/// retain a theme and re-apply it across a document reload or grammar swap.
-#[derive(Clone)]
-pub struct TokenTheme(Theme);
-
-impl TokenTheme {
-    /// Parse a `.tmTheme` (plist).
-    pub fn from_tm_theme(s: &str) -> Result<Self, ThemeError> {
-        ThemeSet::load_from_reader(&mut Cursor::new(s))
-            .map(TokenTheme)
-            .map_err(|e| ThemeError(e.to_string()))
+/// The public [`SpanStyle`] of a resolved syntect `Style`.
+fn style_from(style: Style) -> SpanStyle {
+    SpanStyle {
+        fg: Rgba {
+            r: style.foreground.r,
+            g: style.foreground.g,
+            b: style.foreground.b,
+            a: style.foreground.a,
+        },
+        bold: style.font_style.contains(FontStyle::BOLD),
+        italic: style.font_style.contains(FontStyle::ITALIC),
     }
 }
 
@@ -166,7 +152,7 @@ impl Highlighter {
     /// its line. State is carried line to line, so multi-line constructs resolve.
     #[must_use]
     pub fn highlight(&self, text: &str) -> Vec<Vec<HighlightSpan>> {
-        let syntect = SyntectHighlighter::new(&self.theme.0);
+        let syntect = SyntectHighlighter::new(self.theme.syntect());
         let mut state = LineState {
             parse: ParseState::new(self.syntax.reference()),
             highlight: HighlightState::new(&syntect, ScopeStack::new()),
@@ -999,7 +985,7 @@ impl HighlightCache {
         max_lines: u32,
         mut line: impl FnMut(u32) -> S,
     ) -> u32 {
-        let syntect = SyntectHighlighter::new(&self.theme.0);
+        let syntect = SyntectHighlighter::new(self.theme.syntect());
         let syntax = &*self.syntax;
         let fresh = || LineState {
             parse: ParseState::new(syntax.reference()),
@@ -1232,7 +1218,7 @@ impl HighlightEngine {
     }
 
     fn fresh_state(&self) -> LineState {
-        let syntect = SyntectHighlighter::new(&self.theme.0);
+        let syntect = SyntectHighlighter::new(self.theme.syntect());
         LineState {
             parse: ParseState::new(self.syntax.reference()),
             highlight: HighlightState::new(&syntect, ScopeStack::new()),
@@ -1335,7 +1321,7 @@ pub fn tokenize_segment(
     spans_for: Option<Range<u32>>,
     converge_against: Option<&SegmentTokens>,
 ) -> SegmentTokens {
-    let syntect = SyntectHighlighter::new(&engine.theme.0);
+    let syntect = SyntectHighlighter::new(engine.theme.syntect());
     let set = &engine.syntax.set;
     let started_fresh = matches!(start, SegmentStart::Fresh);
     let mut state = match start {
@@ -1683,6 +1669,49 @@ mod tests {
         let kw = lines[0].iter().find(|s| s.range == (0..2)).expect("a span at 0..2");
         assert_eq!(kw.style.fg, red);
         assert!(lines[0].iter().any(|s| s.style.fg == white), "non-keyword text is default white");
+    }
+
+    #[test]
+    fn builder_theme_colors_syntect_tokens_through_the_vocabulary() {
+        let red = Rgba { r: 0xff, g: 0, b: 0, a: 0xff };
+        let white = Rgba { r: 0xff, g: 0xff, b: 0xff, a: 0xff };
+        let theme = TokenTheme::builder()
+            .foreground(white)
+            .capture("keyword", SpanStyle { fg: red, bold: true, italic: false })
+            .capture("not.in.vocabulary", SpanStyle { fg: red, bold: false, italic: false })
+            .build();
+        let syntax = SyntaxDef::from_sublime_syntax(GRAMMAR).unwrap();
+        let lines = Highlighter::new(syntax, theme).highlight("kw x");
+        let kw = lines[0].iter().find(|s| s.range == (0..2)).expect("a span at 0..2");
+        assert_eq!(kw.style, SpanStyle { fg: red, bold: true, italic: false });
+        let rest: Vec<_> = lines[0].iter().filter(|s| s.range.start >= 2).collect();
+        assert!(!rest.is_empty());
+        assert!(rest.iter().all(|s| s.style == SpanStyle { fg: white, bold: false, italic: false }));
+    }
+
+    #[test]
+    fn builder_theme_lets_the_deeper_capture_win_a_shared_scope_under_syntect() {
+        const ESCAPE_GRAMMAR: &str = "%YAML 1.2\n\
+            ---\n\
+            name: Test\n\
+            scope: source.test\n\
+            contexts:\n\
+            \x20 main:\n\
+            \x20   - match: '\\\\n'\n\
+            \x20     scope: constant.character.escape.test\n";
+        let red = Rgba { r: 0xff, g: 0, b: 0, a: 0xff };
+        let green = Rgba { r: 0, g: 0xff, b: 0, a: 0xff };
+        let deeper = ("string.escape", SpanStyle { fg: green, bold: false, italic: false });
+        let shallower = ("escape", SpanStyle { fg: red, bold: false, italic: false });
+        // Syntect keeps the first equally specific item, so only the
+        // shallower-first order catches a missing depth sort.
+        for [first, second] in [[deeper, shallower], [shallower, deeper]] {
+            let theme = TokenTheme::builder().capture(first.0, first.1).capture(second.0, second.1).build();
+            let syntax = SyntaxDef::from_sublime_syntax(ESCAPE_GRAMMAR).unwrap();
+            let lines = Highlighter::new(syntax, theme).highlight("\\n");
+            let escape = lines[0].iter().find(|s| s.range == (0..2)).expect("a span at 0..2");
+            assert_eq!(escape.style.fg, green, "{} styled first", first.0);
+        }
     }
 
     #[test]
@@ -2356,7 +2385,7 @@ mod tests {
     /// pin the `(row, state)` sequence, not just the rows.
     fn str_state() -> LineState {
         let eng = engine_str();
-        let syntect = SyntectHighlighter::new(&eng.theme.0);
+        let syntect = SyntectHighlighter::new(eng.theme.syntect());
         let (_spans, end) = tokenize_line(&syntect, &eng.syntax.set, &eng.fresh_state(), "\"");
         end
     }
