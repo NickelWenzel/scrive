@@ -4,7 +4,8 @@
 //! `iced::advanced::Widget` (deliberately *not* a `canvas::Program`, because
 //! only the low-level widget API exposes the `operate()` hook needed to join
 //! iced's focus/operation protocol), with a gutter, N-caret selections, syntect
-//! highlighting, diagnostic squiggles, a completion popup, and hover.
+//! or tree-sitter (the `tree-sitter` feature) highlighting, diagnostic
+//! squiggles, a completion popup, and hover.
 //!
 //! # Two tiers
 //!

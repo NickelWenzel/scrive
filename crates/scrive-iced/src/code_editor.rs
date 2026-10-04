@@ -44,9 +44,9 @@ use scrive_core::intel::ticket;
 use scrive_core::{
     default_indent_size, is_completion_word_char, Bias, BufferRow, CompletionController, CompletionCx, CompletionItem,
     CompletionState, CompletionTrigger, Completions, DefinitionRequest, Diagnostic, DiagnosticsOutcome,
-    Document, EditOp, FindQuery, FormatRequest, Hover,
+    Document, EditOp, FindQuery, FormatRequest, Grammar, Hover,
     HoverCx, HoverInfo, InsertText, Point, RenameRequest, Revision, Selection, SelectionId, SelectionSet, Severity,
-    SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, SyntaxDef, TabOutcome, Ticket,
+    SignatureCx, SignatureHelp, SignatureInfo, Snippet, SnippetSession, TabOutcome, Ticket,
     TokenTheme, TransactionError, LOOKBACK_LINES,
 };
 
@@ -443,13 +443,17 @@ impl CodeEditor {
 
     // ── builder (policy; every knob defaulted) ──────────────────────────────
 
-    /// Attach a grammar, enabling syntax highlighting. Uses the theme set by
+    /// Attach a grammar, enabling syntax highlighting: a
+    /// [`SyntaxDef`](scrive_core::SyntaxDef), or a `scrive_core::TreeSitterDef`
+    /// under the `tree-sitter` feature. Uses the theme set by
     /// [`theme`](CodeEditor::theme) if one was staged, else the bundled default.
-    /// Order-independent with `theme`. Seeds the whole (small) document's colors
-    /// immediately so the first paint is highlighted without waiting for a
-    /// viewport report — the cold-load fix.
+    /// Order-independent with `theme`. Seeds the visible rows' colors (the
+    /// whole document before any viewport report) immediately, so the first
+    /// paint is highlighted — the cold-load fix. A tree-sitter parse too long
+    /// for one call's budget is the exception: it finishes over the next
+    /// frames, through [`subscription`](CodeEditor::subscription).
     #[must_use]
-    pub fn language(mut self, grammar: SyntaxDef) -> Self {
+    pub fn language(mut self, grammar: impl Into<Grammar>) -> Self {
         self.doc.set_syntax(grammar, self.theme.clone());
         self.has_syntax = true;
         self.seed_highlight();
@@ -629,8 +633,10 @@ impl CodeEditor {
     /// theme unless `grammar` supplies a new language. The blessed whole-buffer
     /// swap: it runs as one transaction and re-tokenizes the visible document, so
     /// highlighting is correct immediately — never mutate the buffer behind the
-    /// tail's back. (The swap is a normal transaction, so it is undoable.)
-    pub fn load(&mut self, source: impl Into<String>, grammar: Option<SyntaxDef>) {
+    /// tail's back. (The swap is a normal transaction, so it is undoable.) As
+    /// with [`language`](CodeEditor::language), a tree-sitter parse too long for
+    /// one call's budget finishes over the next frames.
+    pub fn load(&mut self, source: impl Into<String>, grammar: Option<Grammar>) {
         let source = source.into();
         // Replace the whole buffer as one transaction; the grammar, theme, and
         // highlight cache stay attached and re-tokenize via `on_commit`.
@@ -1167,8 +1173,9 @@ impl CodeEditor {
                         self.hl_pool = Some(pool);
                     }
                 } else {
-                    // Small document (or shrunk below the threshold): deactivate
-                    // any lingering pool and drive the synchronous path.
+                    // Small document (or shrunk below the threshold), or a grammar
+                    // with no pool engine (tree-sitter): deactivate any lingering
+                    // pool and drive the synchronous path.
                     if let Some(pool) = &mut self.hl_pool {
                         pool.active = false;
                     }
@@ -1584,25 +1591,38 @@ impl CodeEditor {
     // ── internals ───────────────────────────────────────────────────────────
 
     /// Whether the document is large enough for the off-thread highlight pool
-    /// (never on wasm32, which has no threads).
+    /// (never on wasm32, which has no threads) and its grammar can run there.
+    /// A tree-sitter document has no pool engine (`HighlightPool::new` builds
+    /// nothing for it), so at any size it highlights on the UI thread, one
+    /// budgeted call per frame.
     fn uses_pool(&self) -> bool {
         PARALLEL_MIN_BYTES.is_some_and(|min| self.doc.buffer().len() >= min)
+            && self.doc.highlight_engine().is_some()
     }
 
     /// Colour the document at load (or after a grammar swap / buffer load): the
-    /// large-document parallel sweep for a big buffer, else a synchronous seed of
-    /// the whole (small) buffer. The cold-load fix — the first paint is coloured
+    /// large-document parallel sweep for a big buffer, else a synchronous seed
+    /// aimed at the reported viewport, or at the whole buffer before the widget
+    /// has reported one. The widget reports only viewport changes, so a `load`
+    /// while scrolled far down gets no fresh report to re-aim the window.
+    /// The cold-load fix — the first paint is coloured
     /// with no viewport report required, and a huge buffer never blocks the UI
     /// thread (its pool sweeps in the background, aimed at the current viewport,
     /// which the first `ViewportChanged` reaims). Recreating the pool here also
     /// picks up a new grammar's engine after a `load` language swap.
+    ///
+    /// The synchronous seed is one `tokenize_highlight` call. For a tree-sitter
+    /// grammar that call parses within a budget, so a big document's first call
+    /// may only start the parse; the frontier stays dirty and
+    /// [`HighlightSweep`](Event::HighlightSweep) resumes it each frame.
     fn seed_highlight(&mut self) {
         if self.uses_pool() {
             self.hl_pool = HighlightPool::new(&self.doc, self.viewport.clone());
         } else {
             self.hl_pool = None;
             let n = self.doc.buffer().line_count();
-            self.doc.set_highlight_window(0..n);
+            let aim = if self.viewport.is_empty() || self.viewport.start >= n { 0..n } else { self.viewport.clone() };
+            self.doc.set_highlight_window(aim);
             self.doc.tokenize_highlight(n);
         }
     }
@@ -2424,6 +2444,7 @@ fn find_chord(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scrive_core::SyntaxDef;
 
     // A minimal grammar: one keyword-scoped rule over word runs. Enough to drive
     // the highlight cache without pulling the example's Rust grammar into the lib.
@@ -2579,12 +2600,100 @@ mod tests {
         let grammar = SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
         let mut ed = CodeEditor::new("old\n").language(grammar);
         let g2 = SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
-        ed.load("brand new content\nsecond line\n", Some(g2));
+        ed.load("brand new content\nsecond line\n", Some(g2.into()));
         assert_eq!(ed.document().text().into_owned(), "brand new content\nsecond line\n");
         assert!(
             ed.document().highlight_frontier().is_none(),
             "load must re-tokenize the visible document",
         );
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    fn rust_tree_sitter() -> scrive_core::TreeSitterDef {
+        scrive_core::TreeSitterDef::new(tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY)
+            .expect("tree-sitter-rust's own query compiles")
+    }
+
+    /// The cold-load seed holds for a tree-sitter grammar: a small document
+    /// parses within one call's budget, so it is coloured at construction.
+    #[test]
+    #[cfg(feature = "tree-sitter")]
+    fn a_tree_sitter_language_tokenizes_at_load_without_a_viewport_report() {
+        let editor = CodeEditor::new("fn main() {}\nlet x = 1;\n").language(rust_tree_sitter());
+        assert!(editor.document().highlight_frontier().is_none(), "the seed left the frontier dirty");
+        assert!(
+            editor.document().highlight_line_spans(0).is_some_and(|spans| !spans.is_empty()),
+            "`fn` is coloured",
+        );
+    }
+
+    /// A tree-sitter document past the pool threshold stays off the pool, which
+    /// has no engine for it, and converges through the per-frame sweep.
+    #[test]
+    #[cfg(feature = "tree-sitter")]
+    fn a_large_tree_sitter_document_converges_through_the_sweep_without_a_pool() {
+        let big = "fn f() {}\n".repeat(230_000); // ~2.3 MB, over PARALLEL_MIN_BYTES
+        let mut ed = CodeEditor::new(big).language(rust_tree_sitter());
+        if let Some(min) = PARALLEL_MIN_BYTES {
+            assert!(ed.document().buffer().len() >= min, "the document crosses the pool threshold");
+        }
+        assert!(ed.hl_pool.is_none(), "no pool for a grammar without an engine");
+        assert!(ed.document().highlight_frontier().is_some(), "the first parse spans several calls");
+
+        let mut sweeps = 0;
+        while ed.document().highlight_frontier().is_some() {
+            assert!(sweeps < 5_000, "the sweep did not converge");
+            let _ = ed.update(Event::HighlightSweep, Instant::now());
+            sweeps += 1;
+        }
+        assert!(ed.hl_pool.is_none(), "the sweep never started a pool");
+        assert!(ed.document().highlight_line_spans(0).is_some_and(|spans| !spans.is_empty()));
+    }
+
+    /// Loads a 120,000-row document while the widget reports rows
+    /// 100,000..100,036, sweeps to convergence, and checks those rows are
+    /// coloured. No fresh viewport report follows a load, so the seed must aim
+    /// at the one already reported.
+    fn assert_load_colors_the_reported_viewport(grammar: Grammar) {
+        let mut ed = CodeEditor::new("old\n");
+        let _ = ed.update(Event::Editor(Action::ViewportChanged(100_000..100_036)), Instant::now());
+        ed.load("fn f() {}\n".repeat(120_000), Some(grammar));
+        let mut sweeps = 0;
+        while ed.document().highlight_frontier().is_some() {
+            assert!(sweeps < 5_000, "the sweep did not converge");
+            let _ = ed.update(Event::HighlightSweep, Instant::now());
+            sweeps += 1;
+        }
+        assert!(
+            ed.document().highlight_line_spans(100_000).is_some_and(|spans| !spans.is_empty()),
+            "the reported viewport is coloured",
+        );
+    }
+
+    #[test]
+    fn load_colors_the_reported_viewport_with_syntect() {
+        assert_load_colors_the_reported_viewport(SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses").into());
+    }
+
+    #[test]
+    #[cfg(feature = "tree-sitter")]
+    fn load_colors_the_reported_viewport_with_tree_sitter() {
+        assert_load_colors_the_reported_viewport(rust_tree_sitter().into());
+    }
+
+    /// `load` with a tree-sitter grammar swaps the backend out from under a
+    /// syntect one and re-seeds it.
+    #[test]
+    #[cfg(feature = "tree-sitter")]
+    fn load_swaps_a_syntect_grammar_for_tree_sitter() {
+        let grammar = SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
+        let mut ed = CodeEditor::new("old\n").language(grammar);
+        assert!(ed.document().highlight_engine().is_some(), "syntect has a pool engine");
+
+        ed.load("fn main() {}\n", Some(rust_tree_sitter().into()));
+        assert!(ed.document().highlight_engine().is_none(), "the tree-sitter backend replaced syntect");
+        assert!(ed.document().highlight_frontier().is_none(), "load re-tokenized the document");
+        assert!(ed.document().highlight_line_spans(0).is_some_and(|spans| !spans.is_empty()));
     }
 
     /// The `bracket_lexing` builder wires through to the document's bracket

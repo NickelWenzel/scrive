@@ -23,6 +23,9 @@ iced = { version = "0.15.0-dev", features = ["advanced"] }
 # a language server compiles none of it.
 [features]
 lsp = ["dep:scrive-lsp"]
+# Tree-sitter highlighting: `CodeEditor::language` then also accepts a
+# `scrive_core::TreeSitterDef`. Forwards to scrive-core's backend.
+tree-sitter = ["scrive-core/tree-sitter"]
 
 [dev-dependencies]
 # Headless render-to-PNG for self-validation screenshots: construct a real
@@ -43,6 +46,13 @@ serde_json = "1"
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 iced = { version = "0.15.0-dev", features = ["webgl", "fira-sans"] }
 
+# tree-sitter-rust: the grammar of the `tree_sitter` example and the
+# `tree-sitter` feature's tests. Its build.rs predates the template that adds
+# the wasm headers, so a wasm32-unknown-unknown build needs
+# `eval "$(scripts/wasm-cflags.sh)"` first. Not on WASI, like scrive-core's.
+[target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
+tree-sitter-rust = "0.24"
+
 [[example]]
 name = "scratch"
 test = true
@@ -61,6 +71,10 @@ test = true
 name = "rust_analyzer"
 required-features = ["lsp"]
 test = true
+
+[[example]]
+name = "tree_sitter"
+required-features = ["tree-sitter"]
 
 [package.metadata.docs.rs]
 all-features = true
