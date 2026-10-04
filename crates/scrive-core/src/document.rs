@@ -2617,43 +2617,14 @@ fn rebase_views(
     committed: &Committed,
     bracket_cfg: &crate::bracket::BracketConfig,
 ) -> core::ops::Range<u32> {
-    // Highlight cache: splice the transaction's per-edit line spans (built
-    // below). The size invariant (new_size = old_size − old_count + new_count)
+    // Highlight cache: splice the transaction's per-edit line spans (built by
+    // `line_splices`). The size invariant (new_size = old_size − old_count + new_count)
     // keeps each edit's `old_lines` provably in-bounds. Only the actually-edited
     // lines are invalidated — NOT the first-to-last covering range — so a
     // scattered multi-caret edit doesn't over-invalidate the lines between.
     if let Some(cache) = views.highlight.as_mut() {
-        let edits = committed.patch().edits();
-        if !edits.is_empty() {
-            // Per-edit pre-edit line spans `(pre_start, old_lines, new_lines)`,
-            // ascending and coalesced disjoint, so the highlight commit
-            // invalidates only the actually-edited lines — not the whole
-            // first-to-last covering range (which would over-invalidate the
-            // lines between scattered multi-caret edits). `old_lines` comes from
-            // each edit's replaced text (its inverse op); `new_lines` from the
-            // post-edit buffer.
-            let mut spans: Vec<(u32, u32, u32)> = Vec::with_capacity(edits.len());
-            let mut acc: i64 = 0;
-            for (e, inv) in edits.iter().zip(committed.inverse_ops()) {
-                let post_sr = buffer.offset_to_point(e.new.start).row;
-                let post_er = buffer.offset_to_point(e.new.end).row;
-                let new_lines = post_er - post_sr + 1;
-                let old_lines = inv.text.bytes().filter(|&b| b == b'\n').count() as u32 + 1;
-                let pre_start = (i64::from(post_sr) - acc) as u32;
-                acc += i64::from(new_lines) - i64::from(old_lines);
-                match spans.last_mut() {
-                    // Same-line / touching edits share a pre-edit line — coalesce
-                    // so the span list stays disjoint (the merge walks need it).
-                    Some(last) if pre_start < last.0 + last.1 => {
-                        let merged_end = (last.0 + last.1).max(pre_start + old_lines);
-                        let combined_delta = (i64::from(last.2) - i64::from(last.1))
-                            + (i64::from(new_lines) - i64::from(old_lines));
-                        last.1 = merged_end - last.0;
-                        last.2 = (i64::from(last.1) + combined_delta) as u32;
-                    }
-                    _ => spans.push((pre_start, old_lines, new_lines)),
-                }
-            }
+        if !committed.patch().edits().is_empty() {
+            let spans = crate::highlight::splice::line_splices(buffer, committed);
             // Checkpoints, dense window, and dirty runs all ride the per-edit
             // spans — the window stays aimed at the viewport (only edited rows
             // invalidated), so a scattered multi-caret edit's wide covering range
