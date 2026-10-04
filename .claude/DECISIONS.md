@@ -553,3 +553,19 @@ from the edited rows plus a bounded walk of the window's nodes; not planned.
 
 Tree memory, for the record: 36× the text on the bench corpus, 28× on scrive's own sources
 (allocator-counted, ~94 bytes per C allocation). A tree-sitter document holds it while open.
+
+## D23 — Syntect drops spans in the theme's plain style
+
+**Date:** 2026-10-04 · **Context:** follow-up after the tree-sitter visual check, base 5f519b7 · **Status:** decided
+
+### Issue
+Under syntect, every unstyled run got a span in the theme's default foreground. Scrive Dark's is #DFE1E6, so in the iced light palette plain identifiers were light gray on white and hard to read. Tree-sitter didn't have the problem after 5f519b7, because it spans only styled captures and the renderer draws the gaps in the palette's text color.
+
+### Decision
+`line_state::tokenize_line` drops a span whose foreground and font style equal the syntect theme's default (`Highlighter::get_default`). Both backends now span only styled text, and the palette owns plain-text color. `Document::highlight_line_spans`, `Builder::foreground` and the renderer's `colored_runs` docs say so.
+
+### Why
+It's one rule for both backends, and plain text follows light and dark mode with no theme switching. Colored tokens still use the dark theme's colors on a light background. Picking a light theme for light mode stays a separate, later choice.
+
+### Followups
+D6's reason for a builder foreground (plain text would render black under syntect) no longer applies to drawing, because plain-style text has no span. The setting still decides which runs count as plain.
