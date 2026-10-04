@@ -1747,7 +1747,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Editor<'_, Messag
             } else {
                 match spans {
                     Some(spans) if !spans.is_empty() => {
-                        self.draw_spans(renderer, &line, spans, origin, advance, code_clip);
+                        self.draw_spans(renderer, &line, spans, origin, advance, text_color, code_clip);
                     }
                     _ if !line.is_empty() => {
                         self.draw_line(renderer, expand_tabs(&line, 0), origin, text_color, Alignment::Left, code_clip);
@@ -3474,9 +3474,8 @@ impl<Message> Editor<'_, Message> {
         };
         match spans {
             Some(spans) if !spans.is_empty() => {
-                for s in spans {
-                    let fg = s.style.fg;
-                    seg(renderer, s.range.clone(), Color::from_rgb8(fg.r, fg.g, fg.b));
+                for (range, color) in colored_runs(spans, line.len() as u32, text_color) {
+                    seg(renderer, range, color);
                 }
             }
             _ => {
@@ -3697,7 +3696,9 @@ impl<Message> Editor<'_, Message> {
         for (i, &r) in rows[..shown].iter().enumerate() {
             let ry = rect.y + pad + i as f32 * line_h;
             match self.doc.highlight_line_spans(r) {
-                Some(spans) if !spans.is_empty() => self.draw_spans(renderer, &buffer.line(r), spans, Point::new(sx, ry), advance, rect),
+                Some(spans) if !spans.is_empty() => {
+                    self.draw_spans(renderer, &buffer.line(r), spans, Point::new(sx, ry), advance, text_color, rect);
+                }
                 _ => {
                     let line = buffer.line(r);
                     let l = line.trim_start();
@@ -3715,7 +3716,9 @@ impl<Message> Editor<'_, Message> {
     }
 
     /// Draw one line as its colored highlight spans (each a byte range within the
-    /// line, positioned by its start cell). Bold/italic deferred; fg only.
+    /// line, positioned by its start cell), with uncovered text in `plain`.
+    /// Bold/italic deferred; fg only.
+    #[allow(clippy::too_many_arguments)]
     fn draw_spans(
         &self,
         renderer: &mut iced::Renderer,
@@ -3723,24 +3726,14 @@ impl<Message> Editor<'_, Message> {
         spans: &[HighlightSpan],
         origin: Point,
         advance: f32,
+        plain: Color,
         clip: Rectangle,
     ) {
-        for span in spans {
-            let text = &line[span.range.start as usize..span.range.end as usize];
-            if text.is_empty() {
-                continue;
-            }
-            let cell = display_map::expand(line, span.range.start, TAB);
+        for (range, color) in colored_runs(spans, line.len() as u32, plain) {
+            let text = &line[range.start as usize..range.end as usize];
+            let cell = display_map::expand(line, range.start, TAB);
             let x = origin.x + cell as f32 * advance;
-            let fg = span.style.fg;
-            self.draw_line(
-                renderer,
-                expand_tabs(text, cell),
-                Point::new(x, origin.y),
-                Color::from_rgb8(fg.r, fg.g, fg.b),
-                Alignment::Left,
-                clip,
-            );
+            self.draw_line(renderer, expand_tabs(text, cell), Point::new(x, origin.y), color, Alignment::Left, clip);
         }
     }
 
@@ -3866,6 +3859,26 @@ fn expand_tabs(run: &str, start_cell: u32) -> String {
         }
     }
     out
+}
+
+/// A line's highlight spans with the gaps between them filled in `plain`. Syntect
+/// spans cover the whole line, but tree-sitter only spans styled captures, so an
+/// unstyled identifier sits in a gap and would otherwise not be drawn at all.
+fn colored_runs(spans: &[HighlightSpan], line_len: u32, plain: Color) -> Vec<(Range<u32>, Color)> {
+    let mut runs = Vec::with_capacity(spans.len() * 2 + 1);
+    let mut cursor = 0;
+    for span in spans {
+        if span.range.start > cursor {
+            runs.push((cursor..span.range.start, plain));
+        }
+        let fg = span.style.fg;
+        runs.push((span.range.clone(), Color::from_rgb8(fg.r, fg.g, fg.b)));
+        cursor = span.range.end;
+    }
+    if line_len > cursor {
+        runs.push((cursor..line_len, plain));
+    }
+    runs
 }
 
 /// `range` cut at every column of `cols` (sorted, duplicates allowed) strictly
@@ -4864,6 +4877,19 @@ mod tests {
         let runs: Vec<_> = split_at_columns(0..5, &[0, 2, 3, 3, 5]).collect();
         assert_eq!(runs, vec![0..2, 2..3, 3..5], "cut at 2 and 3 only");
         assert_eq!(split_at_columns(2..2, &[2]).count(), 0, "an empty span paints nothing");
+    }
+
+    /// Text no span covers (before, between and after spans) gets the plain
+    /// color; a line the spans cover fully gets no extra runs.
+    #[test]
+    fn colored_runs_fill_the_gaps_between_spans_in_the_plain_color() {
+        let plain = Color::BLACK;
+        let red = scrive_core::Rgba { r: 255, g: 0, b: 0, a: 255 };
+        let span = |range: Range<u32>| HighlightSpan { range, style: scrive_core::SpanStyle { fg: red, bold: false, italic: false } };
+        let runs = colored_runs(&[span(2..4), span(6..7)], 9, plain);
+        let red = Color::from_rgb8(255, 0, 0);
+        assert_eq!(runs, vec![(0..2, plain), (2..4, red), (4..6, plain), (6..7, red), (7..9, plain)]);
+        assert_eq!(colored_runs(&[span(0..9)], 9, plain), vec![(0..9, red)]);
     }
 
     /// A pill is dropped only where a selection strictly contains the hint's
