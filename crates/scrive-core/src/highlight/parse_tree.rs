@@ -2,24 +2,26 @@
 //! queried for spans only on the window rows whose highlighting may have
 //! changed.
 
-use core::ops::Range;
+use core::ops::{ControlFlow, Range};
 
-use tree_sitter::{InputEdit, Parser, QueryCursor, Tree};
+use tree_sitter::{InputEdit, ParseOptions, ParseState, Parser, QueryCursor, Tree};
 
 use super::capture_paint;
 use super::dirty_ranges::DirtyRanges;
 use super::rope_text::{self, RopeText};
 use super::tree_sitter_def::TreeSitterDef;
 use super::{padded_highlight_window, HighlightSpan, SpanStyle, TokenTheme};
-use super::{HIGHLIGHT_MAX_WINDOW_ROWS, HIGHLIGHT_WINDOW_SLACK};
+use super::{HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL, HIGHLIGHT_MAX_WINDOW_ROWS, HIGHLIGHT_WINDOW_SLACK};
 use crate::buffer::Buffer;
 use crate::coords::Point;
+use crate::rope::Rope;
 use crate::patch::Edit;
 use crate::transaction::Committed;
 
 /// The tree-sitter cache. It keeps the document's syntax tree, edited on
-/// every commit and reparsed on the next [`Cache::tokenize`], and spans for
-/// the retention window only (the same window the line-state cache keeps,
+/// every commit and reparsed by [`Cache::tokenize`] (across several calls
+/// when the parse outruns its budget), and spans for the retention window
+/// only (the same window the line-state cache keeps,
 /// through [`padded_highlight_window`]).
 ///
 /// A window row is queried again when it has no spans (edited, or newly in
@@ -37,6 +39,11 @@ pub(super) struct Cache {
     /// The tree is behind the buffer: edited through the commits since the
     /// last parse, but not yet reparsed.
     reparse: bool,
+    /// A parse cancelled at its budget, which the next parse call resumes.
+    in_progress: Option<PendingParse>,
+    /// Progress-callback checks a parse call may take; see
+    /// [`HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL`].
+    parse_budget: u32,
     /// Window rows whose spans are stale.
     dirty: DirtyRanges,
     n_lines: u32,
@@ -49,6 +56,17 @@ pub(super) struct Cache {
     parses: u32,
 }
 
+/// A parse the parser holds mid-way. It reads the text as it was when the
+/// parse started, so the commits since then wait in `queued` instead of
+/// cancelling it.
+struct PendingParse {
+    /// The text at the parse's start; an O(1) clone of the buffer's rope.
+    text: Rope,
+    /// The tree edits of the commits since then, in order, each in the
+    /// coordinates the ones before it leave.
+    queued: Vec<InputEdit>,
+}
+
 impl core::fmt::Debug for Cache {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Cache")
@@ -56,6 +74,7 @@ impl core::fmt::Debug for Cache {
             .field("window", &self.win)
             .field("parsed", &self.tree.is_some())
             .field("reparse", &self.reparse)
+            .field("in_progress", &self.in_progress.is_some())
             .field("dirty", &self.dirty)
             .finish_non_exhaustive()
     }
@@ -72,6 +91,8 @@ impl Cache {
             def,
             tree: None,
             reparse: true,
+            in_progress: None,
+            parse_budget: HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL,
             dirty: DirtyRanges::default(),
             n_lines,
             aim: win.clone(),
@@ -94,13 +115,19 @@ impl Cache {
     /// the new end are final, so the buffer supplies them; the old end
     /// position is the start advanced over the replaced text, which only the
     /// paired inverse op (`inverse_ops()[i]` undoes `edits()[i]`) still holds.
+    ///
+    /// While a parse is pending, the edits are queued for the tree it will
+    /// produce instead, and the old tree is left as the parse started from it.
     pub(super) fn on_commit(&mut self, buffer: &Buffer, committed: &Committed, spans: &[(u32, u32, u32)]) {
-        if let Some(tree) = self.tree.as_mut() {
-            let edits = committed.patch().edits();
-            let inverse = committed.inverse_ops();
-            debug_assert_eq!(edits.len(), inverse.len(), "a commit carries one inverse op per edit");
-            for (edit, inv) in edits.iter().zip(inverse) {
-                tree.edit(&input_edit(buffer, edit, &inv.text));
+        let edits = committed.patch().edits();
+        let inverse = committed.inverse_ops();
+        debug_assert_eq!(edits.len(), inverse.len(), "a commit carries one inverse op per edit");
+        let input_edits = edits.iter().zip(inverse).map(|(edit, inv)| input_edit(buffer, edit, &inv.text));
+        if let Some(pending) = self.in_progress.as_mut() {
+            pending.queued.extend(input_edits);
+        } else if let Some(tree) = self.tree.as_mut() {
+            for edit in input_edits {
+                tree.edit(&edit);
             }
         }
         self.reparse = true;
@@ -113,12 +140,14 @@ impl Cache {
 
     /// Reparse if the buffer moved on, then query the window rows that need
     /// it, at most `max_lines` rows; returns how many rows were queried.
+    /// A parse that runs out of budget queries nothing and resumes on the
+    /// next call.
     ///
     /// The work is bounded by the window, so unlike the line-state cache
     /// there is no target row to stop at.
     pub(super) fn tokenize(&mut self, buffer: &Buffer, max_lines: u32) -> u32 {
-        if self.reparse {
-            self.parse(buffer);
+        if self.reparse && !self.parse(buffer) {
+            return 0;
         }
         let end = self.win.end.min(self.n_lines);
         let mut work = 0;
@@ -185,18 +214,50 @@ impl Cache {
         self.dirty.insert_range(self.win.start..self.win.end.min(self.n_lines));
     }
 
-    fn parse(&mut self, buffer: &Buffer) {
-        let rope = buffer.rope();
-        let old = self.tree.take();
-        let new = self
-            .parser
-            .parse_with_options(&mut |byte, _| rope_text::chunk_from(rope, byte), old.as_ref(), None)
-            .expect("a parse with no cancellation always finishes");
+    /// Advance the parse by one budget; `false` if it hasn't caught up with
+    /// the buffer yet.
+    fn parse(&mut self, buffer: &Buffer) -> bool {
+        let pending = self
+            .in_progress
+            .get_or_insert_with(|| PendingParse { text: buffer.rope().clone(), queued: Vec::new() });
+        let budget = self.parse_budget;
+        let mut checks = 0;
+        let mut progress = |_: &ParseState| {
+            checks += 1;
+            if checks >= budget {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        };
+        let options = ParseOptions::new().progress_callback(&mut progress);
+        let text = &pending.text;
+        let mut input = |byte, _| rope_text::chunk_from(text, byte);
+        // A resumed parse ignores the tree it's handed (the parser retained
+        // the one it started from). `self.tree` stays that tree, unedited,
+        // for `changed_ranges`.
+        let Some(mut new) = self.parser.parse_with_options(&mut input, self.tree.as_ref(), Some(options)) else {
+            return false;
+        };
+        let PendingParse { queued, .. } = self.in_progress.take().expect("set above");
         #[cfg(test)]
         {
             self.parses += 1;
         }
         let window = self.win.start..self.win.end.min(self.n_lines);
+        if !queued.is_empty() {
+            // The new tree is of the parse's start text; catch it up with the
+            // commits since and parse again against the buffer. Its changed
+            // ranges would be in rows those commits have since moved, so the
+            // whole window waits for the next parse.
+            for edit in &queued {
+                new.edit(edit);
+            }
+            self.tree = Some(new);
+            self.dirty.insert_range(window);
+            return false;
+        }
+        let old = self.tree.take();
         match old {
             // `changed_ranges` misses a text-only change inside a multi-row
             // node whose structure didn't change, so a `#match?` / `#eq?` on
@@ -217,6 +278,7 @@ impl Cache {
         }
         self.tree = Some(new);
         self.reparse = false;
+        true
     }
 
     /// Query and paint window rows `rows`, which the tree is current for.
@@ -321,6 +383,16 @@ impl Cache {
     fn parse_count(&self) -> u32 {
         self.parses
     }
+
+    #[cfg(test)]
+    fn set_parse_budget(&mut self, checks: u32) {
+        self.parse_budget = checks;
+    }
+
+    #[cfg(test)]
+    fn parse_in_progress(&self) -> bool {
+        self.in_progress.is_some()
+    }
 }
 
 /// The tree edit for one patch edit; see [`Cache::on_commit`] for the
@@ -391,6 +463,8 @@ mod tests {
         buffer: Buffer,
         cache: Cache,
         theme: TokenTheme,
+        /// Walk the edited tree after each commit (slow on huge documents).
+        check_edits: bool,
     }
 
     impl Fixture {
@@ -398,7 +472,7 @@ mod tests {
             let buffer = Buffer::new(text).unwrap();
             let theme = theme();
             let cache = Cache::new(def(), &theme, buffer.line_count());
-            Self { buffer, cache, theme }
+            Self { buffer, cache, theme, check_edits: true }
         }
 
         fn edit(&mut self, ops: Vec<EditOp>) {
@@ -409,7 +483,9 @@ mod tests {
             let spans = line_splices(&self.buffer, &committed);
             self.cache.on_commit(&self.buffer, &committed, &spans);
             assert_eq!(self.cache.line_count(), self.buffer.line_count());
-            if let Some(tree) = &self.cache.tree {
+            // A pending parse leaves the tree unedited until it finishes.
+            let checked = self.check_edits && !self.cache.parse_in_progress();
+            if let Some(tree) = self.cache.tree.as_ref().filter(|_| checked) {
                 // The edited tree, before any reparse: every node the edits
                 // didn't touch already sits at its post-commit points.
                 self.assert_points_match_bytes(tree, |node| !node.has_changes());
@@ -763,6 +839,182 @@ mod tests {
         f.assert_matches_oracle();
     }
 
+    /// About `bytes` of `sample` rows, wrapped in modules the way real code
+    /// nests, so a reparse reuses whole modules instead of stepping over
+    /// every top-level item.
+    fn nested_sample(bytes: usize) -> String {
+        let body = sample(1_400);
+        let mut text = String::with_capacity(bytes + body.len());
+        for k in 0.. {
+            if text.len() >= bytes {
+                break;
+            }
+            text.push_str(&format!("mod m{k} {{\n{body}\n}}\n"));
+        }
+        text
+    }
+
+    /// Tokenize until the pending parse finishes, asserting the cache stays
+    /// pending and queries nothing meanwhile; returns the calls it took.
+    fn finish_parse(f: &mut Fixture) -> u32 {
+        let parses = f.cache.parse_count();
+        let mut calls = 0;
+        while f.cache.parse_count() == parses {
+            assert!(f.cache.pending().is_some(), "pending while the parse is");
+            let work = f.cache.tokenize(&f.buffer, HIGHLIGHT_MAX_LINES_PER_CALL);
+            if f.cache.parse_count() == parses {
+                assert_eq!(work, 0, "no queries before the parse ends");
+            }
+            calls += 1;
+            assert!(calls <= 10_000, "the parse never finished");
+        }
+        calls
+    }
+
+    #[test]
+    fn a_large_document_parses_across_calls_then_matches_the_oracle() {
+        let mut f = Fixture::new(&nested_sample(400_000));
+        let calls = finish_parse(&mut f);
+        // About 4,400 checks at the default budget of 100.
+        assert!((5..=200).contains(&calls), "the first parse took {calls} calls");
+        assert!(f.cache.pending().is_some(), "the window is still to query");
+        f.drive();
+        assert_eq!(f.cache.pending(), None);
+        assert!(f.assert_matches_oracle() >= 1_000);
+    }
+
+    #[test]
+    fn rows_show_no_spans_until_the_first_parse_finishes() {
+        let mut f = Fixture::new(&sample(1_500));
+        f.cache.set_parse_budget(5);
+        f.cache.tokenize(&f.buffer, HIGHLIGHT_MAX_LINES_PER_CALL);
+        assert!(f.cache.parse_in_progress());
+        assert!((0..1_500).all(|row| f.cache.line_spans(row).is_none()));
+        assert!(finish_parse(&mut f) > 1);
+        f.drive();
+        f.assert_matches_oracle();
+    }
+
+    #[test]
+    fn a_commit_during_the_first_parse_converges() {
+        let mut f = Fixture::new(&sample(1_500));
+        f.cache.set_parse_budget(5);
+        f.cache.tokenize(&f.buffer, HIGHLIGHT_MAX_LINES_PER_CALL);
+        f.cache.tokenize(&f.buffer, HIGHLIGHT_MAX_LINES_PER_CALL);
+        assert!(f.cache.parse_in_progress());
+        let at = f.offset(3, 0);
+        f.edit(vec![EditOp::insert(at, "/* opened\n")]);
+        assert!(f.cache.parse_in_progress(), "the commit queued behind the parse");
+        f.drive();
+        assert_eq!(f.cache.parse_count(), 2, "the first parse finished, then caught up");
+        f.assert_matches_oracle();
+        assert!(f.cache.line_spans(10).unwrap().iter().all(|s| s.style.fg == COMMENT));
+    }
+
+    #[test]
+    fn a_commit_during_a_reparse_queues_and_converges() {
+        let mut f = Fixture::new(&sample(1_500));
+        f.drive();
+        f.cache.set_parse_budget(3);
+        let row = f.cache.line_spans(600).unwrap().to_vec();
+        // The reparse that starts here is what comments out rows 21..40; the
+        // commit queued behind it changes nothing there.
+        f.edit(vec![EditOp::insert(f.offset(20, 0), "/*"), EditOp::insert(f.offset(40, 0), "*/")]);
+        f.cache.tokenize(&f.buffer, HIGHLIGHT_MAX_LINES_PER_CALL);
+        assert!(f.cache.parse_in_progress());
+        f.edit(vec![EditOp::insert(f.offset(500, 0), "struct A;\n")]);
+        assert!(f.cache.parse_in_progress(), "the commit queued behind the reparse");
+        assert_eq!(f.cache.line_spans(601), Some(row.as_slice()), "unedited rows keep their shifted spans");
+        f.cache.set_parse_budget(HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL);
+        f.drive();
+        assert_eq!(f.cache.parse_count(), 3, "the reparse finished, then caught up");
+        f.assert_matches_oracle();
+        assert!(f.cache.line_spans(30).unwrap().iter().all(|s| s.style.fg == COMMENT));
+    }
+
+    #[test]
+    fn several_queued_commits_converge() {
+        let mut rand = rng(0xFEED);
+        for first_parse in [true, false] {
+            let mut f = Fixture::new(&sample(1_500));
+            if !first_parse {
+                f.drive();
+            }
+            f.cache.set_parse_budget(4);
+            f.edit(vec![EditOp::insert(f.offset(700, 0), "struct A;\n")]);
+            f.cache.tokenize(&f.buffer, HIGHLIGHT_MAX_LINES_PER_CALL);
+            assert!(f.cache.parse_in_progress());
+            for _ in 0..8 {
+                let len = f.buffer.len();
+                let mut ops = Vec::new();
+                let mut from = rand(300) as u32;
+                for _ in 0..1 + rand(4) {
+                    if from >= len {
+                        break;
+                    }
+                    let op = random_op(&f, &mut rand, from, (from + 300).min(len));
+                    from = op.range.end + 1 + rand(3_000) as u32;
+                    ops.push(op);
+                }
+                f.edit(ops);
+            }
+            assert!(f.cache.parse_in_progress(), "every commit queued");
+            f.drive();
+            f.assert_matches_oracle();
+        }
+    }
+
+    /// A commit before every call: each parse still finishes, because it
+    /// reads its start text, and the highlight catches up once typing stops.
+    #[test]
+    fn typing_on_every_call_still_finishes_parses() {
+        let mut f = Fixture::new(&sample(3_000));
+        f.cache.set_parse_budget(10);
+        let mut rand = rng(0x7E57);
+        for _ in 0..300 {
+            let row = rand(f.buffer.line_count() as usize) as u32;
+            let at = f.offset(row, 0);
+            f.edit(vec![EditOp::insert(at, ["x", "\n", "fn ", "/*", "*/", "\""][rand(6)])]);
+            f.cache.tokenize(&f.buffer, HIGHLIGHT_MAX_LINES_PER_CALL);
+        }
+        // The first parse spans tens of calls; each incremental catch-up
+        // after it fits in one or two (119 parses finish here).
+        assert!(f.cache.parse_count() >= 50, "{} parses finished while typing", f.cache.parse_count());
+        f.drive();
+        f.assert_matches_oracle();
+    }
+
+    #[test]
+    fn a_resumed_reparse_invalidates_its_changed_rows() {
+        let mut f = Fixture::new(&sample(1_500));
+        f.drive();
+        f.cache.set_parse_budget(3);
+        f.edit(vec![EditOp::insert(f.offset(20, 0), "/*"), EditOp::insert(f.offset(40, 0), "*/")]);
+        assert!(finish_parse(&mut f) > 1, "the reparse spanned several calls");
+        f.drive();
+        f.assert_matches_oracle();
+        assert!(f.cache.line_spans(30).unwrap().iter().all(|s| s.style.fg == COMMENT));
+    }
+
+    #[test]
+    fn a_keystroke_in_a_nested_multi_megabyte_document_reparses_in_one_call() {
+        let mut f = Fixture::new(&nested_sample(2_000_000));
+        f.check_edits = false;
+        f.cache.set_parse_budget(u32::MAX);
+        let row = f.buffer.line_count() / 2;
+        f.cache.set_window(row - 20..row + 20);
+        f.drive();
+        f.cache.set_parse_budget(HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL);
+        // Type into an identifier mid-document.
+        let line = f.buffer.line(row).into_owned();
+        let col = line.find(|c: char| c.is_ascii_digit()).expect("the row has a numbered identifier") as u32;
+        let at = f.offset(row, col);
+        f.edit(vec![EditOp::insert(at, "7")]);
+        f.cache.tokenize(&f.buffer, HIGHLIGHT_MAX_LINES_PER_CALL);
+        assert_eq!(f.cache.parse_count(), 2, "the reparse finished within one call");
+        assert_eq!(f.cache.pending(), None);
+    }
+
     #[test]
     fn advance_counts_rows_and_the_last_rows_bytes() {
         assert_eq!(advance(Point::new(3, 4), ""), Point::new(3, 4));
@@ -771,4 +1023,5 @@ mod tests {
         assert_eq!(advance(Point::new(3, 4), "a\n"), Point::new(4, 0));
     }
 }
+
 

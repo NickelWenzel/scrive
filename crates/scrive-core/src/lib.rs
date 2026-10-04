@@ -81,7 +81,7 @@ pub use highlight::{
     Rgba, SegmentBoundary, SegmentStart, SegmentTokens, SpanStyle, SyntaxDef, TokenTheme,
 };
 #[cfg(feature = "tree-sitter")]
-pub use highlight::TreeSitterDef;
+pub use highlight::{TreeSitterDef, HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL};
 pub use history::{GroupingHint, OpClass};
 pub use intel::completion::{CompletionController, CompletionRequest, CompletionState, PopupList};
 pub use intel::definition::DefinitionRequest;

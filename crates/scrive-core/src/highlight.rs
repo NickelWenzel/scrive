@@ -191,6 +191,16 @@ impl Highlighter {
 /// the budget stopped.
 pub const HIGHLIGHT_MAX_LINES_PER_CALL: u32 = 256;
 
+/// Per-call tree-sitter parse budget, in progress-callback checks. The parser
+/// checks in about every 100 parse operations, so this is an op count too:
+/// deterministic, and free of the wall clock, which wasm32-unknown-unknown
+/// lacks. Bytes parsed would mismeasure the work, since a reparse skips over
+/// reused subtrees. With tree-sitter-rust, 100 checks took about 2 ms in a
+/// release build. A parse past the budget resumes on the next
+/// [`Document::tokenize_highlight`](crate::Document::tokenize_highlight).
+#[cfg(feature = "tree-sitter")]
+pub const HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL: u32 = 100;
+
 /// Sparse-checkpoint stride, in rows: outside the retention window the cache
 /// keeps one end state per this many tokenized rows (plus each budget-stop
 /// resume point), so any row's start state is re-derivable by tokenizing at

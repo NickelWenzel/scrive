@@ -1891,7 +1891,8 @@ impl Document {
 
     /// The next row highlight work would touch — a dirty row, or a window
     /// row awaiting a refill after [`Document::set_highlight_window`] moved
-    /// the retention window (highlight virtualization). `None` when there is
+    /// the retention window (highlight virtualization), or the window top
+    /// while a tree-sitter parse is still due. `None` when there is
     /// nothing to do — or when no grammar is injected. The app's idle sweep
     /// polls this to drive budgeted [`Document::tokenize_highlight`] calls
     /// and to stop when idle (an idle document does zero highlight work).
