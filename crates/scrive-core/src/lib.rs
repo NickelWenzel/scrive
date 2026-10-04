@@ -77,9 +77,8 @@ pub use highlight::{
     HIGHLIGHT_WINDOW_SLACK,
 };
 pub use highlight::{
-    padded_highlight_window, tokenize_segment, HighlightCache, HighlightEngine, HighlightSpan,
-    Highlighter, Rgba, SegmentBoundary, SegmentStart, SegmentTokens, SpanStyle, SyntaxDef,
-    TokenTheme,
+    padded_highlight_window, tokenize_segment, Grammar, HighlightEngine, HighlightSpan, Highlighter,
+    Rgba, SegmentBoundary, SegmentStart, SegmentTokens, SpanStyle, SyntaxDef, TokenTheme,
 };
 pub use history::{GroupingHint, OpClass};
 pub use intel::completion::{CompletionController, CompletionRequest, CompletionState, PopupList};

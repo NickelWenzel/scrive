@@ -25,7 +25,7 @@ use crate::find::{FindQuery, FindState};
 use std::cell::{Ref, RefCell};
 
 use crate::fold_map::{FoldMap, FoldSet};
-use crate::highlight::{HighlightCache, HighlightEngine, HighlightSpan, SyntaxDef, TokenTheme};
+use crate::highlight::{Grammar, HighlightCache, HighlightEngine, HighlightSpan, TokenTheme};
 use crate::history::{GroupingHint, History};
 use crate::intel::inlay;
 use crate::movement::{self, ColumnDir, Granularity, Motion};
@@ -1400,9 +1400,9 @@ impl Document {
     /// swap carries the previous retention-window aim forward, so the currently
     /// visible rows are re-highlighted immediately even though nothing visible
     /// moved to re-trigger the widget's viewport report.
-    pub fn set_syntax(&mut self, syntax: SyntaxDef, theme: TokenTheme) {
+    pub fn set_syntax(&mut self, grammar: impl Into<Grammar>, theme: TokenTheme) {
         let aim = self.highlight.as_ref().map(HighlightCache::window_aim);
-        let mut cache = HighlightCache::new(syntax, theme, self.buffer.line_count());
+        let mut cache = HighlightCache::new(grammar.into(), theme, &self.buffer);
         if let Some(aim) = aim {
             cache.set_window(aim);
         }
@@ -1411,7 +1411,7 @@ impl Document {
 
     /// Swap the highlight theme, keeping the grammar and cache sizing. The
     /// whole cache invalidates; colors repaint on the next `tokenize_highlight`
-    /// (old colors show meanwhile — see [`HighlightCache::set_theme`]). No-op
+    /// (the outgoing colors show meanwhile, not a flash to default). No-op
     /// without a highlighter.
     pub fn set_theme(&mut self, theme: TokenTheme) {
         if let Some(cache) = self.highlight.as_mut() {
@@ -1886,9 +1886,7 @@ impl Document {
         // resumes at [`Document::highlight_frontier`] until convergence.
         let buffer = &self.buffer;
         let Some(cache) = self.highlight.as_mut() else { return };
-        cache.tokenize_until(target, crate::highlight::HIGHLIGHT_MAX_LINES_PER_CALL, |r| {
-            buffer.line(r)
-        });
+        cache.tokenize(buffer, target, crate::highlight::HIGHLIGHT_MAX_LINES_PER_CALL);
     }
 
     /// The next row highlight work would touch — a dirty row, or a window
@@ -1929,14 +1927,14 @@ impl Document {
     /// [`Document::absorb_highlight`].
     #[must_use]
     pub fn highlight_engine(&self) -> Option<HighlightEngine> {
-        self.highlight.as_ref().map(HighlightCache::engine)
+        self.highlight.as_ref().and_then(HighlightCache::engine)
     }
 
     /// Ingest a segment tokenized off-thread (the parallel/speculative sweep).
     /// Returns `false` — absorbing **nothing** — if `revision` no longer
     /// matches the document (an edit landed since the snapshot the segment was
     /// computed from; the app drops the stale result and re-dispatches). On a
-    /// match, forwards to `HighlightCache::absorb`:
+    /// match, the highlight cache absorbs it:
     ///
     /// - `verified` — the coordinator chained this segment from row 0, so its
     ///   start state is TRUE: its checkpoints merge, its window spans/states are
@@ -1961,8 +1959,7 @@ impl Document {
             return false;
         }
         let Some(cache) = self.highlight.as_mut() else { return false };
-        cache.absorb(seg, verified);
-        true
+        cache.absorb(seg, verified)
     }
 
     /// The matched brackets — kept current on every edit. Drives
@@ -2617,25 +2614,8 @@ fn rebase_views(
     committed: &Committed,
     bracket_cfg: &crate::bracket::BracketConfig,
 ) -> core::ops::Range<u32> {
-    // Highlight cache: splice the transaction's per-edit line spans (built by
-    // `line_splices`). The size invariant (new_size = old_size − old_count + new_count)
-    // keeps each edit's `old_lines` provably in-bounds. Only the actually-edited
-    // lines are invalidated — NOT the first-to-last covering range — so a
-    // scattered multi-caret edit doesn't over-invalidate the lines between.
     if let Some(cache) = views.highlight.as_mut() {
-        if !committed.patch().edits().is_empty() {
-            let spans = crate::highlight::splice::line_splices(buffer, committed);
-            // Checkpoints, dense window, and dirty runs all ride the per-edit
-            // spans — the window stays aimed at the viewport (only edited rows
-            // invalidated), so a scattered multi-caret edit's wide covering range
-            // never drains or repositions it.
-            debug_assert_eq!(
-                spans.iter().map(|&(_, o, n)| i64::from(n) - i64::from(o)).sum::<i64>(),
-                i64::from(buffer.line_count()) - i64::from(cache.line_count()),
-                "per-edit line deltas must sum to the buffer's line-count change",
-            );
-            cache.on_commit_patch(&spans);
-        }
+        cache.on_commit(buffer, committed);
     }
     // Brackets: splice through the patch (the incremental engine; `match_text`
     // remains the load-time constructor and the tests' oracle). It returns the

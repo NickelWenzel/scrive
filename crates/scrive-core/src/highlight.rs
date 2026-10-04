@@ -12,36 +12,42 @@
 //!
 //! [`Highlighter::highlight`] tokenizes the whole document top-to-bottom on each
 //! call (state carried line to line) — correct but O(lines), used as the
-//! convergence oracle in tests. Production reads go through [`HighlightCache`],
-//! the incremental engine: geometric shift on edit ([`HighlightCache::on_commit`]),
-//! lazy end-state convergence ([`HighlightCache::tokenize_until`]), and full
-//! invalidation on theme change ([`HighlightCache::set_theme`]). Untokenized
-//! lines return `None` and render in the default style — never an error or a
-//! stall. Each drive tokenizes at most [`HIGHLIGHT_MAX_LINES_PER_CALL`] lines,
-//! so no single call can stall a frame however far a cascade wants to run.
+//! convergence oracle in tests. Production reads go through the incremental
+//! engine a [`Document`](crate::Document) owns once
+//! [`set_syntax`](crate::Document::set_syntax) attaches a [`Grammar`]: geometric
+//! shift on every edit, lazy end-state convergence
+//! ([`tokenize_highlight`](crate::Document::tokenize_highlight)), and full
+//! invalidation on theme change ([`set_theme`](crate::Document::set_theme)).
+//! Untokenized lines return `None` and render in the default style — never an
+//! error or a stall. Each drive tokenizes at most
+//! [`HIGHLIGHT_MAX_LINES_PER_CALL`] lines, so no single call can stall a frame
+//! however far a cascade wants to run.
 //!
 //! Retention is **virtualized** so RAM does not grow with the idle sweep:
 //! spans + per-line states live only in a window around the viewport
-//! ([`HighlightCache::set_window`]); everywhere else, sparse checkpoints
-//! ([`HIGHLIGHT_CHECKPOINT_STRIDE`]) keep every row re-derivable. A fully swept
-//! document holds `O(window + lines/stride)`, not `O(lines)` — see
-//! [`HighlightCache`] for the mechanics.
+//! ([`set_highlight_window`](crate::Document::set_highlight_window)); everywhere
+//! else, sparse checkpoints ([`HIGHLIGHT_CHECKPOINT_STRIDE`]) keep every row
+//! re-derivable. A fully swept document holds `O(window + lines/stride)`, not
+//! `O(lines)`.
 
 use core::ops::Range;
+
+use crate::buffer::Buffer;
+use crate::transaction::Committed;
 
 use syntect::highlighting::{FontStyle, HighlightState, Highlighter as SyntectHighlighter, Style};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet, SyntaxSetBuilder};
 
 mod dirty_ranges;
+mod grammar;
 mod line_state;
 pub(crate) mod splice;
 pub mod token_theme;
 mod vocabulary;
 
 use line_state::{tokenize_line, LineState};
-pub use line_state::{
-    tokenize_segment, HighlightCache, HighlightEngine, SegmentBoundary, SegmentStart, SegmentTokens,
-};
+pub use grammar::Grammar;
+pub use line_state::{tokenize_segment, HighlightEngine, SegmentBoundary, SegmentStart, SegmentTokens};
 pub use token_theme::{ThemeError, TokenTheme};
 
 /// A GUI-free color; scrive-iced maps it to `iced::Color` at render time.
@@ -183,8 +189,9 @@ pub const HIGHLIGHT_MAX_LINES_PER_CALL: u32 = 256;
 pub const HIGHLIGHT_CHECKPOINT_STRIDE: u32 = 256;
 
 /// Retention slack, in rows, kept on EACH side of the window handed to
-/// [`HighlightCache::set_window`] — scrolling within the slack costs nothing;
-/// beyond it, evicted rows refill from the nearest checkpoint (budgeted).
+/// [`Document::set_highlight_window`](crate::Document::set_highlight_window) —
+/// scrolling within the slack costs nothing; beyond it, evicted rows refill
+/// from the nearest checkpoint (budgeted).
 pub const HIGHLIGHT_WINDOW_SLACK: u32 = 512;
 
 /// Hard cap on the retention window's total length, in rows. A collapsed
@@ -198,8 +205,9 @@ pub const HIGHLIGHT_MAX_WINDOW_ROWS: u32 = 4096;
 /// The retention/paint window for a viewport: `viewport` padded by
 /// [`HIGHLIGHT_WINDOW_SLACK`] on each side, its length capped at
 /// [`HIGHLIGHT_MAX_WINDOW_ROWS`], and clamped to `[0, n_lines]`. The **one**
-/// owner of this formula: [`HighlightCache::set_window`] (what the cache
-/// *retains*) and any parallel-highlight worker pool (what it speculatively
+/// owner of this formula:
+/// [`Document::set_highlight_window`](crate::Document::set_highlight_window)
+/// (what the cache *retains*) and any parallel-highlight worker pool (what it speculatively
 /// *paints* and *tokenizes*) must aim at the SAME rows, so both call this
 /// instead of re-deriving it — an integrator running the core's speculative
 /// tokenizer on worker threads cannot drift from the core's retention rule. The
@@ -216,6 +224,120 @@ pub fn padded_highlight_window(viewport: Range<u32>, n_lines: u32) -> Range<u32>
         .min(n_lines)
         .max(start);
     start..end
+}
+
+/// The document-owned incremental highlight cache: one facade over the
+/// backend its [`Grammar`] selects, so `Document` drives every backend the same
+/// way. Each method keeps the contract of the backend's own (see
+/// [`line_state::Cache`]).
+#[derive(Debug)]
+pub(crate) struct HighlightCache {
+    backend: Backend,
+}
+
+#[derive(Debug)]
+enum Backend {
+    Lines(line_state::Cache),
+}
+
+impl HighlightCache {
+    /// A cache sized to `buffer`, every line dirty, its window at the
+    /// document top.
+    pub(crate) fn new(grammar: Grammar, theme: TokenTheme, buffer: &Buffer) -> Self {
+        let backend = match grammar.0 {
+            grammar::Inner::Syntect(def) => {
+                Backend::Lines(line_state::Cache::new(def, theme, buffer.line_count()))
+            }
+        };
+        Self { backend }
+    }
+
+    /// Shift the cache through `committed`, whose edits `buffer` already holds.
+    /// Only each edit's own lines are invalidated, not the first-to-last
+    /// covering range, so a scattered multi-caret edit neither over-invalidates
+    /// the lines between nor drags the window off the viewport.
+    pub(crate) fn on_commit(&mut self, buffer: &Buffer, committed: &Committed) {
+        if committed.patch().edits().is_empty() {
+            return;
+        }
+        let spans = splice::line_splices(buffer, committed);
+        debug_assert_eq!(
+            spans.iter().map(|&(_, o, n)| i64::from(n) - i64::from(o)).sum::<i64>(),
+            i64::from(buffer.line_count()) - i64::from(self.line_count()),
+            "per-edit line deltas must sum to the buffer's line-count change",
+        );
+        match &mut self.backend {
+            Backend::Lines(c) => c.on_commit_patch(&spans),
+        }
+    }
+
+    /// Tokenize toward row `target` (inclusive), at most `max_lines` lines;
+    /// returns how many were tokenized.
+    pub(crate) fn tokenize(&mut self, buffer: &Buffer, target: u32, max_lines: u32) -> u32 {
+        match &mut self.backend {
+            Backend::Lines(c) => c.tokenize_until(target, max_lines, |r| buffer.line(r)),
+        }
+    }
+
+    /// The next row [`HighlightCache::tokenize`] would work on; `None` when idle.
+    pub(crate) fn pending(&self) -> Option<u32> {
+        match &self.backend {
+            Backend::Lines(c) => c.pending(),
+        }
+    }
+
+    /// The spans of `row`, or `None` if it isn't tokenized or retained.
+    pub(crate) fn line_spans(&self, row: u32) -> Option<&[HighlightSpan]> {
+        match &self.backend {
+            Backend::Lines(c) => c.line_spans(row),
+        }
+    }
+
+    /// Aim the retention window at the viewport `rows`.
+    pub(crate) fn set_window(&mut self, rows: Range<u32>) {
+        match &mut self.backend {
+            Backend::Lines(c) => c.set_window(rows),
+        }
+    }
+
+    /// The rows last handed to [`HighlightCache::set_window`].
+    pub(crate) fn window_aim(&self) -> Range<u32> {
+        match &self.backend {
+            Backend::Lines(c) => c.window_aim(),
+        }
+    }
+
+    /// Swap the theme; every line repaints on the following tokenizes.
+    pub(crate) fn set_theme(&mut self, theme: TokenTheme) {
+        match &mut self.backend {
+            Backend::Lines(c) => c.set_theme(theme),
+        }
+    }
+
+    /// The line count the cache is sized for.
+    pub(crate) fn line_count(&self) -> u32 {
+        match &self.backend {
+            Backend::Lines(c) => c.line_count(),
+        }
+    }
+
+    /// A handle for off-thread segment tokenization, if the backend has one.
+    pub(crate) fn engine(&self) -> Option<HighlightEngine> {
+        match &self.backend {
+            Backend::Lines(c) => Some(c.engine()),
+        }
+    }
+
+    /// Ingest an off-thread segment computed at the current revision; `false`
+    /// if the backend takes none.
+    pub(crate) fn absorb(&mut self, seg: SegmentTokens, verified: bool) -> bool {
+        match &mut self.backend {
+            Backend::Lines(c) => {
+                c.absorb(seg, verified);
+                true
+            }
+        }
+    }
 }
 
 #[cfg(test)]

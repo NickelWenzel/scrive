@@ -1,4 +1,4 @@
-//! The syntect line-state cache: [`HighlightCache`], which converges per-line
+//! The syntect line-state cache: [`Cache`], which converges per-line
 //! end states over a virtualized window, and the off-thread segment tokenizer
 //! ([`HighlightEngine`], [`tokenize_segment`]) that feeds it.
 
@@ -19,8 +19,8 @@ use super::{
 
 /// The per-line carry state — syntect's `(ParseState, HighlightState)`. Its `==`
 /// is the convergence probe: equal end states mean identical tokens downstream
-/// (both halves are `Clone + PartialEq`). Private: no syntect type crosses the
-/// module boundary.
+/// (both halves are `Clone + PartialEq`). `pub(super)` for the whole-document
+/// oracle; no syntect type leaves `highlight`.
 #[derive(Clone, PartialEq)]
 pub(super) struct LineState {
     pub(super) parse: ParseState,
@@ -50,12 +50,12 @@ pub(super) fn tokenize_line(
 /// a line is re-tokenized only while its computed end state differs from the
 /// stored one, so an edit repaints just the lines whose state actually
 /// changed. It is driven lazily and budgeted by
-/// [`HighlightCache::tokenize_until`]. **Retention** is what keeps memory
+/// [`Cache::tokenize_until`]. **Retention** is what keeps memory
 /// bounded — two facts make it work:
 ///
 /// - **Spans are draw output** — nothing but visible rows reads them, so they
 ///   are retained only inside a *dense window* (the viewport ±
-///   [`HIGHLIGHT_WINDOW_SLACK`], set via [`HighlightCache::set_window`]),
+///   [`HIGHLIGHT_WINDOW_SLACK`], set via [`Cache::set_window`]),
 ///   together with per-line end states there (so a keystroke at the caret
 ///   still converges per-line).
 /// - **States exist to be resumed from** — and any row's state is
@@ -70,8 +70,8 @@ pub(super) fn tokenize_line(
 /// stride past where a fully-dense cache would have stopped — bounded, and
 /// such edits are rare: you edit what you see). Memory for a fully swept
 /// document: `O(window + lines / stride)` instead of `O(lines)`.
-pub struct HighlightCache {
-    /// `Arc`-shared so [`HighlightCache::engine`] hands an off-thread worker
+pub(super) struct Cache {
+    /// `Arc`-shared so [`Cache::engine`] hands an off-thread worker
     /// the SAME immutable grammar/theme without a deep `SyntaxSet` clone.
     syntax: Arc<SyntaxDef>,
     theme: Arc<TokenTheme>,
@@ -81,7 +81,7 @@ pub struct HighlightCache {
     ret: Retention,
 }
 
-/// The virtualized retention state (see [`HighlightCache`]).
+/// The virtualized retention state (see [`Cache`]).
 struct Retention {
     /// Buffer line count (the commit path keeps it in step).
     n_lines: u32,
@@ -107,9 +107,9 @@ struct Retention {
 
 // Manual (syntect's `Theme`/state aren't all `Debug`, and they'd be noise
 // anyway); lets `Document` keep its `#[derive(Debug)]`.
-impl core::fmt::Debug for HighlightCache {
+impl core::fmt::Debug for Cache {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("HighlightCache")
+        f.debug_struct("Cache")
             .field("lines", &self.ret.n_lines)
             .field("window", &self.ret.win)
             .field("checkpoints", &self.ret.checkpoints.len())
@@ -146,7 +146,7 @@ impl Clone for CkptItem {
 }
 
 // `LineState` is deliberately not `Debug` (syntect's parse/highlight state is
-// noise) — the same reason `HighlightCache`'s `Debug` is manual. `Item` demands
+// noise) — the same reason `Cache`'s `Debug` is manual. `Item` demands
 // `Debug`, so show the shape without the state.
 impl core::fmt::Debug for CkptItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -459,12 +459,12 @@ enum StartState {
     WarmupFresh,
 }
 
-impl HighlightCache {
+impl Cache {
     /// A cache for an `n_lines` document over an injected grammar + theme:
     /// every line invalid, nothing retained. The retention window defaults to
     /// the document top (2 × [`HIGHLIGHT_WINDOW_SLACK`] rows) — right for a
     /// freshly opened view; the app re-aims it per viewport report via
-    /// [`HighlightCache::set_window`].
+    /// [`Cache::set_window`].
     #[must_use]
     pub fn new(syntax: SyntaxDef, theme: TokenTheme, n_lines: u32) -> Self {
         let win = 0..(2 * HIGHLIGHT_WINDOW_SLACK).min(n_lines);
@@ -486,13 +486,14 @@ impl HighlightCache {
 
     /// The first dirty row, if any — `None` means every line's state has
     /// converged (spans may still be evicted outside the window; see
-    /// [`HighlightCache::pending`], which the sweep polls instead).
+    /// [`Cache::pending`], which the sweep polls instead).
+    #[cfg(test)]
     #[must_use]
     pub fn first_dirty(&self) -> Option<u32> {
         self.ret.invalid.first()
     }
 
-    /// The next row a budgeted [`HighlightCache::tokenize_until`] call would
+    /// The next row a budgeted [`Cache::tokenize_until`] call would
     /// work on: the first dirty row, or — once states have converged — the
     /// first window row whose spans await a refill (a window move over
     /// already-swept rows). `None` = nothing to do (the idle-zero-work probe;
@@ -522,7 +523,7 @@ impl HighlightCache {
         self.ret.n_lines
     }
 
-    /// The last rows handed to [`HighlightCache::set_window`] (pre-padding) —
+    /// The last rows handed to [`Cache::set_window`] (pre-padding) —
     /// `Document::set_syntax` re-aims a replacement cache with this so a
     /// grammar swap keeps retention at the viewport instead of silently
     /// resetting to the document top.
@@ -534,8 +535,8 @@ impl HighlightCache {
     /// Aim the retention window at `rows` (the viewport, in buffer rows) —
     /// the cache retains `rows` ± [`HIGHLIGHT_WINDOW_SLACK`] and evicts
     /// outside. Repositioning is O(window); rows entering the window refill
-    /// on the next [`HighlightCache::tokenize_until`] (see
-    /// [`HighlightCache::pending`]).
+    /// on the next [`Cache::tokenize_until`] (see
+    /// [`Cache::pending`]).
     pub fn set_window(&mut self, rows: Range<u32>) {
         let r = &mut self.ret;
         r.aim = rows.clone();
@@ -566,6 +567,7 @@ impl HighlightCache {
     /// line** as the convergence probe in the new last slot), drops replaced
     /// checkpoints and shifts the rest, and marks `[start, start+new)` dirty.
     /// O(edit + window + #checkpoints); the cascade waits for `tokenize_until`.
+    #[cfg(test)]
     pub fn on_commit(&mut self, start: u32, old: u32, new: u32) {
         // A single edit as one line splice. Multi-edit commits use the per-edit
         // spans directly (see `on_commit_patch`).
@@ -831,9 +833,10 @@ impl HighlightCache {
 
 /// A cheap-to-clone, `Send + Sync` handle to a grammar + theme for off-thread
 /// bulk tokenization. Nothing syntect crosses its surface; [`SegmentBoundary`]
-/// and [`SegmentTokens`] are opaque. Obtain via [`HighlightCache::engine`] (to
-/// share the cache's exact grammar/theme) or [`HighlightEngine::new`], and move
-/// clones to worker threads.
+/// and [`SegmentTokens`] are opaque. Obtain via
+/// [`crate::Document::highlight_engine`] (to share the document's exact
+/// grammar/theme) or [`HighlightEngine::new`], and move clones to worker
+/// threads.
 #[derive(Clone)]
 pub struct HighlightEngine {
     syntax: Arc<SyntaxDef>,
@@ -888,7 +891,7 @@ pub struct SegmentTokens {
     started_fresh: bool,
     /// Stride-aligned end-state checkpoints within `rows` (rows where
     /// `(row + 1) % HIGHLIGHT_CHECKPOINT_STRIDE == 0`) - the SAME rows the
-    /// sync walk would pick, so [`HighlightCache::absorb`] merges them cleanly.
+    /// sync walk would pick, so [`Cache::absorb`] merges them cleanly.
     checkpoints: Vec<(u32, Box<LineState>)>,
     /// End state after `rows.end - 1` (equals the start state if `rows` empty).
     end: SegmentBoundary,
@@ -1273,8 +1276,8 @@ mod tests {
     use crate::highlight::tests::{highlighter, GRAMMAR, THEME};
     use crate::highlight::{Highlighter, Rgba, HIGHLIGHT_MAX_LINES_PER_CALL};
 
-    fn cache(n: u32) -> HighlightCache {
-        HighlightCache::new(
+    fn cache(n: u32) -> Cache {
+        Cache::new(
             SyntaxDef::from_sublime_syntax(GRAMMAR).unwrap(),
             TokenTheme::from_tm_theme(THEME).unwrap(),
             n,
@@ -1288,7 +1291,7 @@ mod tests {
     /// After tokenizing, every cached line must equal a fresh whole-document
     /// highlight of the same text — the convergence invariant, whatever the
     /// edit path.
-    fn assert_matches_full(cache: &HighlightCache, text: &str) {
+    fn assert_matches_full(cache: &Cache, text: &str) {
         let full = highlighter().highlight(text);
         for (row, expected) in full.iter().enumerate() {
             assert_eq!(cache.line_spans(row as u32), Some(expected.as_slice()), "line {row}");
@@ -1345,7 +1348,7 @@ mod tests {
 </array></dict></plist>"#;
         let red = Rgba { r: 0xff, g: 0, b: 0, a: 0xff };
         let blue = Rgba { r: 0, g: 0, b: 0xff, a: 0xff };
-        let has = |c: &HighlightCache, row: u32, col: Rgba| {
+        let has = |c: &Cache, row: u32, col: Rgba| {
             c.line_spans(row).unwrap().iter().any(|s| s.style.fg == col)
         };
         // Two keyword lines, both tokenized (red).
@@ -1520,8 +1523,8 @@ mod tests {
         )
     }
 
-    fn cache_cmt(n: u32) -> HighlightCache {
-        HighlightCache::new(
+    fn cache_cmt(n: u32) -> Cache {
+        Cache::new(
             SyntaxDef::from_sublime_syntax(GRAMMAR_CMT).unwrap(),
             TokenTheme::from_tm_theme(THEME).unwrap(),
             n,
@@ -1535,8 +1538,8 @@ mod tests {
         )
     }
 
-    fn cache_str(n: u32) -> HighlightCache {
-        HighlightCache::new(
+    fn cache_str(n: u32) -> Cache {
+        Cache::new(
             SyntaxDef::from_sublime_syntax(GRAMMAR_STR).unwrap(),
             TokenTheme::from_tm_theme(THEME).unwrap(),
             n,
@@ -1552,7 +1555,7 @@ mod tests {
 
     /// Drive to full convergence (dirty walk + window refill), budgeted like
     /// the real sweep.
-    fn drive_all(c: &mut HighlightCache, lines: &[String]) -> u32 {
+    fn drive_all(c: &mut Cache, lines: &[String]) -> u32 {
         let mut work = 0;
         while c.pending().is_some() {
             work += c
@@ -2131,7 +2134,7 @@ mod tests {
         crate::buffer::Buffer::new(&lines.join("\n")).unwrap().snapshot()
     }
 
-    fn drive_all_snap(c: &mut HighlightCache, s: &Snapshot) {
+    fn drive_all_snap(c: &mut Cache, s: &Snapshot) {
         while c.pending().is_some() {
             c.tokenize_until(u32::MAX, HIGHLIGHT_MAX_LINES_PER_CALL, |r| s.line(r));
         }
