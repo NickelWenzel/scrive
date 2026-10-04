@@ -33,9 +33,10 @@ Two crates, with the dependency pointing one way:
   mechanically-derived inverse, and undo/redo flow through the same
   view-rebase path as forward edits.
 - **Multi-cursor** editing, column (box) selection, and word-wise motion.
-- **Syntax highlighting** via an incremental, viewport-windowed
-  [syntect](https://github.com/trishume/syntect) cache; the app supplies the
-  grammar and theme (the core ships neither).
+- **Syntax highlighting** from [syntect](https://github.com/trishume/syntect)
+  `.sublime-syntax` grammars or [tree-sitter](https://tree-sitter.github.io)
+  grammars, picked per editor. It is incremental and windowed to the viewport,
+  and the app supplies the grammar and theme (the core ships neither).
 - **Bracket-pair colorization, matching, and indent guides** — optionally
   comment/string-aware, so brackets inside line comments, strings, and char
   literals are skipped (opt-in per language; line-local).
@@ -102,11 +103,87 @@ the low-level `Editor` widget. The host **must** register the bundled font —
 `iced::application(..).fonts([scrive_iced::CODICON_FONT])` — so the fold chevrons
 and find-bar icons render.
 
+## Syntax highlighting
+
+Highlighting has two backends, each behind a cargo feature of the same name.
+You pick one per editor, both produce the same spans, and one `TokenTheme`
+colors both.
+
+| feature       | default | grammar                      | the app supplies                                    |
+|---------------|---------|------------------------------|-----------------------------------------------------|
+| `syntect`     | on      | `scrive_core::SyntaxDef`     | a `.sublime-syntax` file                            |
+| `tree-sitter` | off     | `scrive_core::TreeSitterDef` | a grammar crate's `LANGUAGE` and a highlights query |
+
+Both features can be on at once. `scrive-iced` forwards them to `scrive-core`.
+With `syntect`, a document of 2 MiB or more tokenizes on worker threads
+(natively). A tree-sitter parse runs on the UI thread, a budgeted slice per
+frame, and the parse tree stays in memory while the document is open. With
+tree-sitter-rust it measured 28 times the text's size on scrive's own sources
+and 36 times on a denser generated corpus.
+
+```rust
+use scrive_core::{SyntaxDef, TreeSitterDef};
+use scrive_iced::CodeEditor;
+
+// syntect
+let grammar = SyntaxDef::from_sublime_syntax(include_str!("rust.sublime-syntax"))?;
+let editor = CodeEditor::new(source).language(grammar);
+
+// tree-sitter
+let grammar = TreeSitterDef::new(tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY)?;
+let editor = CodeEditor::new(source).language(grammar);
+```
+
+`tree_sitter_rust::LANGUAGE` goes in as it is, with no `.into()`. `.language`
+takes anything that converts into a `scrive_core::Grammar`, and so does
+`Document::set_syntax` when you drive the core without the widget. For a
+tree-sitter-only build with no syntect in the dependency tree:
+
+```bash
+cargo add scrive-iced --no-default-features --features tree-sitter
+cargo add scrive-core --no-default-features
+cargo add tree-sitter-rust
+```
+
+The default theme is the bundled Scrive Dark. `.theme(..)` takes your own
+`TokenTheme`, parsed from a `.tmTheme` (`TokenTheme::from_tm_theme`, which
+needs `syntect`) or built in code:
+
+```rust
+use scrive_core::{Rgba, SpanStyle, TokenTheme};
+
+let rgb = |r, g, b| Rgba { r, g, b, a: 0xff };
+let plain = |fg| SpanStyle { fg, bold: false, italic: false };
+let theme = TokenTheme::builder()
+    .foreground(rgb(0xdf, 0xe1, 0xe6))
+    .capture("keyword", plain(rgb(0xec, 0x6a, 0x88)))
+    .capture("function", plain(rgb(0xe0, 0xb6, 0x58)))
+    .build();
+```
+
+Capture names are tree-sitter's, and a dotted name falls back to its prefix:
+`function.method` takes `function`'s style unless it has its own.
+`TokenTheme::vocabulary()` lists the standard names. Each maps to TextMate
+scopes, so a builder theme colors syntect too, and a `.tmTheme` colors
+tree-sitter captures. `resolve(name)` returns the style a capture gets, and
+`foreground()` the plain-text color.
+
+### Tree-sitter on wasm32
+
+The `tree-sitter` feature builds for `wasm32-unknown-unknown`, but a grammar
+crate compiles C. Grammars generated with the tree-sitter CLI 0.26 template or
+later build as they are. Older ones, such as tree-sitter-rust 0.24, fail on
+`stdlib.h` unless their C compiler sees the libc headers that
+`tree-sitter-language` ships. In this repository, run
+`eval "$(scripts/wasm-cflags.sh)"` first. Elsewhere, set
+`CFLAGS_wasm32_unknown_unknown="-isystem <tree-sitter-language source dir>/wasm/include"`.
+
 ## Examples
 
 ```bash
 cargo run -p scrive-iced --example minimal   # the CodeEditor quick start above
 cargo run -p scrive-iced --example scratch   # the low-level Editor widget, full control
+cargo run -p scrive-iced --features tree-sitter --example tree_sitter   # the quick start with a tree-sitter grammar
 ```
 
 `scratch` opens a real editor over a sample Rust document — type, select, find

@@ -45,6 +45,45 @@
 //!     }
 //! }
 //! ```
+//!
+//! # Highlighting
+//!
+//! [`CodeEditor::language`] takes either backend's grammar, and the cargo
+//! features of the same names forward to `scrive-core`:
+//!
+//! | feature | default | grammar | adds |
+//! |---------|---------|---------|------|
+//! | `syntect` | on | `scrive_core::SyntaxDef` (`.sublime-syntax`) | documents of 2 MiB or more tokenize on worker threads, natively |
+//! | `tree-sitter` | off | `scrive_core::TreeSitterDef` (grammar crate + highlights query) | the parse runs on the UI thread, a budgeted slice per frame |
+//! | `lsp` | off | | `scrive_iced::lsp`, the language-server bridge |
+//!
+//! ```no_run
+//! # #[cfg(feature = "syntect")]
+//! # fn syntect(sublime_syntax: &str) -> Result<(), Box<dyn std::error::Error>> {
+//! use scrive_core::SyntaxDef;
+//! use scrive_iced::CodeEditor;
+//!
+//! let editor = CodeEditor::new("fn main() {}\n").language(SyntaxDef::from_sublime_syntax(sublime_syntax)?);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ```no_run
+//! # #[cfg(feature = "tree-sitter")]
+//! # fn tree_sitter() -> Result<(), Box<dyn std::error::Error>> {
+//! use scrive_core::TreeSitterDef;
+//! use scrive_iced::CodeEditor;
+//!
+//! let grammar = TreeSitterDef::new(tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY)?;
+//! let editor = CodeEditor::new("fn main() {}\n").language(grammar);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`scrive_dark_theme`] is the default theme in every build. A host's own
+//! [`TokenTheme`](scrive_core::TokenTheme), from a `.tmTheme` or
+//! `TokenTheme::builder()`, goes to [`CodeEditor::theme`] and colors either
+//! backend.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]

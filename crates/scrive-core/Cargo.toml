@@ -8,8 +8,8 @@ repository.workspace = true
 description = "Headless code-editor core: buffer, atomic multi-range transactions, undo/redo, selections, tracked-range decorations, and incremental syntax highlighting (syntect or tree-sitter). Imports no GUI crate."
 keywords = ["editor", "text", "buffer", "undo", "headless"]
 categories = ["text-editors", "data-structures"]
-# benches/support.rs is a shared module of the one `perf` bench, not a bench
-# of its own — explicit [[bench] ] only.
+# benches/support.rs is a shared module of the `perf` bench, not a bench of
+# its own — explicit [[bench] ] only.
 autobenches = false
 
 # HARD STRUCTURAL RULE: scrive-core depends on no GUI crate. If `iced`/`winit`/
@@ -87,6 +87,9 @@ criterion = { version = "0.5", default-features = false }
 # default features only.
 [target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
 tree-sitter-rust = "0.24"
+# tree-sitter itself, named directly only by the `tree_sitter` bench: it
+# routes the C library's allocations through a counting allocator.
+tree-sitter = "0.27"
 
 # Built as a cdylib so CI can instantiate it under node: the tree-sitter
 # backend's wasm smoke test (scripts/wasm-smoke.mjs).
@@ -99,6 +102,11 @@ required-features = ["tree-sitter"]
 name = "perf"
 harness = false
 required-features = ["syntect"]
+
+[[bench]]
+name = "tree_sitter"
+harness = false
+required-features = ["tree-sitter"]
 
 [[test]]
 name = "spike_syntect"

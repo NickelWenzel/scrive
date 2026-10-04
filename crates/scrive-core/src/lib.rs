@@ -28,6 +28,20 @@
 //! - attach diagnostics / snippet stops → [`decorations`]
 //! - complete / hover / signature help → [`intel::providers`]
 //! - show inlay hints → [`intel::inlay`]
+//!
+//! # Cargo features
+//!
+//! Each highlight backend is its own feature; see [`highlight`] for how to
+//! pick one per document.
+//!
+//! | feature | default | adds |
+//! |---------|---------|------|
+//! | `syntect` | on | `SyntaxDef`: `.sublime-syntax` grammars, and `TokenTheme::from_tm_theme` |
+//! | `tree-sitter` | off | `TreeSitterDef`: a tree-sitter grammar crate's `LANGUAGE` plus a highlights query |
+//!
+//! Both can be on at once. With neither, a [`Document`] does everything but
+//! highlight. Every [`TokenTheme`] method except `from_tm_theme` works in
+//! every build, [`TokenTheme::builder`] included.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]

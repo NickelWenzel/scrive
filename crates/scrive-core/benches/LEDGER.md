@@ -318,3 +318,82 @@ Document-scale multi-caret typing WITH a config set is therefore O(carets·log²
 per commit rather than bulk O(brackets): bounded by caret count (the edit
 dimension), not document size — no doc-scaling regression — but a real constant
 on that one scenario. Not benched here; a `keystroke_aware` cell would pin it.
+
+## Tree-sitter backend (2026-10-04) — parse budget and tree memory
+
+`cargo bench -p scrive-core --features tree-sitter --bench tree_sitter`, a
+separate bench target because `perf`'s fixtures need syntect. tree-sitter 0.27,
+tree-sitter-rust 0.24 with its own `HIGHLIGHTS_QUERY`, release build, on an
+i7-9750H under Linux. Compare these rows with each other, not with the syntect
+sections above, which ran on other machines.
+
+Two corpora, both made of the same seven-row cycle of Rust: a function
+opening, a string binding, a comment, a generic call, the closing `}`, a unit
+struct, a blank. `nested` wraps it in 1,400-row `mod`
+blocks, the way real code nests. `flat` leaves every item at the top level,
+which is the worst case for a reparse: tree-sitter steps over every reused
+top-level sibling. The viewport is 40 rows mid-file, and every scenario drives
+`tokenize_highlight` until `highlight_frontier` is `None`, one call per frame,
+as the iced sweep does. The bench prints the calls and the per-call times next
+to criterion's medians.
+
+| bench                           | median  | calls | per call (median / max) |
+|---------------------------------|---------|-------|-------------------------|
+| tree_sitter/cold_parse_1m       | 165 ms  | 111   | 2.32 / 3.45 ms          |
+| tree_sitter/cold_parse_10m      | 1.79 s  | 1,059 | 2.57 / 3.96 ms          |
+| tree_sitter/keystroke_nested_1m | 827 µs  | 1     | 0.62 ms                 |
+| tree_sitter/keystroke_flat_1m   | 30.3 ms | 5     | 3.2 / 14.8 ms           |
+| tree_sitter/keystroke_flat_10m  | 339 ms  | 48    | 3.4 / 145 ms            |
+| tree_sitter/window_jump_1m      | 2.73 ms | 5     | 0.70 / 0.86 ms          |
+
+The cold-parse medians leave out dropping the document. A rerun on the same
+box, under load, gave 176 ms and 1.83 s, with per-call maxima up to 4.7 ms. The
+other rows come from an earlier, quieter run. The keystroke rows include the
+commit (`type_char`), about 0.2 ms of the nested row. A window jump re-queries
+~1,060 rows at 256 per call and doesn't touch the tree.
+
+**Budget: `HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL` stays at 100.** A parse call
+costs 2.2–2.6 ms at the median and at most 4.7 ms, including the call that
+finishes the parse and queries the first 256 window rows. The median sits in
+the middle of the 0.5–5 ms band the line-state budget targets, and the worst
+call, measured under load, stays inside it. A reparse check
+costs more than a first-parse check (3.0–3.4 ms per 100 on the flat corpus),
+so a separate, larger reparse budget would leave the band. Doubling the budget
+would put the slowest first-parse calls past 5 ms.
+
+**Tree memory**, counted by the allocator (`SCRIVE_BENCH_MEMORY=1`). The run
+routes tree-sitter's C allocations through a counting Rust allocator
+(`tree_sitter::set_allocator`) and reports payload bytes without the counter's
+own block headers. The tree is a direct `Parser` parse with the parser
+dropped. "Highlight state" is everything `set_syntax` plus a converged window
+adds to a `Document`.
+
+| corpus           | tree      | C blocks  | × text | highlight state |
+|------------------|-----------|-----------|--------|-----------------|
+| nested 1 MB      | 34.9 MiB  | 387,806   | 36.3   | 35.0 MiB        |
+| nested 10 MB     | 346.1 MiB | 3,847,626 | 36.3   | 346.2 MiB       |
+| scrive's own `.rs` files, 2.6 MB (one-off) | 68.4 MiB | 775,559 | 27.8 | — |
+
+The tree is the whole cost: parser, query and window spans add about 0.1 MiB.
+It grows linearly, at ~94 bytes per C allocation. The bench corpus packs more
+tokens per byte than hand-written code, and scrive's own sources came out at
+28× their size. The line-state backend holds single-digit MB at any size (see
+"Highlight virtualization"); a tree-sitter document holds its tree for as long
+as it is open.
+
+Counting slows a parse by about a fifth: summed per-call times for a 1 MB
+cold parse came to ~185 ms counted against 155 ms uncounted, one-off. So the
+allocator counts only in the memory run, which times nothing, and the timed
+runs count nothing.
+
+**Residual, honestly:** the call that finishes a reparse also runs
+`changed_ranges`, and on a flat file that walks every top-level sibling. A
+one-off probe timed it at 13.6 ms of a ~15 ms finishing call at 1 MB; the
+145 ms finishing call at 10 MB is the same walk. No budget bounds it. Nested
+code doesn't pay it (the whole keystroke is one 0.6 ms call), but a generated
+10 MB file of top-level items hitches a frame per keystroke burst. A cheaper
+invalidation than `changed_ranges` could fix that; the budget can't.
+
+A first parse of 10 MB takes ~1,060 calls, about 18 s at one call per 60 fps
+frame, and rows stay unhighlighted meanwhile. A host that wants it sooner can
+call `tokenize_highlight` more than once per frame.

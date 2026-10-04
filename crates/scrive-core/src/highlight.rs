@@ -1,39 +1,106 @@
-//! Syntax highlighting — a GUI-free public surface over private engines, one
-//! per cargo feature. **Backend types are named only inside this module**;
-//! none crosses the `pub` line (tree-sitter's `LanguageFn` handoff aside), so
-//! the GUI crate never has to pin a backend's version.
+//! Syntax highlighting: a GUI-free public API over two private backends, one
+//! per cargo feature. Backend types are named only inside this module, apart
+//! from tree-sitter's `LanguageFn` handoff, so the GUI crate never has to pin a
+//! backend's version.
 //!
-//! The core is **language-agnostic**: the app supplies the grammar, as an
-//! injected `.sublime-syntax` (`SyntaxDef::from_sublime_syntax`, feature
-//! `syntect`, on by default) or a tree-sitter grammar and highlights query
-//! (`TreeSitterDef::new`, feature `tree-sitter`), and the theme, as a
-//! `.tmTheme` (`TokenTheme::from_tm_theme`, feature `syntect`) or capture
-//! styles built in code ([`TokenTheme::builder`]); scrive-core ships neither.
-//! With neither feature a [`Grammar`] can't be built, and a
+//! The core is language-agnostic. The app supplies the grammar and the theme,
+//! and scrive-core ships neither.
+//!
+//! # Backends
+//!
+//! | feature | default | grammar | the app supplies |
+//! |---------|---------|---------|------------------|
+//! | `syntect` | on | `SyntaxDef::from_sublime_syntax` | a `.sublime-syntax` file |
+//! | `tree-sitter` | off | `TreeSitterDef::new` | a grammar crate's `LANGUAGE` and a highlights query |
+//!
+//! Either converts into a [`Grammar`], which
+//! [`Document::set_syntax`](crate::Document::set_syntax) takes, so the backend
+//! is picked per document. Both produce the same [`HighlightSpan`] rows. With
+//! neither feature a [`Grammar`] can't be built, and a
 //! [`Document`](crate::Document) never highlights.
+//!
+//! ```
+//! # #[cfg(feature = "syntect")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use scrive_core::{Document, SyntaxDef, TokenTheme};
+//!
+//! let grammar = SyntaxDef::from_sublime_syntax(
+//!     "name: Demo\nscope: source.demo\ncontexts:\n  main:\n    - match: '\\bfn\\b'\n      scope: keyword.demo\n",
+//! )?;
+//! let mut doc = Document::new("fn main() {}\n")?;
+//! doc.set_syntax(grammar, TokenTheme::builder().build());
+//! doc.tokenize_highlight(doc.buffer().line_count());
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "syntect"))]
+//! # fn main() {}
+//! ```
+//!
+//! ```
+//! # #[cfg(feature = "tree-sitter")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use scrive_core::{Document, TokenTheme, TreeSitterDef};
+//!
+//! let grammar = TreeSitterDef::new(tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY)?;
+//! let mut doc = Document::new("fn main() {}\n")?;
+//! doc.set_syntax(grammar, TokenTheme::builder().build());
+//! // A first parse can take several calls; drive until there's nothing left.
+//! while doc.highlight_frontier().is_some() {
+//!     doc.tokenize_highlight(doc.buffer().line_count());
+//! }
+//! # Ok(())
+//! # }
+//! # #[cfg(not(feature = "tree-sitter"))]
+//! # fn main() {}
+//! ```
+//!
+//! # Themes and captures
+//!
+//! One [`TokenTheme`] colors both backends. Build it from a `.tmTheme` with
+//! `TokenTheme::from_tm_theme` (feature `syntect`), or in code with
+//! [`TokenTheme::builder`]. A tree-sitter capture name resolves to its own
+//! style, else to its longest dotted prefix's: `@function.method` takes
+//! `function`'s style unless it has one of its own
+//! ([`TokenTheme::resolve`]). [`TokenTheme::vocabulary`] lists the standard
+//! captures. They map to TextMate scopes, so a builder theme colors syntect
+//! too, and a `.tmTheme` colors tree-sitter captures.
+//!
+//! When captures overlap, the innermost node wins, and on one node the
+//! query's earliest pattern wins, as in tree-sitter-highlight and the queries
+//! grammar crates ship. One difference: a capture the theme doesn't style
+//! doesn't claim its node, so a later pattern or the enclosing node's color
+//! shows through. A partial theme still colors as much as it can.
 //!
 //! # The incremental engine
 //!
 //! Production reads go through the incremental engine a
 //! [`Document`](crate::Document) owns once
-//! [`set_syntax`](crate::Document::set_syntax) attaches a [`Grammar`]: an
+//! [`set_syntax`](crate::Document::set_syntax) attaches a [`Grammar`]. An
 //! edit shifts it in place, it converges lazily
 //! ([`tokenize_highlight`](crate::Document::tokenize_highlight)), and a theme
 //! change invalidates every line ([`set_theme`](crate::Document::set_theme)).
-//! Untokenized lines return `None` and render in the default style — never an
+//! Untokenized lines return `None` and render in the default style, never an
 //! error or a stall. Each drive tokenizes at most
-//! [`HIGHLIGHT_MAX_LINES_PER_CALL`] lines, so no single call can stall a frame
-//! however far a cascade wants to run. Under syntect, `Highlighter::highlight`
-//! tokenizes a whole document top-to-bottom on each call — correct but
-//! O(lines), used as the convergence oracle in tests.
+//! [`HIGHLIGHT_MAX_LINES_PER_CALL`] lines and, under tree-sitter, advances the
+//! parse by at most `HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL`, so no single call
+//! stalls a frame. Under syntect, `Highlighter::highlight` tokenizes a whole
+//! document top to bottom on each call. It is correct but O(lines), and the
+//! tests use it as the convergence oracle.
 //!
-//! Retention is **virtualized** so RAM does not grow with the idle sweep:
-//! spans live only in a window around the viewport
+//! Spans live only in a window around the viewport
 //! ([`set_highlight_window`](crate::Document::set_highlight_window)). Outside
 //! it, the syntect backend keeps sparse checkpoints
-//! (`HIGHLIGHT_CHECKPOINT_STRIDE`) so every row stays re-derivable, and the
-//! tree-sitter backend keeps its parse tree. A fully swept document holds
-//! `O(window + lines/stride)` line states, not `O(lines)`.
+//! (`HIGHLIGHT_CHECKPOINT_STRIDE`) so every row stays re-derivable: a fully
+//! swept document holds `O(window + lines/stride)` line states, not
+//! `O(lines)`. The tree-sitter backend keeps its parse tree instead, which
+//! grows with the document. With tree-sitter-rust it measured 28 times the
+//! text's size on scrive's own sources and 36 times on the bench corpus
+//! (`benches/LEDGER.md`).
+//!
+//! While the code has syntax errors, tree-sitter's incremental reparse can
+//! recover differently from a fresh parse of the same text, so the colors
+//! can differ from what reloading the file shows. They agree again once the
+//! text parses cleanly.
 
 use core::ops::Range;
 
@@ -215,8 +282,9 @@ pub const HIGHLIGHT_MAX_LINES_PER_CALL: u32 = 256;
 /// checks in about every 100 parse operations, so this is an op count too:
 /// deterministic, and free of the wall clock, which wasm32-unknown-unknown
 /// lacks. Bytes parsed would mismeasure the work, since a reparse skips over
-/// reused subtrees. With tree-sitter-rust, 100 checks took about 2 ms in a
-/// release build. A parse past the budget resumes on the next
+/// reused subtrees. With tree-sitter-rust in a release build, a call took
+/// 2.2–2.6 ms at the median and at most 4.7 ms (`benches/LEDGER.md`). A parse
+/// past the budget resumes on the next
 /// [`Document::tokenize_highlight`](crate::Document::tokenize_highlight).
 #[cfg(feature = "tree-sitter")]
 pub const HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL: u32 = 100;
