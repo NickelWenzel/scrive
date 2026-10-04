@@ -38,17 +38,23 @@ use crate::transaction::Committed;
 use syntect::highlighting::{FontStyle, HighlightState, Highlighter as SyntectHighlighter, Style};
 use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet, SyntaxSetBuilder};
 
+#[cfg(feature = "tree-sitter")]
+mod capture_paint;
 mod dirty_ranges;
 mod grammar;
 mod line_state;
 pub(crate) mod splice;
 pub mod token_theme;
+#[cfg(feature = "tree-sitter")]
+mod tree_sitter_def;
 mod vocabulary;
 
 use line_state::{tokenize_line, LineState};
 pub use grammar::Grammar;
 pub use line_state::{tokenize_segment, HighlightEngine, SegmentBoundary, SegmentStart, SegmentTokens};
 pub use token_theme::{ThemeError, TokenTheme};
+#[cfg(feature = "tree-sitter")]
+pub use tree_sitter_def::{QueryErrorKind, TreeSitterDef, TreeSitterError};
 
 /// A GUI-free color; scrive-iced maps it to `iced::Color` at render time.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]

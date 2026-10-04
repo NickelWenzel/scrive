@@ -89,7 +89,10 @@ impl TokenTheme {
     /// The style for a tree-sitter capture name: its own rule, else the rule
     /// of its longest dotted prefix. `none` and names starting with `_` are
     /// never styled, following the tree-sitter highlight query convention.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the tree-sitter backend is the caller"))]
+    #[cfg_attr(
+        not(any(test, feature = "tree-sitter")),
+        expect(dead_code, reason = "the tree-sitter backend is the caller")
+    )]
     pub(crate) fn resolve(&self, capture: &str) -> Option<SpanStyle> {
         if capture == "none" || capture.starts_with('_') {
             return None;

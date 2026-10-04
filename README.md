@@ -182,6 +182,14 @@ UI text such as the find bar, and `webgl` for browsers without WebGPU. There
 are no threads, so a large document is highlighted on the UI thread instead of
 the background pool.
 
+scrive-core's `tree-sitter` feature builds for wasm32 too, but a grammar crate
+compiles C. Grammars generated with the tree-sitter CLI 0.26 template or later
+build as they are. Older ones, such as tree-sitter-rust 0.24, fail on
+`stdlib.h` unless their C compiler sees the libc headers that
+`tree-sitter-language` ships. In this repository, run
+`eval "$(scripts/wasm-cflags.sh)"` first. Elsewhere, set
+`CFLAGS_wasm32_unknown_unknown="-isystem <tree-sitter-language source dir>/wasm/include"`.
+
 Serve an example as a web app with [Trunk](https://trunkrs.dev) (it fetches
 the matching `wasm-bindgen` itself):
 

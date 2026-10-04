@@ -43,10 +43,19 @@ jobs:
         with:
           tool: wasmtime
 
+      # tree-sitter-rust (a test grammar) predates the grammar template that
+      # adds the wasm libc headers itself; point its C compiler at them.
+      - name: Set wasm CFLAGS for tree-sitter grammars
+        run: scripts/wasm-cflags.sh | sed 's/^export //; s/"//g' >> "$GITHUB_ENV"
+
       # The browser target: the libraries (every feature), their tests, and the
       # examples must build.
       - name: Build for wasm32-unknown-unknown
         run: cargo build --workspace --all-targets --all-features --target wasm32-unknown-unknown
+
+      # The tree-sitter backend runs in the browser target, with no imports.
+      - name: Run the tree-sitter wasm smoke test
+        run: node scripts/wasm-smoke.mjs target/wasm32-unknown-unknown/debug/examples/wasm_smoke.wasm
 
       # The GUI-free core runs its unit tests as wasm (32-bit usize, no threads).
       - name: Test scrive-core on wasm32-wasip1

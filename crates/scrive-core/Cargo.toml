@@ -36,12 +36,27 @@ autobenches = false
 #               automaton is linear-time by construction. It is also nearly free
 #               here — regex-automata / regex-syntax / aho-corasick / memchr are
 #               already in the tree via syntect's `default-fancy`.
+#   tree-sitter (optional, `tree-sitter` feature) — the parse-tree highlight
+#               backend: parser, incremental trees, highlights queries. Types
+#               stay OUT of the public API, like syntect's. Its own build
+#               script shims libc for wasm32-unknown-unknown, so the feature
+#               builds for the browser with no extra setup.
+#   tree-sitter-language (optional, `tree-sitter` feature) — the ONE backend
+#               type allowed in the public API, deliberately: `LanguageFn` in
+#               `TreeSitterDef::new`. It is the stable, runtime-version-free
+#               handoff type every grammar crate exports (`LANGUAGE`), so it is
+#               the only way a consumer can hand scrive a grammar.
+[features]
+tree-sitter = ["dep:tree-sitter", "dep:tree-sitter-language"]
+
 [dependencies]
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 memchr = "2"      # find scanning (memmem/memchr2) + test oracles
 thiserror = "2"   # error enums (LoadError, TransactionError)
 regex = "1"       # find's whole-word + regex modes (wrapped; never public)
 arrayvec = "0.7"  # the rope chunk's inline storage (wrapped; never public)
+tree-sitter = { version = "0.27", optional = true }           # wrapped; never public
+tree-sitter-language = { version = "0.1", optional = true }  # `LanguageFn`, the grammar handoff
 
 [dev-dependencies]
 # ropey: kept ONLY as the byte-for-byte oracle for our own rope. Dev-only — the
@@ -57,6 +72,21 @@ criterion = "0.5"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 criterion = { version = "0.5", default-features = false }
+
+# tree-sitter-rust: the grammar the `tree-sitter` feature's tests highlight
+# with. Its build.rs predates the template that adds the wasm headers, so a
+# wasm32-unknown-unknown build needs `eval "$(scripts/wasm-cflags.sh)"` first.
+# Not on WASI: its C needs a wasi-sdk sysroot, and the wasip1 tests run
+# default features only.
+[target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
+tree-sitter-rust = "0.24"
+
+# Built as a cdylib so CI can instantiate it under node: the tree-sitter
+# backend's wasm smoke test (scripts/wasm-smoke.mjs).
+[[example]]
+name = "wasm_smoke"
+crate-type = ["cdylib"]
+required-features = ["tree-sitter"]
 
 [[bench]]
 name = "perf"
