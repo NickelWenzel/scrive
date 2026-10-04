@@ -124,9 +124,8 @@ impl TokenTheme {
 }
 
 impl Builder {
-    /// The color of text no capture styles. Syntect paints it on every
-    /// unstyled run; tree-sitter leaves unstyled text to the renderer's own
-    /// default.
+    /// The color of text no capture styles. Neither backend spans such text;
+    /// it's the renderer's choice whether to use this or its own default.
     #[must_use]
     pub fn foreground(mut self, fg: Rgba) -> Self {
         self.foreground = Some(fg);

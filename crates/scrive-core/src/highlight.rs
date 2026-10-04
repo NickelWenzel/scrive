@@ -534,12 +534,13 @@ mod tests {
     fn keyword_gets_the_keyword_color() {
         let lines = highlighter().highlight("kw x");
         assert_eq!(lines.len(), 1);
-        // The `kw` at bytes 0..2 is red; something else is white.
+        // The `kw` at bytes 0..2 is red; the rest is in the theme's plain
+        // style, so it gets no span and the renderer draws it in its own color.
         let red = Rgba { r: 0xff, g: 0, b: 0, a: 0xff };
-        let white = Rgba { r: 0xff, g: 0xff, b: 0xff, a: 0xff };
-        let kw = lines[0].iter().find(|s| s.range == (0..2)).expect("a span at 0..2");
+        assert_eq!(lines[0].len(), 1, "only the keyword is spanned");
+        let kw = &lines[0][0];
+        assert_eq!(kw.range, 0..2);
         assert_eq!(kw.style.fg, red);
-        assert!(lines[0].iter().any(|s| s.style.fg == white), "non-keyword text is default white");
     }
 
     #[test]
@@ -555,9 +556,8 @@ mod tests {
         let lines = Highlighter::new(syntax, theme).highlight("kw x");
         let kw = lines[0].iter().find(|s| s.range == (0..2)).expect("a span at 0..2");
         assert_eq!(kw.style, SpanStyle { fg: red, bold: true, italic: false });
-        let rest: Vec<_> = lines[0].iter().filter(|s| s.range.start >= 2).collect();
-        assert!(!rest.is_empty());
-        assert!(rest.iter().all(|s| s.style == SpanStyle { fg: white, bold: false, italic: false }));
+        // Text in the builder's plain foreground gets no span.
+        assert!(lines[0].iter().all(|s| s.range.end <= 2), "only the keyword is spanned");
     }
 
     #[test]

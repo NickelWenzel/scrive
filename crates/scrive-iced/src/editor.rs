@@ -3861,9 +3861,9 @@ fn expand_tabs(run: &str, start_cell: u32) -> String {
     out
 }
 
-/// A line's highlight spans with the gaps between them filled in `plain`. Syntect
-/// spans cover the whole line, but tree-sitter only spans styled captures, so an
-/// unstyled identifier sits in a gap and would otherwise not be drawn at all.
+/// A line's highlight spans with the gaps between them filled in `plain`. The
+/// core spans only styled text, so an unstyled identifier sits in a gap and is
+/// drawn in the palette's text color, readable in light and dark mode alike.
 fn colored_runs(spans: &[HighlightSpan], line_len: u32, plain: Color) -> Vec<(Range<u32>, Color)> {
     let mut runs = Vec::with_capacity(spans.len() * 2 + 1);
     let mut cursor = 0;

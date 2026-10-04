@@ -30,6 +30,10 @@ pub(super) struct LineState {
 /// Tokenize one line from `start`, returning its spans and its **end** state
 /// (the start state for the next line). A parse error falls back to no spans,
 /// carrying the start state forward unchanged so the tokenize loop cannot spin.
+///
+/// Text in the theme's plain style gets no span, as with tree-sitter: the
+/// renderer draws it in its own plain color, which follows the light or dark
+/// palette instead of a dark theme's light foreground.
 pub(super) fn tokenize_line(
     syntect: &SyntectHighlighter<'_>,
     set: &SyntaxSet,
@@ -38,7 +42,9 @@ pub(super) fn tokenize_line(
 ) -> (Vec<HighlightSpan>, LineState) {
     let mut end = start.clone();
     let ops = end.parse.parse_line(line, set).unwrap_or_default();
+    let plain = syntect.get_default();
     let spans = RangedHighlightIterator::new(&mut end.highlight, &ops, line, syntect)
+        .filter(|(style, _, _)| style.foreground != plain.foreground || style.font_style != plain.font_style)
         .map(|(style, _text, range)| span_from(style, range))
         .collect();
     (spans, end)

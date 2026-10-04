@@ -1918,8 +1918,8 @@ impl Document {
 
     /// Cached highlight spans for a buffer row — `None` if untokenized or no
     /// highlighter is attached (the renderer falls back to the plain text color).
-    /// The spans may leave gaps: a tree-sitter grammar spans only the captures
-    /// the theme styles, so a renderer draws uncovered text in its plain color.
+    /// The spans may leave gaps: both backends span only text the theme styles,
+    /// so a renderer draws uncovered text in its plain color.
     #[must_use]
     pub fn highlight_line_spans(&self, row: u32) -> Option<&[HighlightSpan]> {
         self.highlight.as_ref().and_then(|c| c.line_spans(row))
