@@ -1921,7 +1921,8 @@ impl Document {
     }
 
     /// A `Send + Sync` handle to the highlighter's grammar + theme, for the
-    /// app's off-thread parallel/speculative sweep. `None` without a grammar.
+    /// app's off-thread parallel/speculative sweep. `None` without a grammar,
+    /// and for a tree-sitter grammar, which highlights on this thread only.
     /// Pair with [`Document::snapshot`] (an O(1) rope clone) and
     /// [`crate::tokenize_segment`] on a worker, then feed results back through
     /// [`Document::absorb_highlight`].
@@ -1933,8 +1934,10 @@ impl Document {
     /// Ingest a segment tokenized off-thread (the parallel/speculative sweep).
     /// Returns `false` — absorbing **nothing** — if `revision` no longer
     /// matches the document (an edit landed since the snapshot the segment was
-    /// computed from; the app drops the stale result and re-dispatches). On a
-    /// match, the highlight cache absorbs it:
+    /// computed from; the app drops the stale result and re-dispatches), or if
+    /// the document's highlighter takes no segments (a tree-sitter grammar,
+    /// whose [`Document::highlight_engine`] is `None`). Otherwise the
+    /// highlight cache absorbs it:
     ///
     /// - `verified` — the coordinator chained this segment from row 0, so its
     ///   start state is TRUE: its checkpoints merge, its window spans/states are
@@ -6457,5 +6460,169 @@ mod tests {
         install(&mut d, vec![(99, type_hint("E", 1)), (2, type_hint("M", 2))]);
         let offsets: Vec<u32> = d.inlays_in(0..u32::MAX).map(|s| s.offset()).collect();
         assert_eq!(offsets, vec![1, 3], "mid-char snaps left, past-the-end clamps");
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    mod tree_sitter_highlight {
+        use super::*;
+        use crate::{Rgba, SpanStyle, TokenTheme, TreeSitterDef};
+
+        fn grammar() -> TreeSitterDef {
+            TreeSitterDef::new(tree_sitter_rust::LANGUAGE, tree_sitter_rust::HIGHLIGHTS_QUERY).unwrap()
+        }
+
+        fn theme() -> TokenTheme {
+            let style = |r, g, b| SpanStyle { fg: Rgba { r, g, b, a: 0xff }, bold: false, italic: false };
+            TokenTheme::builder()
+                .capture("keyword", style(0xff, 0, 0))
+                .capture("string", style(0, 0xff, 0))
+                .capture("comment", style(0x80, 0x80, 0x80))
+                .capture("type", style(0xff, 0xff, 0))
+                .build()
+        }
+
+        fn highlighted(text: &str) -> Document {
+            let mut d = doc(text);
+            d.set_syntax(grammar(), theme());
+            settle(&mut d);
+            d
+        }
+
+        fn settle(d: &mut Document) {
+            for _ in 0..100 {
+                if d.highlight_frontier().is_none() {
+                    return;
+                }
+                d.tokenize_highlight(u32::MAX);
+            }
+            panic!("the highlight never settled");
+        }
+
+        /// Every row equals a fresh document's over the same text.
+        fn assert_equals_fresh(d: &mut Document) {
+            settle(d);
+            let fresh = highlighted(&d.text());
+            assert_eq!(d.buffer().line_count(), fresh.buffer().line_count());
+            for row in 0..d.buffer().line_count() {
+                assert!(fresh.highlight_line_spans(row).is_some(), "row {row} is retained");
+                assert_eq!(d.highlight_line_spans(row), fresh.highlight_line_spans(row), "row {row}");
+            }
+        }
+
+        const SOURCE: &str = "struct A;\nfn main() {\n    let s = \"x\";\n}\n";
+
+        #[test]
+        fn undo_and_redo_resync_tree_sitter_highlight() {
+            let mut d = highlighted(SOURCE);
+            assert!(d.highlight_engine().is_none(), "tree-sitter has no off-thread engine");
+            d.set_selections(SelectionSet::new(0));
+            d.edit(vec![EditOp::insert(0, "/* a\nb */\n")]).unwrap();
+            assert_equals_fresh(&mut d);
+            let spans = d.highlight_line_spans(1).unwrap();
+            assert!(!spans.is_empty() && spans.iter().all(|s| s.style.fg.r == 0x80), "row 1 is a comment");
+            assert!(d.undo());
+            assert_eq!(d.text(), SOURCE);
+            assert_equals_fresh(&mut d);
+            assert!(d.redo());
+            assert_equals_fresh(&mut d);
+        }
+
+        #[test]
+        fn a_multi_op_transaction_equals_a_fresh_document() {
+            let mut d = highlighted(SOURCE);
+            // Ascending, one of them adding a row, and two on one row.
+            d.edit_grouped(
+                vec![
+                    EditOp::new(7..8, "Bee"),               // `A` -> `Bee`
+                    EditOp::insert(10, "const C: u8 = 1;\n"), // row 1 start
+                    EditOp::new(13..17, "start"),            // `main` -> `start`
+                    EditOp::new(35..36, "yz"),               // `x` -> `yz`
+                    EditOp::insert(38, " // done"),          // after `;` on the same row
+                ],
+                typ(OpClass::Type),
+            )
+            .unwrap();
+            assert_eq!(d.text(), "struct Bee;\nconst C: u8 = 1;\nfn start() {\n    let s = \"yz\"; // done\n}\n");
+            assert_equals_fresh(&mut d);
+        }
+
+        /// Seeded multi-edit commits that keep the text valid Rust, mixed
+        /// with undo and redo: the window keeps matching a fresh document.
+        #[test]
+        fn randomized_commits_undo_and_redo_equal_a_fresh_document() {
+            let source: String = (0..120).map(|i| format!("fn f{i}() {{\n    let s{i} = \"v\";\n}}\n")).collect();
+            let mut d = highlighted(&source);
+            let mut state = 0xC0FFEE_u64;
+            let mut rand = move |bound: usize| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((state >> 33) as usize) % bound.max(1)
+            };
+            for step in 0..60 {
+                match rand(4) {
+                    0 => {
+                        d.undo();
+                    }
+                    1 => {
+                        d.redo();
+                    }
+                    _ => {
+                        let n = d.buffer().line_count();
+                        let mut rows: Vec<u32> = (0..1 + rand(4)).map(|_| rand(n as usize) as u32).collect();
+                        rows.sort_unstable();
+                        rows.dedup();
+                        let ops: Vec<EditOp> = rows
+                            .into_iter()
+                            .filter_map(|row| {
+                                let start = d.buffer().point_to_offset(crate::Point::new(row, 0));
+                                let line = d.buffer().line(row);
+                                if line.starts_with("    let") {
+                                    let end = d.buffer().point_to_offset(crate::Point::new(row + 1, 0));
+                                    Some(if rand(2) == 0 {
+                                        EditOp::delete(start..end)
+                                    } else {
+                                        EditOp::insert(start, "    let q = 'c';\n")
+                                    })
+                                } else if line.starts_with("fn") || line.is_empty() {
+                                    Some(EditOp::insert(start, "/* a\n b */ struct T;\n"))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        if !ops.is_empty() {
+                            d.edit_grouped(ops, typ(OpClass::Other)).unwrap();
+                        }
+                    }
+                }
+                if step % 6 == 5 {
+                    assert_equals_fresh(&mut d);
+                }
+            }
+            assert_equals_fresh(&mut d);
+        }
+
+        #[test]
+        fn set_syntax_with_a_tree_sitter_grammar_keeps_the_window_aim() {
+            let mut d = doc(&"fn f() {}\n".repeat(3_000));
+            let syntect = crate::SyntaxDef::from_sublime_syntax(HL_G).unwrap();
+            d.set_syntax(syntect, crate::TokenTheme::from_tm_theme(HL_TH).unwrap());
+            d.set_highlight_window(2_000..2_040);
+            d.set_syntax(grammar(), theme());
+            settle(&mut d);
+            assert!(d.highlight_line_spans(2_020).is_some(), "the viewport rows are retained");
+            assert!(d.highlight_line_spans(0).is_none(), "the document top is outside the window");
+        }
+
+        #[test]
+        fn absorb_highlight_takes_no_segment_for_tree_sitter() {
+            let mut syntect = doc_with_syntax(10);
+            let engine = syntect.highlight_engine().unwrap();
+            let snap = syntect.snapshot();
+            let seg = crate::tokenize_segment(&engine, &snap, 0..11, crate::SegmentStart::Fresh, None, None);
+            let mut d = highlighted(SOURCE);
+            assert!(!d.absorb_highlight(d.revision(), seg, true));
+            syntect.set_syntax(grammar(), theme());
+            assert!(syntect.highlight_engine().is_none());
+        }
     }
 }

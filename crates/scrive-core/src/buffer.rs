@@ -388,6 +388,13 @@ impl Buffer {
         self.offset_to_point(self.clip_offset(self.point_to_offset(point), bias))
     }
 
+    /// The rope itself, for crate code that walks chunks in place (the
+    /// tree-sitter backend's parse input and query text).
+    #[cfg(feature = "tree-sitter")]
+    pub(crate) fn rope(&self) -> &Rope {
+        &self.text
+    }
+
     /// An immutable copy for background consumers. **O(1)** — the
     /// rope clone shares structure; nothing is materialized until the
     /// consumer reads.

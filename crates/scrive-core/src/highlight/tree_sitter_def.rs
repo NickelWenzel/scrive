@@ -4,7 +4,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use tree_sitter::{Language, LanguageError, Parser, Query, QueryCursor};
+use tree_sitter::{Language, LanguageError, Parser, Query, QueryCursor, Tree};
 use tree_sitter_language::LanguageFn;
 
 use super::capture_paint;
@@ -144,6 +144,18 @@ impl TreeSitterDef {
 #[cfg_attr(not(test), expect(dead_code, reason = "the incremental backend's tests are the caller"))]
 pub(crate) fn highlight_whole(def: &TreeSitterDef, theme: &TokenTheme, text: &str) -> Vec<Vec<HighlightSpan>> {
     let tree = def.parser().parse(text, None).expect("a parse with no cancellation always finishes");
+    highlight_tree(def, theme, &tree, text)
+}
+
+/// Highlight all of `text` from `tree`, a parse of it, as
+/// [`highlight_whole`] does.
+#[cfg_attr(not(test), expect(dead_code, reason = "the incremental backend's tests are the caller"))]
+pub(crate) fn highlight_tree(
+    def: &TreeSitterDef,
+    theme: &TokenTheme,
+    tree: &Tree,
+    text: &str,
+) -> Vec<Vec<HighlightSpan>> {
     let mut cursor = QueryCursor::new();
     let captures = capture_paint::collect(&mut cursor, def.query(), tree.root_node(), text.as_bytes());
     let len = u32::try_from(text.len()).expect("documents are addressed with u32 offsets");

@@ -43,6 +43,10 @@ mod capture_paint;
 mod dirty_ranges;
 mod grammar;
 mod line_state;
+#[cfg(feature = "tree-sitter")]
+mod parse_tree;
+#[cfg(feature = "tree-sitter")]
+mod rope_text;
 pub(crate) mod splice;
 pub mod token_theme;
 #[cfg(feature = "tree-sitter")]
@@ -235,7 +239,8 @@ pub fn padded_highlight_window(viewport: Range<u32>, n_lines: u32) -> Range<u32>
 /// The document-owned incremental highlight cache: one facade over the
 /// backend its [`Grammar`] selects, so `Document` drives every backend the same
 /// way. Each method keeps the contract of the backend's own (see
-/// [`line_state::Cache`]).
+/// [`line_state::Cache`] and, with the `tree-sitter` feature,
+/// `parse_tree::Cache`).
 #[derive(Debug)]
 pub(crate) struct HighlightCache {
     backend: Backend,
@@ -244,6 +249,8 @@ pub(crate) struct HighlightCache {
 #[derive(Debug)]
 enum Backend {
     Lines(line_state::Cache),
+    #[cfg(feature = "tree-sitter")]
+    Tree(parse_tree::Cache),
 }
 
 impl HighlightCache {
@@ -253,6 +260,10 @@ impl HighlightCache {
         let backend = match grammar.0 {
             grammar::Inner::Syntect(def) => {
                 Backend::Lines(line_state::Cache::new(def, theme, buffer.line_count()))
+            }
+            #[cfg(feature = "tree-sitter")]
+            grammar::Inner::TreeSitter(def) => {
+                Backend::Tree(parse_tree::Cache::new(def, &theme, buffer.line_count()))
             }
         };
         Self { backend }
@@ -274,14 +285,19 @@ impl HighlightCache {
         );
         match &mut self.backend {
             Backend::Lines(c) => c.on_commit_patch(&spans),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(c) => c.on_commit(buffer, committed, &spans),
         }
     }
 
     /// Tokenize toward row `target` (inclusive), at most `max_lines` lines;
-    /// returns how many were tokenized.
+    /// returns how many were tokenized. The tree-sitter backend works only
+    /// within the window and ignores `target`.
     pub(crate) fn tokenize(&mut self, buffer: &Buffer, target: u32, max_lines: u32) -> u32 {
         match &mut self.backend {
             Backend::Lines(c) => c.tokenize_until(target, max_lines, |r| buffer.line(r)),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(c) => c.tokenize(buffer, max_lines),
         }
     }
 
@@ -289,6 +305,8 @@ impl HighlightCache {
     pub(crate) fn pending(&self) -> Option<u32> {
         match &self.backend {
             Backend::Lines(c) => c.pending(),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(c) => c.pending(),
         }
     }
 
@@ -296,6 +314,8 @@ impl HighlightCache {
     pub(crate) fn line_spans(&self, row: u32) -> Option<&[HighlightSpan]> {
         match &self.backend {
             Backend::Lines(c) => c.line_spans(row),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(c) => c.line_spans(row),
         }
     }
 
@@ -303,6 +323,8 @@ impl HighlightCache {
     pub(crate) fn set_window(&mut self, rows: Range<u32>) {
         match &mut self.backend {
             Backend::Lines(c) => c.set_window(rows),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(c) => c.set_window(rows),
         }
     }
 
@@ -310,6 +332,8 @@ impl HighlightCache {
     pub(crate) fn window_aim(&self) -> Range<u32> {
         match &self.backend {
             Backend::Lines(c) => c.window_aim(),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(c) => c.window_aim(),
         }
     }
 
@@ -317,6 +341,8 @@ impl HighlightCache {
     pub(crate) fn set_theme(&mut self, theme: TokenTheme) {
         match &mut self.backend {
             Backend::Lines(c) => c.set_theme(theme),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(c) => c.set_theme(&theme),
         }
     }
 
@@ -324,6 +350,8 @@ impl HighlightCache {
     pub(crate) fn line_count(&self) -> u32 {
         match &self.backend {
             Backend::Lines(c) => c.line_count(),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(c) => c.line_count(),
         }
     }
 
@@ -331,6 +359,8 @@ impl HighlightCache {
     pub(crate) fn engine(&self) -> Option<HighlightEngine> {
         match &self.backend {
             Backend::Lines(c) => Some(c.engine()),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(_) => None,
         }
     }
 
@@ -342,6 +372,8 @@ impl HighlightCache {
                 c.absorb(seg, verified);
                 true
             }
+            #[cfg(feature = "tree-sitter")]
+            Backend::Tree(_) => false,
         }
     }
 }

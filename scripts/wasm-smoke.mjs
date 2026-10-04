@@ -1,6 +1,7 @@
 // Runs scrive-core's `wasm_smoke` example under node. Instantiating with an
 // empty import object fails if any libc (or other) import leaked into the
-// module, and `run` returns non-zero on success.
+// module. `run` highlights an edited document through `Document` and returns
+// its span count, which is non-zero on success.
 //
 //   node scripts/wasm-smoke.mjs <path to wasm_smoke.wasm>
 import { readFileSync } from "node:fs";
@@ -20,7 +21,7 @@ if (imports.length > 0) {
 const { exports } = new WebAssembly.Instance(module, {});
 const count = exports.run();
 if (count === 0) {
-  console.error("wasm smoke test failed: run() returned 0");
+  console.error("wasm smoke test failed: run() highlighted no spans");
   process.exit(1);
 }
-console.log(`wasm smoke test passed: run() = ${count}`);
+console.log(`wasm smoke test passed: ${count} highlight spans`);

@@ -63,6 +63,22 @@ impl DirtyRanges {
         self.0.insert(i, row..row + 1);
     }
 
+    /// Mark rows `[range)` dirty, merging with the runs it touches.
+    #[cfg(feature = "tree-sitter")]
+    pub(crate) fn insert_range(&mut self, range: Range<u32>) {
+        if range.start >= range.end {
+            return;
+        }
+        let lo = self.0.partition_point(|r| r.end < range.start);
+        let hi = self.0.partition_point(|r| r.start <= range.end);
+        let merged = if lo < hi {
+            self.0[lo].start.min(range.start)..self.0[hi - 1].end.max(range.end)
+        } else {
+            range
+        };
+        self.0.splice(lo..hi, [merged]);
+    }
+
     /// The commit splice: `spans` is the per-edit list of pre-edit line
     /// spans `(pre_start, old_lines, new_lines)`, ascending and disjoint. Shifts
     /// existing runs through the combined splices and marks ONLY each edit's own
@@ -188,5 +204,23 @@ mod tests {
         assert_eq!(d.first(), Some(2));
         d.remove_first(2);
         assert_eq!(d.0, vec![3..7]);
+    }
+
+    #[cfg(feature = "tree-sitter")]
+    #[test]
+    fn insert_range_merges_the_runs_it_touches() {
+        let mut d = DirtyRanges::default();
+        d.insert_range(5..5);
+        assert_eq!(d.0, Vec::<Range<u32>>::new());
+        d.insert_range(10..12);
+        d.insert_range(2..4);
+        d.insert_range(20..25);
+        assert_eq!(d.0, vec![2..4, 10..12, 20..25]);
+        d.insert_range(4..10); // touches both neighbours
+        assert_eq!(d.0, vec![2..12, 20..25]);
+        d.insert_range(14..16);
+        assert_eq!(d.0, vec![2..12, 14..16, 20..25]);
+        d.insert_range(0..30);
+        assert_eq!(d.0, vec![0..30]);
     }
 }
