@@ -51,10 +51,12 @@ use scrive_core::{
 };
 
 use crate::editor::{Action, Editor, Wake};
-use crate::highlight_pool::{HighlightPool, PARALLEL_MIN_BYTES};
+#[cfg(feature = "syntect")]
+use crate::highlight_pool::HighlightPool;
 
 #[cfg(feature = "lsp")]
 mod lsp;
+mod pool;
 
 /// The async request types a host pulls from a [`CodeEditor`]. They live in
 /// scrive-core so a language-service client can use them without iced.
@@ -293,6 +295,7 @@ pub struct CodeEditor {
     /// The off-thread parallel highlight sweep — `Some` for a large document
     /// (see [`uses_pool`](Self::uses_pool)), `None` otherwise (the synchronous path). Owned
     /// here so a batteries-included host gets large-document highlighting for free.
+    #[cfg(feature = "syntect")]
     hl_pool: Option<HighlightPool>,
     /// The language-server client the document is registered with. At most one, because the
     /// change log and the request slots each have a single consumer.
@@ -435,6 +438,7 @@ impl CodeEditor {
             tickets: ticket::Counter::new(),
             awaiting: Awaiting::default(),
             items_caret: 0,
+            #[cfg(feature = "syntect")]
             hl_pool: None,
             #[cfg(feature = "lsp")]
             lsp_client: None,
@@ -443,9 +447,9 @@ impl CodeEditor {
 
     // ── builder (policy; every knob defaulted) ──────────────────────────────
 
-    /// Attach a grammar, enabling syntax highlighting: a
-    /// [`SyntaxDef`](scrive_core::SyntaxDef), or a `scrive_core::TreeSitterDef`
-    /// under the `tree-sitter` feature. Uses the theme set by
+    /// Attach a grammar, enabling syntax highlighting: a `scrive_core::SyntaxDef`
+    /// under the `syntect` feature (on by default), or a
+    /// `scrive_core::TreeSitterDef` under the `tree-sitter` feature. Uses the theme set by
     /// [`theme`](CodeEditor::theme) if one was staged, else the bundled default.
     /// Order-independent with `theme`. Seeds the visible rows' colors (the
     /// whole document before any viewport report) immediately, so the first
@@ -927,19 +931,7 @@ impl CodeEditor {
                 let left_window = self.inlays.window.as_ref().is_some_and(|w| rows.start < w.start || rows.end > w.end);
                 self.viewport = rows.clone();
                 self.doc.set_highlight_window(rows.clone());
-                if self.uses_pool() {
-                    // Large document: the off-thread sweep owns dirt-clearing; the
-                    // viewport is painted synchronously now and verified in place.
-                    // Do NOT run the whole-doc synchronous walk (it would race the
-                    // pool). Create the pool on first sight.
-                    if let Some(mut pool) = self.hl_pool.take() {
-                        pool.reaim(&mut self.doc, rows);
-                        self.hl_pool = Some(pool);
-                    } else if let Some(pool) = HighlightPool::new(&self.doc, rows.clone()) {
-                        pool.speculate(&mut self.doc, rows);
-                        self.hl_pool = Some(pool);
-                    }
-                } else {
+                if !self.pool_viewport(rows.clone()) {
                     self.doc.tokenize_highlight(rows.end);
                 }
                 self.hover = None; // scroll closes the hover…
@@ -1147,38 +1139,9 @@ impl CodeEditor {
             // The subscription drops itself once the frontier is clean, so this
             // stops firing on an idle document.
             Event::HighlightSweep => {
-                if self.uses_pool() {
-                    if let Some(mut pool) = self.hl_pool.take() {
-                        if pool.rev != self.doc.revision() {
-                            // An edit landed: re-sweep from a fresh snapshot AND
-                            // repaint the viewport now (the verified prefix in the
-                            // cache survives).
-                            pool.restart(&mut self.doc, self.viewport.clone());
-                        } else {
-                            // Drain finished jobs and advance the verified chain.
-                            pool.poll(&mut self.doc);
-                        }
-                        let idle = !pool.active;
-                        self.hl_pool = Some(pool);
-                        // Once the sweep is idle, the synchronous phase-2 path
-                        // refills any window rows the sweep evicted (dirt is
-                        // cleared, so this is a cheap window refill, not O(doc)).
-                        if idle {
-                            let n = self.doc.buffer().line_count();
-                            self.doc.tokenize_highlight(n);
-                        }
-                    } else if let Some(pool) = HighlightPool::new(&self.doc, self.viewport.clone()) {
-                        // Large but no pool yet (grew past the threshold): create
-                        // it rather than tokenize the whole document synchronously.
-                        self.hl_pool = Some(pool);
-                    }
-                } else {
-                    // Small document (or shrunk below the threshold), or a grammar
-                    // with no pool engine (tree-sitter): deactivate any lingering
-                    // pool and drive the synchronous path.
-                    if let Some(pool) = &mut self.hl_pool {
-                        pool.active = false;
-                    }
+                // A small document, or a grammar with no pool engine
+                // (tree-sitter), drives the synchronous path.
+                if !self.pool_sweep() {
                     let n = self.doc.buffer().line_count();
                     self.doc.tokenize_highlight(n);
                 }
@@ -1555,8 +1518,7 @@ impl CodeEditor {
     /// convergence it returns [`Subscription::none`], so an idle document does
     /// zero per-frame work. Map it: `self.editor.subscription().map(Message::Editor)`.
     pub fn subscription(&self) -> Subscription<Event> {
-        let sweeping = self.doc.highlight_frontier().is_some()
-            || self.hl_pool.as_ref().is_some_and(|p| p.active);
+        let sweeping = self.doc.highlight_frontier().is_some() || self.pool_active();
         let sweep = if sweeping {
             iced::window::frames().map(|_| Event::HighlightSweep)
         } else {
@@ -1590,16 +1552,6 @@ impl CodeEditor {
 
     // ── internals ───────────────────────────────────────────────────────────
 
-    /// Whether the document is large enough for the off-thread highlight pool
-    /// (never on wasm32, which has no threads) and its grammar can run there.
-    /// A tree-sitter document has no pool engine (`HighlightPool::new` builds
-    /// nothing for it), so at any size it highlights on the UI thread, one
-    /// budgeted call per frame.
-    fn uses_pool(&self) -> bool {
-        PARALLEL_MIN_BYTES.is_some_and(|min| self.doc.buffer().len() >= min)
-            && self.doc.highlight_engine().is_some()
-    }
-
     /// Colour the document at load (or after a grammar swap / buffer load): the
     /// large-document parallel sweep for a big buffer, else a synchronous seed
     /// aimed at the reported viewport, or at the whole buffer before the widget
@@ -1616,10 +1568,7 @@ impl CodeEditor {
     /// may only start the parse; the frontier stays dirty and
     /// [`HighlightSweep`](Event::HighlightSweep) resumes it each frame.
     fn seed_highlight(&mut self) {
-        if self.uses_pool() {
-            self.hl_pool = HighlightPool::new(&self.doc, self.viewport.clone());
-        } else {
-            self.hl_pool = None;
+        if !self.pool_seed() {
             let n = self.doc.buffer().line_count();
             let aim = if self.viewport.is_empty() || self.viewport.start >= n { 0..n } else { self.viewport.clone() };
             self.doc.set_highlight_window(aim);
@@ -2444,10 +2393,12 @@ fn find_chord(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "syntect")]
     use scrive_core::SyntaxDef;
 
     // A minimal grammar: one keyword-scoped rule over word runs. Enough to drive
     // the highlight cache without pulling the example's Rust grammar into the lib.
+    #[cfg(feature = "syntect")]
     const GRAMMAR: &str = "%YAML 1.2\n---\nname: T\nscope: source.t\ncontexts:\n  main:\n    - match: '\\w+'\n      scope: keyword.t\n";
 
     /// The cold-load fix, as a fails-first regression: attaching a grammar
@@ -2456,6 +2407,7 @@ mod tests {
     /// in [`CodeEditor::language`] the frontier stays fully dirty after
     /// `set_syntax` and this assertion fails — which was exactly the
     /// "no highlighting until one scroll tick" bug.
+    #[cfg(feature = "syntect")]
     #[test]
     fn language_tokenizes_at_load_without_a_viewport_report() {
         let grammar = SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
@@ -2595,6 +2547,7 @@ mod tests {
     /// The blessed whole-buffer swap replaces the text AND re-tokenizes the
     /// visible document at load — with no `ViewportChanged`. Fails-first against a
     /// `load` that swapped the buffer but left the (grammar-swapped) cache dirty.
+    #[cfg(feature = "syntect")]
     #[test]
     fn load_swaps_the_buffer_and_retokenizes() {
         let grammar = SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
@@ -2634,10 +2587,13 @@ mod tests {
     fn a_large_tree_sitter_document_converges_through_the_sweep_without_a_pool() {
         let big = "fn f() {}\n".repeat(230_000); // ~2.3 MB, over PARALLEL_MIN_BYTES
         let mut ed = CodeEditor::new(big).language(rust_tree_sitter());
-        if let Some(min) = PARALLEL_MIN_BYTES {
-            assert!(ed.document().buffer().len() >= min, "the document crosses the pool threshold");
+        #[cfg(feature = "syntect")]
+        {
+            if let Some(min) = crate::highlight_pool::PARALLEL_MIN_BYTES {
+                assert!(ed.document().buffer().len() >= min, "the document crosses the pool threshold");
+            }
+            assert!(ed.hl_pool.is_none(), "no pool for a grammar without an engine");
         }
-        assert!(ed.hl_pool.is_none(), "no pool for a grammar without an engine");
         assert!(ed.document().highlight_frontier().is_some(), "the first parse spans several calls");
 
         let mut sweeps = 0;
@@ -2646,6 +2602,7 @@ mod tests {
             let _ = ed.update(Event::HighlightSweep, Instant::now());
             sweeps += 1;
         }
+        #[cfg(feature = "syntect")]
         assert!(ed.hl_pool.is_none(), "the sweep never started a pool");
         assert!(ed.document().highlight_line_spans(0).is_some_and(|spans| !spans.is_empty()));
     }
@@ -2654,6 +2611,7 @@ mod tests {
     /// 100,000..100,036, sweeps to convergence, and checks those rows are
     /// coloured. No fresh viewport report follows a load, so the seed must aim
     /// at the one already reported.
+    #[cfg(any(feature = "syntect", feature = "tree-sitter"))]
     fn assert_load_colors_the_reported_viewport(grammar: Grammar) {
         let mut ed = CodeEditor::new("old\n");
         let _ = ed.update(Event::Editor(Action::ViewportChanged(100_000..100_036)), Instant::now());
@@ -2670,6 +2628,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn load_colors_the_reported_viewport_with_syntect() {
         assert_load_colors_the_reported_viewport(SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses").into());
@@ -2684,7 +2643,7 @@ mod tests {
     /// `load` with a tree-sitter grammar swaps the backend out from under a
     /// syntect one and re-seeds it.
     #[test]
-    #[cfg(feature = "tree-sitter")]
+    #[cfg(all(feature = "syntect", feature = "tree-sitter"))]
     fn load_swaps_a_syntect_grammar_for_tree_sitter() {
         let grammar = SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
         let mut ed = CodeEditor::new("old\n").language(grammar);
@@ -2699,6 +2658,7 @@ mod tests {
     /// The `bracket_lexing` builder wires through to the document's bracket
     /// matching: a bracket inside a string is not counted, so it is not coloured,
     /// folded, or indent-guided.
+    #[cfg(feature = "syntect")]
     #[test]
     fn bracket_lexing_skips_in_string_brackets() {
         let grammar = SyntaxDef::from_sublime_syntax(GRAMMAR).expect("grammar parses");
@@ -2816,6 +2776,7 @@ mod tests {
     /// A large document (≥ the parallel threshold) spins up the off-thread pool
     /// at load; a small one keeps the synchronous path. This is what stops a huge
     /// buffer from blocking the UI thread tokenizing synchronously.
+    #[cfg(feature = "syntect")]
     #[test]
     #[cfg(not(target_arch = "wasm32"))] // no pool without threads
     fn large_document_uses_the_parallel_pool() {

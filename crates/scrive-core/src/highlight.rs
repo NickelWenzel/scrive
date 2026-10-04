@@ -1,47 +1,56 @@
-//! Syntax highlighting — a GUI-free public surface over a private syntect
-//! engine. **Syntect is named only inside this module**; nothing from it
-//! crosses the `pub` line, so the GUI crate never has to pin syntect's version.
+//! Syntax highlighting — a GUI-free public surface over private engines, one
+//! per cargo feature. **Backend types are named only inside this module**;
+//! none crosses the `pub` line (tree-sitter's `LanguageFn` handoff aside), so
+//! the GUI crate never has to pin a backend's version.
 //!
-//! The core is **language-agnostic**: the grammar is an app-supplied
-//! `.sublime-syntax`, injected as text (`SyntaxDef::from_sublime_syntax`), and
-//! the theme an app-supplied `.tmTheme` (`TokenTheme::from_tm_theme`) or
-//! capture styles built in code (`TokenTheme::builder`); scrive-core ships
-//! neither.
+//! The core is **language-agnostic**: the app supplies the grammar, as an
+//! injected `.sublime-syntax` (`SyntaxDef::from_sublime_syntax`, feature
+//! `syntect`, on by default) or a tree-sitter grammar and highlights query
+//! (`TreeSitterDef::new`, feature `tree-sitter`), and the theme, as a
+//! `.tmTheme` (`TokenTheme::from_tm_theme`, feature `syntect`) or capture
+//! styles built in code ([`TokenTheme::builder`]); scrive-core ships neither.
+//! With neither feature a [`Grammar`] can't be built, and a
+//! [`Document`](crate::Document) never highlights.
 //!
-//! # Two entry points
+//! # The incremental engine
 //!
-//! [`Highlighter::highlight`] tokenizes the whole document top-to-bottom on each
-//! call (state carried line to line) — correct but O(lines), used as the
-//! convergence oracle in tests. Production reads go through the incremental
-//! engine a [`Document`](crate::Document) owns once
-//! [`set_syntax`](crate::Document::set_syntax) attaches a [`Grammar`]: geometric
-//! shift on every edit, lazy end-state convergence
-//! ([`tokenize_highlight`](crate::Document::tokenize_highlight)), and full
-//! invalidation on theme change ([`set_theme`](crate::Document::set_theme)).
+//! Production reads go through the incremental engine a
+//! [`Document`](crate::Document) owns once
+//! [`set_syntax`](crate::Document::set_syntax) attaches a [`Grammar`]: an
+//! edit shifts it in place, it converges lazily
+//! ([`tokenize_highlight`](crate::Document::tokenize_highlight)), and a theme
+//! change invalidates every line ([`set_theme`](crate::Document::set_theme)).
 //! Untokenized lines return `None` and render in the default style — never an
 //! error or a stall. Each drive tokenizes at most
 //! [`HIGHLIGHT_MAX_LINES_PER_CALL`] lines, so no single call can stall a frame
-//! however far a cascade wants to run.
+//! however far a cascade wants to run. Under syntect, `Highlighter::highlight`
+//! tokenizes a whole document top-to-bottom on each call — correct but
+//! O(lines), used as the convergence oracle in tests.
 //!
 //! Retention is **virtualized** so RAM does not grow with the idle sweep:
-//! spans + per-line states live only in a window around the viewport
-//! ([`set_highlight_window`](crate::Document::set_highlight_window)); everywhere
-//! else, sparse checkpoints ([`HIGHLIGHT_CHECKPOINT_STRIDE`]) keep every row
-//! re-derivable. A fully swept document holds `O(window + lines/stride)`, not
-//! `O(lines)`.
+//! spans live only in a window around the viewport
+//! ([`set_highlight_window`](crate::Document::set_highlight_window)). Outside
+//! it, the syntect backend keeps sparse checkpoints
+//! (`HIGHLIGHT_CHECKPOINT_STRIDE`) so every row stays re-derivable, and the
+//! tree-sitter backend keeps its parse tree. A fully swept document holds
+//! `O(window + lines/stride)` line states, not `O(lines)`.
 
 use core::ops::Range;
 
 use crate::buffer::Buffer;
 use crate::transaction::Committed;
 
+#[cfg(feature = "syntect")]
 use syntect::highlighting::{FontStyle, HighlightState, Highlighter as SyntectHighlighter, Style};
+#[cfg(feature = "syntect")]
 use syntect::parsing::{ParseState, ScopeStack, SyntaxDefinition, SyntaxReference, SyntaxSet, SyntaxSetBuilder};
 
 #[cfg(feature = "tree-sitter")]
 mod capture_paint;
+#[cfg(any(feature = "syntect", feature = "tree-sitter"))]
 mod dirty_ranges;
 mod grammar;
+#[cfg(feature = "syntect")]
 mod line_state;
 #[cfg(feature = "tree-sitter")]
 mod parse_tree;
@@ -53,10 +62,14 @@ pub mod token_theme;
 mod tree_sitter_def;
 mod vocabulary;
 
+#[cfg(feature = "syntect")]
 use line_state::{tokenize_line, LineState};
 pub use grammar::Grammar;
+#[cfg(feature = "syntect")]
 pub use line_state::{tokenize_segment, HighlightEngine, SegmentBoundary, SegmentStart, SegmentTokens};
-pub use token_theme::{ThemeError, TokenTheme};
+pub use token_theme::TokenTheme;
+#[cfg(feature = "syntect")]
+pub use token_theme::ThemeError;
 #[cfg(feature = "tree-sitter")]
 pub use tree_sitter_def::{QueryErrorKind, TreeSitterDef, TreeSitterError};
 
@@ -75,7 +88,7 @@ pub struct Rgba {
 
 /// Resolved inline style for one run — the theme is consulted at tokenize time
 /// (syntect's highlight iterator already yields resolved styles), so nothing
-/// downstream re-touches syntect.
+/// downstream re-touches the backend.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct SpanStyle {
     /// Foreground color.
@@ -98,17 +111,20 @@ pub struct HighlightSpan {
 }
 
 /// Failed to parse an injected `.sublime-syntax` grammar.
+#[cfg(feature = "syntect")]
 #[derive(Debug, thiserror::Error)]
 #[error("invalid .sublime-syntax grammar: {0}")]
 pub struct SyntaxError(String);
 
 /// A parsed grammar. The app supplies a validated `.sublime-syntax` definition;
 /// scrive-core ships no grammar of its own and stays language-agnostic.
+#[cfg(feature = "syntect")]
 pub struct SyntaxDef {
     set: SyntaxSet,
     name: String,
 }
 
+#[cfg(feature = "syntect")]
 impl SyntaxDef {
     /// Parse an injected `.sublime-syntax` grammar (LF-only lines, no trailing
     /// newline in the regexes).
@@ -132,11 +148,13 @@ impl SyntaxDef {
 
 /// Convert a syntect `(Style, byte range)` to a public [`HighlightSpan`] — the
 /// one place a resolved style crosses out of syntect.
+#[cfg(feature = "syntect")]
 fn span_from(style: Style, range: Range<usize>) -> HighlightSpan {
     HighlightSpan { range: range.start as u32..range.end as u32, style: style_from(style) }
 }
 
 /// The public [`SpanStyle`] of a resolved syntect `Style`.
+#[cfg(feature = "syntect")]
 fn style_from(style: Style) -> SpanStyle {
     SpanStyle {
         fg: Rgba {
@@ -152,11 +170,13 @@ fn style_from(style: Style) -> SpanStyle {
 
 /// A whole-document highlighter over a grammar + theme. Owns both; syntect stays
 /// private behind it.
+#[cfg(feature = "syntect")]
 pub struct Highlighter {
     syntax: SyntaxDef,
     theme: TokenTheme,
 }
 
+#[cfg(feature = "syntect")]
 impl Highlighter {
     /// A highlighter over an injected grammar and theme.
     #[must_use]
@@ -206,6 +226,7 @@ pub const HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL: u32 = 100;
 /// resume point), so any row's start state is re-derivable by tokenizing at
 /// most a stride forward from the checkpoint above it. Memory per fully-swept
 /// document: `lines / stride` states instead of `lines`.
+#[cfg(feature = "syntect")]
 pub const HIGHLIGHT_CHECKPOINT_STRIDE: u32 = 256;
 
 /// Retention slack, in rows, kept on EACH side of the window handed to
@@ -248,9 +269,10 @@ pub fn padded_highlight_window(viewport: Range<u32>, n_lines: u32) -> Range<u32>
 
 /// The document-owned incremental highlight cache: one facade over the
 /// backend its [`Grammar`] selects, so `Document` drives every backend the same
-/// way. Each method keeps the contract of the backend's own (see
-/// [`line_state::Cache`] and, with the `tree-sitter` feature,
-/// `parse_tree::Cache`).
+/// way. Each method keeps the contract of the backend's own (`line_state::Cache`
+/// with the `syntect` feature, `parse_tree::Cache` with `tree-sitter`). With
+/// neither feature `Backend` is empty and no cache can exist, which is what
+/// lets `Document` keep its highlight methods without a cfg.
 #[derive(Debug)]
 pub(crate) struct HighlightCache {
     backend: Backend,
@@ -258,25 +280,32 @@ pub(crate) struct HighlightCache {
 
 #[derive(Debug)]
 enum Backend {
+    #[cfg(feature = "syntect")]
     Lines(line_state::Cache),
     #[cfg(feature = "tree-sitter")]
     Tree(parse_tree::Cache),
 }
 
+// The matches below are on the place `self.backend`, not on `&self.backend`:
+// the compiler accepts an empty match only on the former.
+#[cfg_attr(
+    not(any(feature = "syntect", feature = "tree-sitter")),
+    expect(unused_variables, reason = "no backend takes the arguments")
+)]
 impl HighlightCache {
     /// A cache sized to `buffer`, every line dirty, its window at the
     /// document top.
     pub(crate) fn new(grammar: Grammar, theme: TokenTheme, buffer: &Buffer) -> Self {
-        let backend = match grammar.0 {
+        match grammar.0 {
+            #[cfg(feature = "syntect")]
             grammar::Inner::Syntect(def) => {
-                Backend::Lines(line_state::Cache::new(def, theme, buffer.line_count()))
+                Self { backend: Backend::Lines(line_state::Cache::new(def, theme, buffer.line_count())) }
             }
             #[cfg(feature = "tree-sitter")]
             grammar::Inner::TreeSitter(def) => {
-                Backend::Tree(parse_tree::Cache::new(def, &theme, buffer.line_count()))
+                Self { backend: Backend::Tree(parse_tree::Cache::new(def, &theme, buffer.line_count())) }
             }
-        };
-        Self { backend }
+        }
     }
 
     /// Shift the cache through `committed`, whose edits `buffer` already holds.
@@ -293,82 +322,95 @@ impl HighlightCache {
             i64::from(buffer.line_count()) - i64::from(self.line_count()),
             "per-edit line deltas must sum to the buffer's line-count change",
         );
-        match &mut self.backend {
-            Backend::Lines(c) => c.on_commit_patch(&spans),
+        match self.backend {
+            #[cfg(feature = "syntect")]
+            Backend::Lines(ref mut c) => c.on_commit_patch(&spans),
             #[cfg(feature = "tree-sitter")]
-            Backend::Tree(c) => c.on_commit(buffer, committed, &spans),
+            Backend::Tree(ref mut c) => c.on_commit(buffer, committed, &spans),
         }
     }
 
     /// Tokenize toward row `target` (inclusive), at most `max_lines` lines;
     /// returns how many were tokenized. The tree-sitter backend works only
     /// within the window and ignores `target`.
+    #[cfg_attr(
+        not(feature = "syntect"),
+        expect(unused_variables, reason = "only the syntect backend walks toward `target`")
+    )]
     pub(crate) fn tokenize(&mut self, buffer: &Buffer, target: u32, max_lines: u32) -> u32 {
-        match &mut self.backend {
-            Backend::Lines(c) => c.tokenize_until(target, max_lines, |r| buffer.line(r)),
+        match self.backend {
+            #[cfg(feature = "syntect")]
+            Backend::Lines(ref mut c) => c.tokenize_until(target, max_lines, |r| buffer.line(r)),
             #[cfg(feature = "tree-sitter")]
-            Backend::Tree(c) => c.tokenize(buffer, max_lines),
+            Backend::Tree(ref mut c) => c.tokenize(buffer, max_lines),
         }
     }
 
     /// The next row [`HighlightCache::tokenize`] would work on; `None` when idle.
     pub(crate) fn pending(&self) -> Option<u32> {
-        match &self.backend {
-            Backend::Lines(c) => c.pending(),
+        match self.backend {
+            #[cfg(feature = "syntect")]
+            Backend::Lines(ref c) => c.pending(),
             #[cfg(feature = "tree-sitter")]
-            Backend::Tree(c) => c.pending(),
+            Backend::Tree(ref c) => c.pending(),
         }
     }
 
     /// The spans of `row`, or `None` if it isn't tokenized or retained.
     pub(crate) fn line_spans(&self, row: u32) -> Option<&[HighlightSpan]> {
-        match &self.backend {
-            Backend::Lines(c) => c.line_spans(row),
+        match self.backend {
+            #[cfg(feature = "syntect")]
+            Backend::Lines(ref c) => c.line_spans(row),
             #[cfg(feature = "tree-sitter")]
-            Backend::Tree(c) => c.line_spans(row),
+            Backend::Tree(ref c) => c.line_spans(row),
         }
     }
 
     /// Aim the retention window at the viewport `rows`.
     pub(crate) fn set_window(&mut self, rows: Range<u32>) {
-        match &mut self.backend {
-            Backend::Lines(c) => c.set_window(rows),
+        match self.backend {
+            #[cfg(feature = "syntect")]
+            Backend::Lines(ref mut c) => c.set_window(rows),
             #[cfg(feature = "tree-sitter")]
-            Backend::Tree(c) => c.set_window(rows),
+            Backend::Tree(ref mut c) => c.set_window(rows),
         }
     }
 
     /// The rows last handed to [`HighlightCache::set_window`].
     pub(crate) fn window_aim(&self) -> Range<u32> {
-        match &self.backend {
-            Backend::Lines(c) => c.window_aim(),
+        match self.backend {
+            #[cfg(feature = "syntect")]
+            Backend::Lines(ref c) => c.window_aim(),
             #[cfg(feature = "tree-sitter")]
-            Backend::Tree(c) => c.window_aim(),
+            Backend::Tree(ref c) => c.window_aim(),
         }
     }
 
     /// Swap the theme; every line repaints on the following tokenizes.
     pub(crate) fn set_theme(&mut self, theme: TokenTheme) {
-        match &mut self.backend {
-            Backend::Lines(c) => c.set_theme(theme),
+        match self.backend {
+            #[cfg(feature = "syntect")]
+            Backend::Lines(ref mut c) => c.set_theme(theme),
             #[cfg(feature = "tree-sitter")]
-            Backend::Tree(c) => c.set_theme(&theme),
+            Backend::Tree(ref mut c) => c.set_theme(&theme),
         }
     }
 
     /// The line count the cache is sized for.
     pub(crate) fn line_count(&self) -> u32 {
-        match &self.backend {
-            Backend::Lines(c) => c.line_count(),
+        match self.backend {
+            #[cfg(feature = "syntect")]
+            Backend::Lines(ref c) => c.line_count(),
             #[cfg(feature = "tree-sitter")]
-            Backend::Tree(c) => c.line_count(),
+            Backend::Tree(ref c) => c.line_count(),
         }
     }
 
     /// A handle for off-thread segment tokenization, if the backend has one.
+    #[cfg(feature = "syntect")]
     pub(crate) fn engine(&self) -> Option<HighlightEngine> {
-        match &self.backend {
-            Backend::Lines(c) => Some(c.engine()),
+        match self.backend {
+            Backend::Lines(ref c) => Some(c.engine()),
             #[cfg(feature = "tree-sitter")]
             Backend::Tree(_) => None,
         }
@@ -376,9 +418,10 @@ impl HighlightCache {
 
     /// Ingest an off-thread segment computed at the current revision; `false`
     /// if the backend takes none.
+    #[cfg(feature = "syntect")]
     pub(crate) fn absorb(&mut self, seg: SegmentTokens, verified: bool) -> bool {
-        match &mut self.backend {
-            Backend::Lines(c) => {
+        match self.backend {
+            Backend::Lines(ref mut c) => {
                 c.absorb(seg, verified);
                 true
             }
@@ -388,7 +431,7 @@ impl HighlightCache {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "syntect"))]
 mod tests {
     use super::*;
 

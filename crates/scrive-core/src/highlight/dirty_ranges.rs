@@ -16,6 +16,7 @@ impl DirtyRanges {
     /// Every row of an `n`-line document dirty (load / theme change) — ONE
     /// run covering the document (a `Vec` holding a single `Range` element,
     /// which is exactly the point of the range-run representation).
+    #[cfg(feature = "syntect")]
     pub(crate) fn all(n: u32) -> Self {
         Self((n > 0).then_some(0..n).into_iter().collect())
     }
@@ -27,6 +28,7 @@ impl DirtyRanges {
 
     /// Remove `row`, which MUST be the current first dirty row (the only
     /// consumption order `tokenize_until` uses). O(1) amortized.
+    #[cfg(feature = "syntect")]
     pub(crate) fn remove_first(&mut self, row: u32) {
         debug_assert_eq!(self.first(), Some(row), "consumption is front-only");
         let r = &mut self.0[0];
@@ -39,6 +41,7 @@ impl DirtyRanges {
     /// Mark one row dirty (the cascade step) — merging into a neighbouring
     /// run so the list stays disjoint and non-adjacent. O(log + shift), and
     /// the cascade inserts at/near the front in practice.
+    #[cfg(feature = "syntect")]
     pub(crate) fn insert(&mut self, row: u32) {
         let i = self.0.partition_point(|r| r.end < row);
         if i < self.0.len() {
@@ -138,7 +141,7 @@ impl DirtyRanges {
 
     /// Total dirty rows (sum of run lengths) — the invalidation size a commit
     /// scheduled, which the sweep must eventually walk.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "syntect"))]
     pub(crate) fn total_rows(&self) -> u32 {
         self.0.iter().map(|r| r.end - r.start).sum()
     }
@@ -174,7 +177,7 @@ impl DirtyRanges {
     }
 
     /// Number of disjoint runs — the canary probe.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "syntect"))]
     pub(crate) fn runs(&self) -> usize {
         self.0.len()
     }
@@ -184,6 +187,7 @@ impl DirtyRanges {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn dirty_ranges_shift_merge_unit() {
         let mut d = DirtyRanges::default();

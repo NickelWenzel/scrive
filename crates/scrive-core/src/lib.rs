@@ -73,12 +73,13 @@ pub use document::{Document, RevealMode};
 pub use find::{default_find_debounce, FindQuery, FindState, FIND_MATCH_CAP};
 pub use fold_map::{FoldMap, FoldSet, InlineFold, VisibleRow};
 pub use highlight::{
-    HIGHLIGHT_CHECKPOINT_STRIDE, HIGHLIGHT_MAX_LINES_PER_CALL, HIGHLIGHT_MAX_WINDOW_ROWS,
-    HIGHLIGHT_WINDOW_SLACK,
+    padded_highlight_window, Grammar, HighlightSpan, Rgba, SpanStyle, TokenTheme,
+    HIGHLIGHT_MAX_LINES_PER_CALL, HIGHLIGHT_MAX_WINDOW_ROWS, HIGHLIGHT_WINDOW_SLACK,
 };
+#[cfg(feature = "syntect")]
 pub use highlight::{
-    padded_highlight_window, tokenize_segment, Grammar, HighlightEngine, HighlightSpan, Highlighter,
-    Rgba, SegmentBoundary, SegmentStart, SegmentTokens, SpanStyle, SyntaxDef, TokenTheme,
+    tokenize_segment, HighlightEngine, Highlighter, SegmentBoundary, SegmentStart, SegmentTokens,
+    SyntaxDef, HIGHLIGHT_CHECKPOINT_STRIDE,
 };
 #[cfg(feature = "tree-sitter")]
 pub use highlight::{TreeSitterDef, HIGHLIGHT_MAX_PARSE_CHECKS_PER_CALL};

@@ -53,6 +53,7 @@ mod clipboard;
 pub mod code_editor;
 pub mod editor;
 mod geo;
+#[cfg(feature = "syntect")]
 mod highlight_pool;
 pub mod metrics;
 pub mod popup;
@@ -112,11 +113,64 @@ pub fn required_fonts() -> &'static [&'static [u8]] {
 ///
 /// The theme is compiled in, so parsing it cannot fail at runtime — a malformed
 /// asset is a packaging bug the crate's own tests catch, not a caller error.
-/// That is why this returns the theme directly rather than a `Result`.
+/// That is why this returns the theme directly rather than a `Result`. Without
+/// the `syntect` feature the same colors are built in code, as capture styles.
 #[must_use]
 pub fn scrive_dark_theme() -> scrive_core::TokenTheme {
-    scrive_core::TokenTheme::from_tm_theme(include_str!("../assets/scrive-dark.tmTheme"))
-        .expect("bundled Scrive Dark theme parses")
+    #[cfg(feature = "syntect")]
+    return scrive_core::TokenTheme::from_tm_theme(include_str!("../assets/scrive-dark.tmTheme"))
+        .expect("bundled Scrive Dark theme parses");
+    #[cfg(not(feature = "syntect"))]
+    scrive_dark_captures()
+}
+
+/// Scrive Dark as capture styles, for the build that can't parse the
+/// `.tmTheme`. A test keeps it equal to the asset.
+#[cfg(any(test, not(feature = "syntect")))]
+fn scrive_dark_captures() -> scrive_core::TokenTheme {
+    use scrive_core::{Rgba, SpanStyle};
+    const fn style(hex: u32, italic: bool) -> SpanStyle {
+        let fg = Rgba { r: (hex >> 16) as u8, g: (hex >> 8) as u8, b: hex as u8, a: 0xff };
+        SpanStyle { fg, bold: false, italic }
+    }
+    const COMMENT: SpanStyle = style(0x6A6F7A, true);
+    const KEYWORD: SpanStyle = style(0xEC6A88, false);
+    const TYPE: SpanStyle = style(0x4FB6C7, false);
+    const FUNCTION: SpanStyle = style(0xE0B658, false);
+    const STRING: SpanStyle = style(0xA3C76D, false);
+    const CONSTANT: SpanStyle = style(0xB08CE0, false);
+    const ATTRIBUTE: SpanStyle = style(0xC99668, false);
+    const PUNCTUATION: SpanStyle = style(0x9AA0AB, false);
+    // Every styled vocabulary capture, spelled out rather than left to prefix
+    // fallback, so the comparison with the asset covers each one.
+    const CAPTURES: &[(&str, SpanStyle)] = &[
+        ("attribute", ATTRIBUTE),
+        ("comment", COMMENT),
+        ("constant.builtin", CONSTANT),
+        ("constructor", FUNCTION),
+        ("escape", CONSTANT),
+        ("function", FUNCTION),
+        ("function.builtin", FUNCTION),
+        ("function.macro", FUNCTION),
+        ("function.method", FUNCTION),
+        ("keyword", KEYWORD),
+        ("number", CONSTANT),
+        ("operator", KEYWORD),
+        ("punctuation", PUNCTUATION),
+        ("punctuation.bracket", PUNCTUATION),
+        ("punctuation.delimiter", PUNCTUATION),
+        ("string", STRING),
+        ("string.escape", CONSTANT),
+        ("string.special", STRING),
+        ("type", TYPE),
+        ("type.builtin", TYPE),
+    ];
+    CAPTURES
+        .iter()
+        .fold(scrive_core::TokenTheme::builder().foreground(style(0xDFE1E6, false).fg), |b, &(capture, span)| {
+            b.capture(capture, span)
+        })
+        .build()
 }
 
 /// Codicon glyph codepoints scrive draws. Names and values are from the codicon
@@ -161,5 +215,16 @@ mod tests {
     #[test]
     fn bundled_scrive_dark_theme_parses() {
         let _ = super::scrive_dark_theme();
+    }
+
+    #[cfg(feature = "syntect")]
+    #[test]
+    fn scrive_dark_captures_match_the_tm_theme() {
+        let asset = super::scrive_dark_theme();
+        let built = super::scrive_dark_captures();
+        for capture in scrive_core::TokenTheme::vocabulary() {
+            assert_eq!(built.resolve(capture), asset.resolve(capture), "{capture}");
+        }
+        assert_eq!(built.foreground(), asset.foreground());
     }
 }

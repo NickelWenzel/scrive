@@ -2,19 +2,26 @@
 //! reads its `Theme`, and tree-sitter captures resolve through its capture
 //! rules.
 
+#[cfg(feature = "syntect")]
 use std::io::Cursor;
+#[cfg(feature = "syntect")]
 use std::str::FromStr;
 
+#[cfg(feature = "syntect")]
 use syntect::highlighting::{
     Color, FontStyle, Highlighter as SyntectHighlighter, ScopeSelectors, StyleModifier, Theme,
     ThemeItem, ThemeSet, ThemeSettings,
 };
+#[cfg(feature = "syntect")]
 use syntect::parsing::Scope;
 
 use super::vocabulary;
-use super::{style_from, Rgba, SpanStyle};
+#[cfg(feature = "syntect")]
+use super::style_from;
+use super::{Rgba, SpanStyle};
 
 /// Failed to parse a `.tmTheme`.
+#[cfg(feature = "syntect")]
 #[derive(Debug, thiserror::Error)]
 #[error("invalid .tmTheme: {0}")]
 pub struct ThemeError(String);
@@ -35,6 +42,7 @@ pub struct ThemeError(String);
 /// `variable.builtin` and `variable.parameter`.
 #[derive(Clone)]
 pub struct TokenTheme {
+    #[cfg(feature = "syntect")]
     theme: Theme,
     rules: Vec<Rule>,
     foreground: Option<Rgba>,
@@ -59,6 +67,7 @@ impl TokenTheme {
     /// written; tree-sitter captures in the standard vocabulary take the
     /// style the theme gives their TextMate scopes, and a capture the theme
     /// leaves at its default foreground stays plain text.
+    #[cfg(feature = "syntect")]
     pub fn from_tm_theme(s: &str) -> Result<Self, ThemeError> {
         let theme = ThemeSet::load_from_reader(&mut Cursor::new(s))
             .map_err(|e| ThemeError(e.to_string()))?;
@@ -81,19 +90,26 @@ impl TokenTheme {
         self.foreground
     }
 
+    /// The standard capture vocabulary listed on [`TokenTheme`], in that
+    /// order: the names a host's theme table should cover, and the ones
+    /// [`TokenTheme::builder`] carries over to syntect.
+    pub fn vocabulary() -> impl ExactSizeIterator<Item = &'static str> {
+        vocabulary::VOCABULARY.iter().map(|&(capture, _)| capture)
+    }
+
     /// The syntect theme the line-state backend highlights with.
+    #[cfg(feature = "syntect")]
     pub(super) fn syntect(&self) -> &Theme {
         &self.theme
     }
 
-    /// The style for a tree-sitter capture name: its own rule, else the rule
-    /// of its longest dotted prefix. `none` and names starting with `_` are
-    /// never styled, following the tree-sitter highlight query convention.
-    #[cfg_attr(
-        not(any(test, feature = "tree-sitter")),
-        expect(dead_code, reason = "the tree-sitter backend is the caller")
-    )]
-    pub(crate) fn resolve(&self, capture: &str) -> Option<SpanStyle> {
+    /// The style a tree-sitter capture name gets: its own rule, else the rule
+    /// of its longest dotted prefix, else `None` (plain text). `none` and
+    /// names starting with `_` are never styled, following the tree-sitter
+    /// highlight query convention. For comparing themes, or showing a
+    /// capture's color outside the editor.
+    #[must_use]
+    pub fn resolve(&self, capture: &str) -> Option<SpanStyle> {
         if capture == "none" || capture.starts_with('_') {
             return None;
         }
@@ -127,7 +143,7 @@ impl Builder {
     /// one wins, whatever the call order. Across capture families the two
     /// backends can still differ: `keyword` colors syntect's
     /// `keyword.operator`, while tree-sitter's `@operator` stays plain until
-    /// `operator` is styled. A theme from [`TokenTheme::from_tm_theme`]
+    /// `operator` is styled. A theme from `TokenTheme::from_tm_theme`
     /// doesn't have this gap, since its capture rules are derived from the
     /// same scopes syntect matches.
     #[must_use]
@@ -143,6 +159,18 @@ impl Builder {
     /// Finish the theme.
     #[must_use]
     pub fn build(self) -> TokenTheme {
+        TokenTheme {
+            #[cfg(feature = "syntect")]
+            theme: self.syntect_theme(),
+            rules: self.rules,
+            foreground: self.foreground,
+        }
+    }
+
+    /// The syntect theme of the rules in the vocabulary: each styles its
+    /// capture's scopes.
+    #[cfg(feature = "syntect")]
+    fn syntect_theme(&self) -> Theme {
         // Syntect keeps the first of two equally specific selectors, so the
         // more dotted capture goes first.
         let mut by_depth: Vec<&Rule> = self.rules.iter().collect();
@@ -156,20 +184,20 @@ impl Builder {
                 Some(ThemeItem { scope: selectors, style: style_modifier(rule.style) })
             })
             .collect();
-        let theme = Theme {
+        Theme {
             settings: ThemeSettings {
                 foreground: self.foreground.map(color),
                 ..ThemeSettings::default()
             },
             scopes,
             ..Theme::default()
-        };
-        TokenTheme { theme, rules: self.rules, foreground: self.foreground }
+        }
     }
 }
 
 /// One rule per vocabulary capture whose first representative scope with a
 /// non-default style sets it.
+#[cfg(feature = "syntect")]
 fn derive_rules(theme: &Theme) -> Vec<Rule> {
     let syntect = SyntectHighlighter::new(theme);
     let plain = syntect.get_default();
@@ -189,6 +217,7 @@ fn derive_rules(theme: &Theme) -> Vec<Rule> {
 
 /// A rule's full style, so a capture that is neither bold nor italic also
 /// clears a font style an enclosing scope set, the way a capture style does.
+#[cfg(feature = "syntect")]
 fn style_modifier(style: SpanStyle) -> StyleModifier {
     let mut font_style = FontStyle::empty();
     font_style.set(FontStyle::BOLD, style.bold);
@@ -196,10 +225,12 @@ fn style_modifier(style: SpanStyle) -> StyleModifier {
     StyleModifier { foreground: Some(color(style.fg)), background: None, font_style: Some(font_style) }
 }
 
+#[cfg(feature = "syntect")]
 fn color(c: Rgba) -> Color {
     Color { r: c.r, g: c.g, b: c.b, a: c.a }
 }
 
+#[cfg(feature = "syntect")]
 fn rgba(c: Color) -> Rgba {
     Rgba { r: c.r, g: c.g, b: c.b, a: c.a }
 }
@@ -215,6 +246,7 @@ mod tests {
         SpanStyle { fg, bold: false, italic: false }
     }
 
+    #[cfg(feature = "syntect")]
     fn rgb(hex: u32) -> Rgba {
         Rgba { r: (hex >> 16) as u8, g: (hex >> 8) as u8, b: hex as u8, a: 0xff }
     }
@@ -251,6 +283,7 @@ mod tests {
         assert_eq!(theme.resolve("keyword"), Some(plain(GREEN)));
     }
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn every_vocabulary_scope_parses() {
         for (capture, scopes) in vocabulary::VOCABULARY {
@@ -261,7 +294,8 @@ mod tests {
         }
     }
 
-    /// The content of scrive-iced's `assets/scrive-dark.tmTheme`.
+    /// A copy of scrive-iced's `assets/scrive-dark.tmTheme`; scrive-iced's drift test checks the real one.
+    #[cfg(feature = "syntect")]
     const SCRIVE_DARK: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -293,6 +327,7 @@ mod tests {
 </dict>
 </plist>"#;
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn tm_theme_derives_a_rule_for_every_styled_vocabulary_capture() {
         let expected: &[(&str, Option<u32>)] = &[

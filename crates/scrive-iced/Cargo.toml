@@ -22,7 +22,12 @@ iced = { version = "0.15.0-dev", features = ["advanced"] }
 # the `CodeEditor` methods that drive a client. Off by default, so a host without
 # a language server compiles none of it.
 [features]
+default = ["syntect"]
 lsp = ["dep:scrive-lsp"]
+# Syntect highlighting: `CodeEditor::language` accepts a
+# `scrive_core::SyntaxDef`, and big documents tokenize on worker threads.
+# Forwards to scrive-core's backend.
+syntect = ["scrive-core/syntect"]
 # Tree-sitter highlighting: `CodeEditor::language` then also accepts a
 # `scrive_core::TreeSitterDef`. Forwards to scrive-core's backend.
 tree-sitter = ["scrive-core/tree-sitter"]
@@ -53,23 +58,31 @@ iced = { version = "0.15.0-dev", features = ["webgl", "fira-sans"] }
 [target.'cfg(not(target_os = "wasi"))'.dev-dependencies]
 tree-sitter-rust = "0.24"
 
+# The syntect examples highlight with the bundled `.sublime-syntax` grammar.
 [[example]]
-name = "scratch"
-test = true
+name = "minimal"
+required-features = ["syntect"]
 
 [[example]]
+name = "scratch"
+required-features = ["syntect"]
+test = true
+
+# Records the scratch example, which it includes.
+[[example]]
 name = "record_showcase"
+required-features = ["syntect"]
 
 [[example]]
 name = "lsp"
 path = "examples/lsp/main.rs"
-required-features = ["lsp"]
+required-features = ["lsp", "syntect"]
 test = true
 
 # Native only: spawns rust-analyzer from PATH. Its wasm32 build is a stub `main`.
 [[example]]
 name = "rust_analyzer"
-required-features = ["lsp"]
+required-features = ["lsp", "syntect"]
 test = true
 
 [[example]]

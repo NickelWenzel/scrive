@@ -12,8 +12,11 @@ repository = "https://github.com/robbym/scrive"
 
 # The internal crates, declared once. A release bump edits the `version`s here
 # and nowhere else; each member opts in with `<crate>.workspace = true`.
+# scrive-core's highlight backends are features, and a member can't turn off a
+# workspace dependency's defaults, so the entry turns them off and each member
+# enables the backends it needs.
 [workspace.dependencies]
-scrive-core = { path = "crates/scrive-core", version = "0.4.0" }
+scrive-core = { path = "crates/scrive-core", version = "0.4.0", default-features = false }
 scrive-lsp = { path = "crates/scrive-lsp", version = "0.4.0" }
 
 # Track iced's git master. The requirements in scrive-iced are `0.15.0-dev`

@@ -30,6 +30,10 @@ jobs:
       - name: Test workspace (all features)
         run: cargo test --workspace --all-features
 
+      # The tree-sitter backend alone, with syntect out of the build.
+      - name: Test scrive-core and scrive-iced (tree-sitter only)
+        run: cargo test -p scrive-core -p scrive-iced --no-default-features --features tree-sitter
+
   wasm:
     name: Wasm
     runs-on: ubuntu-latest
@@ -86,6 +90,13 @@ jobs:
       - name: Clippy, all features (no warnings)
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+      # The highlight backends are features; lint the builds that drop syntect.
+      - name: Clippy, no highlight backend (no warnings)
+        run: cargo clippy -p scrive-core -p scrive-iced --all-targets --no-default-features -- -D warnings
+
+      - name: Clippy, tree-sitter only (no warnings)
+        run: cargo clippy -p scrive-core -p scrive-iced --all-targets --no-default-features --features tree-sitter -- -D warnings
+
       # Missing docs and broken intra-doc links are denied at the crate level;
       # this catches every other rustdoc warning.
       - name: Docs build clean
@@ -100,6 +111,12 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # Docs that link to syntect-only items break here.
+      - name: Docs build clean (tree-sitter only)
+        run: cargo doc --no-deps -p scrive-core -p scrive-iced --no-default-features --features tree-sitter
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       # The headless crates must never pull a GUI crate into their normal
       # dependency graph. `cargo tree` failing is itself a failure.
       - name: Headless crates depend on no GUI crate
@@ -109,6 +126,18 @@ jobs:
             out=$(cargo tree -p "$c" -e normal --prefix none) || exit 1
             if grep -qE '^(iced|winit|wgpu)' <<<"$out"; then
               echo "$c depends on a GUI crate"
+              exit 1
+            fi
+          done
+
+      # A tree-sitter-only consumer must be able to drop syntect entirely.
+      - name: Tree-sitter-only builds pull in no syntect
+        shell: bash
+        run: |
+          for c in scrive-core scrive-iced; do
+            out=$(cargo tree -p "$c" --no-default-features --features tree-sitter -e normal --prefix none) || exit 1
+            if grep -q '^syntect ' <<<"$out"; then
+              echo "$c pulls in syntect without the syntect feature"
               exit 1
             fi
           done

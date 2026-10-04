@@ -25,7 +25,9 @@ use crate::find::{FindQuery, FindState};
 use std::cell::{Ref, RefCell};
 
 use crate::fold_map::{FoldMap, FoldSet};
-use crate::highlight::{Grammar, HighlightCache, HighlightEngine, HighlightSpan, TokenTheme};
+#[cfg(feature = "syntect")]
+use crate::highlight::HighlightEngine;
+use crate::highlight::{Grammar, HighlightCache, HighlightSpan, TokenTheme};
 use crate::history::{GroupingHint, History};
 use crate::intel::inlay;
 use crate::movement::{self, ColumnDir, Granularity, Motion};
@@ -1927,6 +1929,7 @@ impl Document {
     /// Pair with [`Document::snapshot`] (an O(1) rope clone) and
     /// [`crate::tokenize_segment`] on a worker, then feed results back through
     /// [`Document::absorb_highlight`].
+    #[cfg(feature = "syntect")]
     #[must_use]
     pub fn highlight_engine(&self) -> Option<HighlightEngine> {
         self.highlight.as_ref().and_then(HighlightCache::engine)
@@ -1953,6 +1956,7 @@ impl Document {
     /// cache and rides `rebase_views`' `on_commit` splices like every other
     /// derived fact — only *in-flight* results are dropped by the revision
     /// check.
+    #[cfg(feature = "syntect")]
     pub fn absorb_highlight(
         &mut self,
         revision: Revision,
@@ -4104,6 +4108,7 @@ mod tests {
         assert!(d.is_dirty(), "divergent edit is still dirty, never falsely clean");
     }
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn highlight_cache_splice_tracks_line_count_across_edits() {
         // Tiny grammar/theme via the same app-injection path scratch uses.
@@ -4132,6 +4137,7 @@ mod tests {
         assert!(d.highlight_line_spans(2).is_none(), "no spans past the buffer");
     }
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn multi_op_transaction_highlight_equals_a_fresh_document() {
         // A multi-caret transaction commits ALL its edits at once; rebase_views
@@ -4187,6 +4193,7 @@ mod tests {
     /// viewport: the widget's deduped viewport report never re-fires when
     /// nothing visible moved, so the swapped cache must retain the currently
     /// visible rows rather than reset to the top and leave them fallback-styled.
+    #[cfg(feature = "syntect")]
     #[test]
     fn set_syntax_preserves_the_highlight_window_aim() {
         const G: &str = "%YAML 1.2\n---\nname: T\nscope: source.t\ncontexts:\n  main:\n    - match: '\\w+'\n      scope: keyword.t\n";
@@ -4214,11 +4221,14 @@ mod tests {
     // suffices at the Document seam — the stitch correctness lives in
     // highlight.rs's stateful oracle; here we check the seam's contract:
     // revision gating, dirt clearing, and no-checkpoint speculation.
+    #[cfg(feature = "syntect")]
     const HL_G: &str = "%YAML 1.2\n---\nname: T\nscope: source.t\ncontexts:\n  main:\n    - match: '\\bkw\\b'\n      scope: keyword.t\n";
+    #[cfg(feature = "syntect")]
     const HL_TH: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict><key>settings</key><array><dict><key>settings</key><dict><key>foreground</key><string>#FFFFFF</string></dict></dict></array></dict></plist>"#;
 
+    #[cfg(feature = "syntect")]
     fn doc_with_syntax(n: usize) -> Document {
         let mut d = doc(&"kw word\n".repeat(n));
         d.set_syntax(
@@ -4228,6 +4238,7 @@ mod tests {
         d
     }
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn absorb_highlight_drops_a_stale_revision() {
         let mut d = doc_with_syntax(2_000);
@@ -4244,6 +4255,7 @@ mod tests {
         assert_eq!(d.highlight_frontier(), Some(0), "the frontier is untouched by a dropped absorb");
     }
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn absorb_highlight_verified_clears_the_frontier() {
         let mut d = doc_with_syntax(5_000);
@@ -4260,6 +4272,7 @@ mod tests {
         assert_eq!(d.highlight_frontier(), None, "verified absorb clears every dirty row");
     }
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn absorb_highlight_speculative_shows_spans_but_keeps_dirt() {
         let mut d = doc_with_syntax(2_000);
@@ -5346,6 +5359,7 @@ mod tests {
         assert_eq!(crate::display_map::expand(&d.buffer().line(0), span.start, 4), 3);
     }
 
+    #[cfg(feature = "syntect")]
     #[test]
     fn undo_resyncs_brackets_and_highlight_to_the_reverted_text() {
         const G: &str = "%YAML 1.2\n---\nname: T\nscope: source.t\ncontexts:\n  main:\n    - match: '\\w+'\n      scope: keyword.t\n";
@@ -6515,7 +6529,6 @@ mod tests {
         #[test]
         fn undo_and_redo_resync_tree_sitter_highlight() {
             let mut d = highlighted(SOURCE);
-            assert!(d.highlight_engine().is_none(), "tree-sitter has no off-thread engine");
             d.set_selections(SelectionSet::new(0));
             d.edit(vec![EditOp::insert(0, "/* a\nb */\n")]).unwrap();
             assert_equals_fresh(&mut d);
@@ -6602,6 +6615,7 @@ mod tests {
             assert_equals_fresh(&mut d);
         }
 
+        #[cfg(feature = "syntect")]
         #[test]
         fn set_syntax_with_a_tree_sitter_grammar_keeps_the_window_aim() {
             let mut d = doc(&"fn f() {}\n".repeat(3_000));
@@ -6614,6 +6628,7 @@ mod tests {
             assert!(d.highlight_line_spans(0).is_none(), "the document top is outside the window");
         }
 
+        #[cfg(feature = "syntect")]
         #[test]
         fn absorb_highlight_takes_no_segment_for_tree_sitter() {
             let mut syntect = doc_with_syntax(10);

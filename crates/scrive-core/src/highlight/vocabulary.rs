@@ -41,6 +41,7 @@ pub(super) const VOCABULARY: &[(&str, &[&str])] = &[
 ];
 
 /// The representative scopes of `capture`, if it is in the vocabulary.
+#[cfg(feature = "syntect")]
 pub(super) fn scopes(capture: &str) -> Option<&'static [&'static str]> {
     VOCABULARY.iter().find(|(name, _)| *name == capture).map(|(_, scopes)| *scopes)
 }

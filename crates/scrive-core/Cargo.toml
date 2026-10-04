@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
-description = "Headless code-editor core: buffer, atomic multi-range transactions, undo/redo, selections, tracked-range decorations, and an incremental syntect highlight cache. Imports no GUI crate."
+description = "Headless code-editor core: buffer, atomic multi-range transactions, undo/redo, selections, tracked-range decorations, and incremental syntax highlighting (syntect or tree-sitter). Imports no GUI crate."
 keywords = ["editor", "text", "buffer", "undo", "headless"]
 categories = ["text-editors", "data-structures"]
 # benches/support.rs is a shared module of the one `perf` bench, not a bench
@@ -17,8 +17,9 @@ autobenches = false
 # runs `cargo tree -p scrive-core` and asserts none appear.
 #
 # Dependency budget — each entry earns its place with a consumer:
-#   syntect   — the incremental highlight state cache. Types stay OUT of the
-#               public API (wrapped).
+#   syntect (optional, `syntect` feature, on by default) — the line-state
+#               highlight backend for `.sublime-syntax` grammars. Types stay
+#               OUT of the public API (wrapped).
 #   memchr    — line-index and substring scanning.
 #   thiserror — transaction/load error enums.
 #   arrayvec  — the rope chunk's inline storage (`ArrayString<CHUNK_MAX>`).
@@ -30,12 +31,13 @@ autobenches = false
 #               makes, at the same 128-byte chunk size.
 #   regex     — find's whole-word and regex modes. Types stay OUT of the public
 #               API (wrapped), like syntect's. Deliberately `regex` and NOT the
-#               `fancy-regex` syntect already pulls in: a find pattern arrives
+#               `fancy-regex` syntect uses: a find pattern arrives
 #               keystroke-by-keystroke from a user, and fancy-regex BACKTRACKS,
 #               so one pathological pattern would hang the UI. regex's RE2
-#               automaton is linear-time by construction. It is also nearly free
-#               here — regex-automata / regex-syntax / aho-corasick / memchr are
-#               already in the tree via syntect's `default-fancy`.
+#               automaton is linear-time by construction. Its own dependencies
+#               are small (regex-automata / regex-syntax / aho-corasick / memchr,
+#               the last already ours), and with the `syntect` feature they are
+#               shared with syntect's `default-fancy`.
 #   tree-sitter (optional, `tree-sitter` feature) — the parse-tree highlight
 #               backend: parser, incremental trees, highlights queries. Types
 #               stay OUT of the public API, like syntect's. Its own build
@@ -46,11 +48,16 @@ autobenches = false
 #               `TreeSitterDef::new`. It is the stable, runtime-version-free
 #               handoff type every grammar crate exports (`LANGUAGE`), so it is
 #               the only way a consumer can hand scrive a grammar.
+# The highlight backends, one feature each. With neither, a `Document` builds
+# without highlighting: `Grammar` has no constructor, so `set_syntax` can't be
+# called.
 [features]
+default = ["syntect"]
+syntect = ["dep:syntect"]
 tree-sitter = ["dep:tree-sitter", "dep:tree-sitter-language"]
 
 [dependencies]
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+syntect = { version = "5", default-features = false, features = ["default-fancy"], optional = true }
 memchr = "2"      # find scanning (memmem/memchr2) + test oracles
 thiserror = "2"   # error enums (LoadError, TransactionError)
 regex = "1"       # find's whole-word + regex modes (wrapped; never public)
@@ -91,6 +98,11 @@ required-features = ["tree-sitter"]
 [[bench]]
 name = "perf"
 harness = false
+required-features = ["syntect"]
+
+[[test]]
+name = "spike_syntect"
+required-features = ["syntect"]
 
 [package.metadata.docs.rs]
 all-features = true
