@@ -218,8 +218,8 @@ pub(crate) fn apply(buffer: &mut Buffer, ops: Vec<EditOp>) -> Result<Committed, 
         delta += op.text.len() as i64 - (e - s) as i64;
     }
 
-    // (5) apply all edits in ONE batched rope pass (the multi-caret path: one spine
-    // rebuild sharing every untouched subtree, not N sequential splices). `norm` is
+    // (5) apply all edits as one batch (the multi-caret path: the rope picks
+    // per-edit splices or one rebuild). `norm` is
     // sorted ascending and disjoint — exactly `edit_many`'s contract. The `batch`
     // borrows `norm`, so it lives in its own scope and drops before `norm` moves
     // into the returned `Committed` as the forward ops.

@@ -1,14 +1,12 @@
 //! The document text store: a rope.
 //!
-//! Storage is a `Rope` — an augmented `SumTree<Chunk>`, the one
-//! tree every position query rides. The **LF-only line model** lives in the
-//! chunk summary (a `'\n'` count), so line/point math is a summary fold with no
-//! second index to drift; a test pins that only `'\n'` breaks a line. An edit is
-//! `O(edit + log chunks)` and coordinate lookups are `O(log chunks)` cursor
+//! Storage is a `Rope` (a wrapper over `ropey::Rope`) under an **LF-only line
+//! model**: only `'\n'` breaks a line, which a test pins. An edit is
+//! `O(edit + log chunks)` and coordinate lookups are `O(log chunks)` tree
 //! descents — no operation is bandwidth-bound in the document length. There is no
 //! load-size policy: the only bound is the `u32` offset space (~4 GiB), checked at
-//! load and on the edit path. (The rope is oracle-tested byte-for-byte against an
-//! independent reference model.)
+//! load and on the edit path. (The rope is oracle-tested against an independent
+//! `String` model.)
 //!
 //! **The read API is backing-agnostic:** every read hands out [`Cow`] slices or
 //! single chars —
@@ -452,7 +450,7 @@ impl Buffer {
     }
 
     /// Apply MANY disjoint edits (`(range, replacement)`, sorted ascending, disjoint,
-    /// in-bounds, LF-only) in ONE rope pass — the batched twin of N [`Self::splice`]s
+    /// in-bounds, LF-only) as one batch — the batched twin of N [`Self::splice`]s
     /// (the document-scale multi-caret path). The transaction engine owns the
     /// validation and revision bump, exactly as for `splice`.
     pub(crate) fn edit_many(&mut self, edits: &[(Range<u32>, &str)]) {

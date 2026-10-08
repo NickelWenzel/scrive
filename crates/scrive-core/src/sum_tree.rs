@@ -11,8 +11,8 @@
 //! copy-on-write edits: an edit rebuilds only the touched leaves and the spine
 //! above them, leaving every other subtree shared with the pre-edit tree.
 //!
-//! The full API — build, summary, dimensional seek, split, append, batched
-//! multi-edit — is oracle-tested against a plain `Vec` (see the module tests).
+//! The full API — build, summary, dimensional seek, split, append — is
+//! oracle-tested against a plain `Vec` (see the module tests).
 
 // A complete generic B-tree API; not every method is exercised in every build
 // configuration, so unused-code warnings are silenced module-wide.
@@ -405,88 +405,6 @@ impl<T: Item> SumTree<T> {
         left.append(&SumTree::from_items(new)).append(&right)
     }
 
-    /// Apply MANY disjoint edits in ONE recursive pass, rebuilding only the edited
-    /// leaves and the spine above them ONCE while sharing every untouched subtree
-    /// (an O(1) `Arc` clone) — the batched twin of N sequential [`Self::replace`]s,
-    /// which each re-clone the whole root spine (the document-scale multi-caret
-    /// storm). `edits` are sorted by `start` and disjoint in dimension `D`;
-    /// `rebuild_leaf(items, leaf_start, edits_in_leaf)` produces a leaf's new items
-    /// from its old ones and the edits falling inside it (the caller owns how a
-    /// replacement `R` splices into items — e.g. the rope reconstructs chunk text).
-    ///
-    /// Returns `None` if any edit STRADDLES a child boundary (a large/multi-leaf
-    /// replacement); the caller falls back to sequential [`Self::replace`]. Dense
-    /// tiny edits (multi-caret typing) never straddle, so they always take this
-    /// O(edited leaves + spine) path. For a fully covered spine that is O(edits);
-    /// each rebuilt node is built once, not once per edit.
-    #[must_use]
-    pub fn edit_many<D, R, F>(&self, edits: &[(std::ops::Range<D>, R)], rebuild_leaf: &F) -> Option<SumTree<T>>
-    where
-        D: Dimension<T::Summary>,
-        F: Fn(&[T], &D, &[(std::ops::Range<D>, R)]) -> Vec<T>,
-    {
-        self.edit_rec(&D::default(), edits, rebuild_leaf)
-    }
-
-    fn edit_rec<D, R, F>(
-        &self,
-        base: &D,
-        edits: &[(std::ops::Range<D>, R)],
-        rebuild_leaf: &F,
-    ) -> Option<SumTree<T>>
-    where
-        D: Dimension<T::Summary>,
-        F: Fn(&[T], &D, &[(std::ops::Range<D>, R)]) -> Vec<T>,
-    {
-        if edits.is_empty() {
-            return Some(self.clone()); // untouched subtree — shared, O(1)
-        }
-        match &*self.0 {
-            Node::Leaf { items, .. } => Some(SumTree::from_items(rebuild_leaf(items, base, edits))),
-            Node::Internal { children, child_summaries, .. } => {
-                let mut parts: Vec<SumTree<T>> = Vec::with_capacity(children.len());
-                let mut cstart = base.clone();
-                let mut ei = 0usize;
-                let last = children.len() - 1;
-                for (i, (child, csum)) in children.iter().zip(child_summaries).enumerate() {
-                    let mut cend = cstart.clone();
-                    cend.add_summary(csum);
-                    // The edits whose start falls in this child — a contiguous run
-                    // (edits are sorted). The last child also takes a start == cend
-                    // (an append at the node's very end).
-                    let lo = ei;
-                    while ei < edits.len()
-                        && (edits[ei].0.start < cend || (i == last && edits[ei].0.start <= cend))
-                    {
-                        // A replacement reaching past this child straddles the boundary
-                        // — bail to the sequential path (rare: a multi-leaf edit).
-                        if edits[ei].0.end > cend {
-                            return None;
-                        }
-                        ei += 1;
-                    }
-                    parts.push(child.edit_rec(&cstart, &edits[lo..ei], rebuild_leaf)?);
-                    cstart = cend;
-                }
-                Some(Self::concat_all(parts))
-            }
-        }
-    }
-
-    /// Balanced concatenation of a subtree list (divide-and-conquer `append`, so the
-    /// result is O(log)-tall, not a right-leaning O(k) chain). The edit rebuild's
-    /// child-combine; `append` tolerates the mixed heights a leaf's growth produces.
-    fn concat_all(mut trees: Vec<SumTree<T>>) -> SumTree<T> {
-        match trees.len() {
-            0 => SumTree::new(),
-            1 => trees.pop().expect("len 1"),
-            n => {
-                let right = trees.split_off(n / 2);
-                Self::concat_all(trees).append(&Self::concat_all(right))
-            }
-        }
-    }
-
     /// The combined summary of every item strictly before dimension `target` — the
     /// prefix fold (e.g. the bracket shape of everything left of a caret). Items
     /// are added left-to-right through `Summary::add_summary`, so an offset-bearing
@@ -716,78 +634,6 @@ impl<T: Item> SumTree<T> {
         }
     }
 
-    /// Split precisely at dimension `at`, splitting the straddling item with
-    /// `split_item(item, item_start, at)` when `at` falls strictly inside it (an
-    /// `at` on an item boundary needs no split). The left half of the split item
-    /// ends the left tree; the right half begins the right tree. This is how a
-    /// text rope cuts mid-chunk. O(log n).
-    #[must_use]
-    pub fn split_with<D, F>(&self, at: &D, split_item: &mut F) -> (SumTree<T>, SumTree<T>)
-    where
-        D: Dimension<T::Summary>,
-        F: FnMut(&T, &D, &D) -> (T, T),
-    {
-        self.split_abs_with(&D::default(), at, split_item)
-    }
-
-    fn split_abs_with<D, F>(&self, start: &D, at: &D, split_item: &mut F) -> (SumTree<T>, SumTree<T>)
-    where
-        D: Dimension<T::Summary>,
-        F: FnMut(&T, &D, &D) -> (T, T),
-    {
-        if at <= start {
-            return (SumTree::new(), self.clone());
-        }
-        let mut whole_end = start.clone();
-        whole_end.add_summary(self.summary());
-        if at >= &whole_end {
-            return (self.clone(), SumTree::new());
-        }
-        match &*self.0 {
-            Node::Leaf { items, item_summaries, .. } => {
-                let mut acc = start.clone();
-                let mut k = 0;
-                while k < items.len() {
-                    let mut end = acc.clone();
-                    end.add_summary(&item_summaries[k]);
-                    if &end > at {
-                        break;
-                    }
-                    acc = end;
-                    k += 1;
-                }
-                if &acc == at {
-                    // `at` lands exactly on item k's start — a clean cut, no split.
-                    (Self::leaf(items[..k].to_vec()), Self::leaf(items[k..].to_vec()))
-                } else {
-                    // `at` is strictly inside item k — split it.
-                    let (l, r) = split_item(&items[k], &acc, at);
-                    let mut left = items[..k].to_vec();
-                    left.push(l);
-                    let mut right = vec![r];
-                    right.extend_from_slice(&items[k + 1..]);
-                    (Self::finalize(Self::from_items_1or2(left)), Self::finalize(Self::from_items_1or2(right)))
-                }
-            }
-            Node::Internal { children, child_summaries, .. } => {
-                let mut acc = start.clone();
-                for (i, child) in children.iter().enumerate() {
-                    let mut end = acc.clone();
-                    end.add_summary(&child_summaries[i]);
-                    if &end > at {
-                        let (l, r) = child.split_abs_with(&acc, at, split_item);
-                        let h = self.height();
-                        let left = Self::wrap_children(h, &children[..i]).append(&l);
-                        let right = r.append(&Self::wrap_children(h, &children[i + 1..]));
-                        return (left, right);
-                    }
-                    acc = end;
-                }
-                unreachable!("`at < whole_end` guarantees a straddling child")
-            }
-        }
-    }
-
     /// The item whose `D`-span contains `target`, and the accumulated `D` at that
     /// item's start — the first item whose end-`D` exceeds `target` (so an exact
     /// boundary biases right, to the following item). Clamps to the last item when
@@ -957,33 +803,6 @@ impl<T: Item> SumTree<T> {
                 for (child, s) in children.iter().zip(child_summaries) {
                     child.bucketed_reduce_from(&acc, bounds, out, fold);
                     acc.add_summary(s);
-                }
-            }
-        }
-    }
-
-    /// Borrowed references to every item in a subtree the `keep` predicate accepts
-    /// (checked on each subtree's summary), in order — the interval-overlap window
-    /// read that must borrow (e.g. an absolute-offset item store whose summary
-    /// carries min-start/max-end). Subtrees whose summary is rejected are pruned;
-    /// surviving leaves hand back all their items (the caller does the exact
-    /// per-item test). O(log n + collected).
-    #[must_use]
-    pub fn filter_refs<F: Fn(&T::Summary) -> bool>(&self, keep: &F) -> Vec<&T> {
-        let mut out = Vec::new();
-        self.filter_refs_into(keep, &mut out);
-        out
-    }
-
-    fn filter_refs_into<'a, F: Fn(&T::Summary) -> bool>(&'a self, keep: &F, out: &mut Vec<&'a T>) {
-        if !keep(self.summary()) {
-            return;
-        }
-        match &*self.0 {
-            Node::Leaf { items, .. } => out.extend(items.iter()),
-            Node::Internal { children, .. } => {
-                for c in children {
-                    c.filter_refs_into(keep, out);
                 }
             }
         }
@@ -1305,11 +1124,6 @@ mod tests {
         }
     }
 
-    fn split_run(r: &Run, start: &ByLen, at: &ByLen) -> (Run, Run) {
-        let pos = at.0 - start.0; // bytes into the run
-        (Run { len: pos, id: r.id }, Run { len: r.len - pos, id: r.id })
-    }
-
     // An interval item for the filter_visit (interval-tree) test: delta-gap start,
     // `len` gives end = start + len; the summary carries the subtree's max end.
     #[derive(Clone, Debug)]
@@ -1418,25 +1232,6 @@ mod tests {
                 .map(|w| starts.iter().filter(|&&s| s >= w[0] && s < w[1]).count() as u32)
                 .collect();
             assert_eq!(got, want, "bounds {bounds:?}");
-        }
-    }
-
-    #[test]
-    fn split_with_cuts_inside_an_item() {
-        let src = runs_from(0, 100);
-        let tree = SumTree::from_items(src.clone());
-        let total: u32 = src.iter().map(|r| r.len).sum();
-        for at in 0..=total {
-            let (left, right) = tree.split_with(&ByLen(at), &mut split_run);
-            // Byte-precise: left holds exactly the first `at` bytes, nothing lost.
-            assert_eq!(left.summary().len, at, "at={at}: left byte count");
-            assert_eq!(left.summary().len + right.summary().len, total, "at={at}: total preserved");
-            if !left.is_empty() {
-                left.assert_invariants();
-            }
-            if !right.is_empty() {
-                right.assert_invariants();
-            }
         }
     }
 }

@@ -63,7 +63,7 @@ pub mod movement;
 mod offset_set; // delta-gap SumTree of offsets (folds/decorations backing)
 pub mod patch;
 mod perf; // op-count work meter behind the complexity gate (crate-internal)
-mod rope; // the text rope (SumTree<Chunk>) backing Buffer
+mod rope; // the text rope (a ropey wrapper) backing Buffer
 #[cfg(test)]
 mod perf_gate; // scale-matrix test that fails the build if a shared primitive scales worse than linearly (tests only)
 pub mod row_layout;

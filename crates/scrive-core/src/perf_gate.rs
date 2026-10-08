@@ -164,6 +164,8 @@ fn single_caret_movement_is_size_independent() {
 // ── ALLOCATION dimension: typing at N carets over N folds must not allocate
 //    `SumTree` nodes superlinearly. The semantic work meter is blind to
 //    copy-on-write tree allocation, so this cell watches `NODE_ALLOCS` directly.
+//    The rope is ropey's and invisible to it; `tests/alloc_gate.rs` counts
+//    its allocations.
 //    An O(N²) shape (a per-caret whole-tree rebuild, or a per-fold at()/split
 //    loop) reads ~4× per-caret here; O(N·log) editing stays flat. ──────────────
 #[test]
@@ -189,11 +191,9 @@ fn multicaret_over_folds_allocates_linearly() {
     // Per-caret is O(log doc) — it creeps up with the deeper tree but must stay far
     // below the 4× a quadratic would show; 1.8× leaves headroom for that log growth.
     assert!(pb <= ps * 1.8, "fold+type allocates superlinearly: {ps:.1} -> {pb:.1}/caret");
-    // And an absolute ceiling. With the batched edit path the whole commit touches
-    // only a few nodes per caret (~5 here): the buffer applies all N edits in ONE
-    // spine rebuild and the views shift in bulk. Per-caret tree work — the batch
-    // falling to sequential splices (~48/caret), or a view's bulk shift done as N
-    // splices — lands in the tens; a per-edit split storm (O(log²)) or per-fold
+    // And an absolute ceiling. The views shift in bulk, so the whole commit
+    // touches only a few nodes per caret (~5 here). A view's bulk shift done as N
+    // splices lands in the tens; a per-edit split storm (O(log²)) or per-fold
     // at()/rebuild higher still. A ratio test can't see such a constant jump, only
     // this bound. 30 is ~6× the healthy value: ample margin for log growth, tight
     // enough to trip the moment a view goes per-caret.

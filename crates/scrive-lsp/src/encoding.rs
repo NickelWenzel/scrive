@@ -370,10 +370,10 @@ mod tests {
     /// A line longer than one rope chunk converts the same as a short one.
     #[test]
     fn conversion_walks_across_rope_chunk_boundaries() {
-        let wide = "é".repeat(200) + "x";
-        assert_offsets(Encoding::Utf16, &wide, &[((0, 200), 400), ((0, 201), 401)]);
-        assert_positions(Encoding::Utf16, &wide, &[(400, (0, 200))]);
-        assert_offsets(Encoding::Utf16, &"a".repeat(300), &[((0, 250), 250)]);
+        let wide = "é".repeat(2000) + "x";
+        assert_offsets(Encoding::Utf16, &wide, &[((0, 2000), 4000), ((0, 2001), 4001)]);
+        assert_positions(Encoding::Utf16, &wide, &[(4000, (0, 2000))]);
+        assert_offsets(Encoding::Utf16, &"a".repeat(3000), &[((0, 2500), 2500)]);
     }
 
     /// Disk text may end lines with `\r\n`; the `\r` is not part of the line.
