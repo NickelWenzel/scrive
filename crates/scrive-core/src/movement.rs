@@ -465,8 +465,9 @@ pub(crate) fn word_delete_right(buffer: &Buffer, caret: u32) -> u32 {
 /// the caret sits in whitespace or the buffer is empty — Ctrl+D then has nothing
 /// to select.
 pub(crate) fn surrounding_word(buffer: &Buffer, offset: u32) -> Option<(u32, u32)> {
-    let prev = |o: usize| buffer.char_before(o as u32);
-    let next = |o: usize| buffer.char_at(o as u32);
+    let (mut back, mut fwd) = (buffer.char_cursor(), buffer.char_cursor());
+    let mut prev = |o: usize| back.char_before(o as u32);
+    let mut next = |o: usize| fwd.char_at(o as u32);
     let o = offset as usize;
     let kind = match (prev(o).map(char_kind), next(o).map(char_kind)) {
         (Some(a), Some(b)) => a.max(b),

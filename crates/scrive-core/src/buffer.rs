@@ -276,6 +276,11 @@ impl Buffer {
         self.text.line(row)
     }
 
+    /// A [`CharCursor`] over this buffer, for walks that read many nearby chars.
+    pub(crate) fn char_cursor(&self) -> CharCursor<'_> {
+        CharCursor { text: &self.text, chunk: "", start: 0 }
+    }
+
     /// The char whose first byte is at `offset` — `None` at/past the end.
     /// (`offset` must be a char boundary.) The forward one-char read every
     /// boundary scan uses instead of slicing the whole text. `O(log chunks)`.
@@ -483,6 +488,40 @@ impl Buffer {
     }
 }
 
+/// [`Buffer::char_at`] / [`Buffer::char_before`] that keep the last chunk they
+/// read, so a char-by-char walk pays one rope descent per chunk instead of one
+/// per char.
+pub(crate) struct CharCursor<'a> {
+    text: &'a Rope,
+    chunk: &'a str,
+    start: u32,
+}
+
+impl<'a> CharCursor<'a> {
+    /// The chunk holding byte `offset`, or the last chunk at the end.
+    fn chunk_holding(&mut self, offset: u32) -> (&'a str, u32) {
+        if offset < self.start || offset >= self.start + self.chunk.len() as u32 {
+            (self.chunk, self.start) = self.text.chunk_at(offset);
+        }
+        (self.chunk, self.start)
+    }
+
+    pub(crate) fn char_at(&mut self, offset: u32) -> Option<char> {
+        let off = offset.min(self.text.len());
+        let (chunk, start) = self.chunk_holding(off);
+        chunk[(off - start) as usize..].chars().next()
+    }
+
+    pub(crate) fn char_before(&mut self, offset: u32) -> Option<char> {
+        let off = offset.min(self.text.len());
+        if off == 0 {
+            return None;
+        }
+        let (chunk, start) = self.chunk_holding(off - 1);
+        chunk[..(off - start) as usize].chars().next_back()
+    }
+}
+
 fn clip_in(text: &Rope, offset: u32, bias: Bias) -> u32 {
     let off = offset.min(text.len());
     // A non-boundary offset sits strictly inside one char, and chunk
@@ -657,6 +696,19 @@ mod tests {
         assert_eq!(b.line_count(), 2, "only \\n may break lines");
         assert_eq!(b.line(1), "g");
         assert_eq!(b.offset_to_point(b.len()).row, 1);
+    }
+
+    #[test]
+    fn char_cursor_reads_like_char_at_in_both_directions() {
+        let text: String = (0..400).map(|i| format!("{i} λ→🦀 word\n")).collect();
+        let b = buf(&text);
+        let offsets: Vec<u32> = (0..=text.len()).filter(|&o| text.is_char_boundary(o)).map(|o| o as u32).collect();
+        let mut cursor = b.char_cursor();
+        for &o in offsets.iter().chain(offsets.iter().rev()) {
+            assert_eq!(cursor.char_at(o), b.char_at(o), "char_at {o}");
+            assert_eq!(cursor.char_before(o), b.char_before(o), "char_before {o}");
+        }
+        assert_eq!(buf("").char_cursor().char_at(0), None);
     }
 
     /// A document big enough to span many rope chunks must answer every read
