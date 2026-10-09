@@ -33,6 +33,8 @@ categories = ["text-editors", "development-tools"]
 #   thiserror         — the crate's error enums.
 #   wasmtimer         — browser only: the memory bridge's poll timer, since
 #                       `std::time` panics there.
+#   windows-sys       — tests on Windows only: the stdio test's console-window
+#                       check.
 [dependencies]
 scrive-core.workspace = true
 lsp-types = "0.97"   # LSP payloads (re-exported; never wrapped)
@@ -54,6 +56,15 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 # `block_on` for the tests that use threads.
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# The console check reads `GetConsoleWindow`, which needs `unsafe` (allowed in the test crate).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+# Self-re-executing fake servers need their own `main`.
+[[test]]
+name = "stdio"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true
