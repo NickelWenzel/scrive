@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
-description = "A headless Language Server Protocol client for scrive: it syncs scrive-core documents with a language server over a bridge it owns, and turns the server's replies into editor updates."
+description = "A Language Server Protocol client for scrive: syncs scrive-core documents with a language server over stdio, TCP, WebSocket or an in-process connection, and turns its replies into editor updates."
 keywords = ["lsp", "language-server", "editor", "headless"]
 categories = ["text-editors", "development-tools"]
 

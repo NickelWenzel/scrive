@@ -11,8 +11,9 @@ categories = ["gui", "text-editors"]
 
 [dependencies]
 scrive-core.workspace = true
-# The Language Server Protocol bridge behind the `lsp` feature, re-exported as
-# `scrive_iced::lsp` and driven by the `CodeEditor` glue.
+# The Language Server Protocol client behind the `lsp` feature, re-exported as
+# `scrive_iced::lsp` and driven by the `CodeEditor` glue. It owns the connection
+# to the server.
 scrive-lsp = { workspace = true, optional = true }
 # `advanced` unlocks the low-level `Widget` API (iced::advanced::*) the editor
 # widget implements directly, rather than as a canvas::Program.
@@ -25,7 +26,8 @@ iced = { version = "0.15.0-dev", features = ["advanced"] }
 default = ["syntect"]
 lsp = ["dep:scrive-lsp"]
 # The WebSocket transport for the language-server client: `lsp::Client::builder().websocket(url)`,
-# natively and in the browser. Pulls tungstenite and rustls on native targets.
+# natively and in the browser. Natively it pulls tungstenite, rustls, webpki-roots and mio; the
+# browser build adds no crate iced doesn't already pull in.
 lsp-websocket = ["lsp", "scrive-lsp/websocket"]
 # Syntect highlighting: `CodeEditor::language` accepts a
 # `scrive_core::SyntaxDef`, and big documents tokenize on worker threads.

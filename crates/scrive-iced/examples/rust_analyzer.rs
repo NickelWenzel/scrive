@@ -10,7 +10,8 @@
 //! Without one, a scratch crate is written to the system temp directory and its `src/main.rs`
 //! opened: it has a type error, a function to hover and F12 to, and a call to retype for
 //! signature help. Ctrl+S (Cmd+S on macOS) writes the file and tells the server, which re-runs
-//! `cargo check`: the type error's squiggle updates only then.
+//! `cargo check`: the type error's squiggle updates only then. The button by the status line
+//! turns `checkOnSave` off and on through `Client::configure`.
 //!
 //! Inlay hints are on: double-click a type hint to insert it, Ctrl+click a part to jump, hover
 //! one for its tooltip. Ctrl+I (Cmd+I on macOS) turns them off and on.

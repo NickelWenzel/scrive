@@ -57,7 +57,8 @@ const OWNED: [&str; 8] = {
 
 /// One connection to one language server, over the bridge its [`Builder`] chose: natively, a
 /// child process with `Builder::stdio` or a socket with `Builder::connect` and
-/// `Builder::listen`; on every target, an in-process server with [`Builder::memory`].
+/// `Builder::listen`; natively and in a browser with the `websocket` feature, a WebSocket with
+/// `Builder::websocket`; on every target, an in-process server with [`Builder::memory`].
 ///
 /// The client sends by itself; the host runs the [`Events`] stream the builder returned and
 /// passes each event to [`receive`](Self::receive), which folds it in and returns the updates.

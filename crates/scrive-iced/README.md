@@ -24,10 +24,11 @@ Three crates, with every dependency pointing one way:
   matching, indent guides, diagnostic squiggles, code folding, and the
   completion / hover / signature-help popups. Depends on `scrive-core`; the
   dependency never points back.
-- **`scrive-lsp`** — a Language Server Protocol bridge with no I/O: a state
-  machine that turns editor snapshots and change logs into JSON-RPC messages,
-  and server messages into per-document updates. Depends on `scrive-core`
-  only; `scrive-iced` pulls it in behind its `lsp` feature.
+- **`scrive-lsp`** — a Language Server Protocol client. It owns the connection
+  to the server (a child process, TCP, a WebSocket, or an in-process server),
+  keeps the server's copy of each open document in sync, and turns its replies
+  into per-document updates. Depends on `scrive-core` and no GUI crate;
+  `scrive-iced` pulls it in behind its `lsp` feature.
 
 ## Features
 
@@ -56,7 +57,8 @@ Three crates, with every dependency pointing one way:
   documents per client: incremental sync (including undo), diagnostics,
   completion, signature help, hover, goto definition, rename across files,
   formatting, and inlay hints. Late replies are dropped, never applied to text
-  that moved.
+  that moved. The client runs the server over stdio, TCP, a WebSocket, or
+  in-process, restarts it when it crashes, and shuts it down cleanly.
 - **Diagnostics** — squiggles, a diagnostic hover, and scrollbar overview marks.
 
 Every derived position — a caret, a find match, a diagnostic, a snippet stop — is
@@ -191,42 +193,73 @@ later build as they are. Older ones, such as tree-sitter-rust 0.24, fail on
 
 ## Language servers
 
-Enable the `lsp` feature and `scrive_iced::lsp` re-exports the bridge. The app
-owns the transport (a child process, a socket, a web worker) and carries
-`lsp::Message`s both ways; the bridge owns everything between them:
+Enable the `lsp` feature and `scrive_iced::lsp` re-exports the client. An
+`lsp::Client` talks to one server over a connection it owns, and the builder's
+last call picks the transport:
+
+| call | transport | targets |
+|------|-----------|---------|
+| `.stdio(command)` | spawns the server and talks over its stdin and stdout | native |
+| `.connect(address)` | TCP: dials a server that listens | native |
+| `.listen(socket_addr)` | TCP: waits for the server to dial in | native |
+| `.websocket(url)` | `ws://` or `wss://`, one JSON-RPC message per text frame (the `lsp-websocket` feature) | native and browser |
+| `.memory(connection)` | an in-process server on an `lsp::lsp_server::Connection` | every target |
+
+The call returns the client and a stream of events. Run the stream as a task
+and hand each event back to the client:
 
 ```rust
 // Boot: one client per server, one open_lsp per editor.
-let (mut client, initialize) = lsp::Client::builder().root(root).build();
-let mut outgoing = vec![initialize];
-outgoing.extend(editor.open_lsp(&mut client, &file, "rust")?);
+let (mut client, events) = lsp::Client::builder()
+    .root(lsp::uri::from_path(&workspace).expect("an absolute path"))
+    .stdio(Command::new("rust-analyzer"))?;
+editor.open_lsp(&mut client, &uri, "rust")?;
+let task = Task::run(events, Message::Lsp);
 
-// After every editor update: sync, send what it returns, and route its jump.
+// After every editor update: sync. The client sends what the edit needs.
 let task = editor.update(event, now).map(Message::Editor);
 let synced = editor.sync_lsp(&mut client);
-let mut outgoing = synced.messages;
 // synced.jump: a hint's label part in another tab — call that editor's jump().
 
-// For every message from the server.
-let output = client.receive(message)?;
-let mut outgoing = output.messages;
-for update in output.updates {
-    if let lsp::Update::Document(document) = update {
-        // Route to the editor whose document().doc_id() == document.doc_id().
-        let applied = editor.apply_lsp(&mut client, document);
-        outgoing.extend(applied.messages);
-        // applied.jump: a definition in another tab — call that editor's jump().
+// For every event from the stream.
+for update in client.receive(event) {
+    match update {
+        lsp::Update::Document(document) => {
+            // Route to the editor whose document().doc_id() == document.doc_id().
+            let applied = editor.apply_lsp(&mut client, document);
+            // applied.jump: a definition in another tab — call that editor's jump().
+        }
+        lsp::Update::Status(status) => {}   // Starting, Running, Restarting, Stopped
+        lsp::Update::Log(entry) => {}       // stderr, window/logMessage, window/showMessage
+        lsp::Update::Error(error) => {}     // a reply that didn't decode, a failed request
+        lsp::Update::FileEdits(edits) => {} // a rename's edits to a file that isn't open
+        lsp::Update::Notification(_) | lsp::Update::Trace(_) => {}
     }
 }
 ```
+
+When the server crashes or the connection drops, requests in flight settle
+empty at once, and the client brings the server back with the editors still
+attached: stdio spawns it again, `connect` and `websocket` dial again. By
+default it gives up when a fifth loss falls within 3 minutes; `.restart(..)`
+changes that, and `client.restart()` tries again by hand. An in-process server
+and a `listen` client are never brought back.
+
+`client.shutdown()` sends `shutdown` and `exit`. Over stdio, TCP and WebSocket
+the client then gives the server a grace period to go before it kills the
+process or closes the connection; an in-process server gets both messages
+without any wait. Hand the documents `shutdown()` returns to `apply_lsp`, and
+exit the app on `Status::Stopped(Reason::Shutdown)`. Dropping the client sends
+the same goodbye; over stdio, TCP and WebSocket a worker thread runs it, and
+the process exit can cut it short.
 
 Inlay hints are opt-in per editor: `.inlay_hints(true)`, or `set_inlay_hints` at
 runtime. The editor schedules the fetches itself, and `sync_lsp` sends them.
 Hovering a hint shows its tooltip, Ctrl+click on a part jumps, and a
 double-click inserts the hint's text. The library binds no toggle key.
 
-`scrive-lsp` does no I/O and builds for wasm32. `examples/lsp` runs two tabs
-against a scripted in-process server and shows the traffic.
+`examples/lsp` runs two tabs against a scripted in-process server and shows
+the traffic. `crates/scrive-lsp/README.md` covers the client in depth.
 
 ## Examples
 
@@ -244,10 +277,12 @@ cargo run -p scrive-iced --features lsp --example rust_analyzer -- path/to/file.
 editor. Press F12 on `greet`, F2 to rename it across both files, or Shift+Alt+F
 to format. Its main.rs shows inlay hints: Ctrl+click `name:` to jump to the
 parameter, double-click `: String` to insert it, and Ctrl+I to turn them off and
-on. `rust_analyzer` is native only and needs rust-analyzer on `PATH`; it talks
-to the server over stdio, and the status bar shows its messages. Its
-`cargo check` diagnostics refresh when you save with Ctrl+S (Cmd+S on macOS).
-It shows rust-analyzer's inlay hints; Ctrl+I toggles them.
+on. `rust_analyzer` is native only and needs rust-analyzer on `PATH`. It runs
+the server over stdio, shows its status and latest log line under the editor,
+restarts it if it crashes, and shuts it down when the window closes. Its
+`cargo check` diagnostics refresh when you save with Ctrl+S (Cmd+S on macOS),
+and the button by the status line turns check-on-save off and on. It shows
+rust-analyzer's inlay hints; Ctrl+I toggles them.
 
 ## Web (wasm32)
 
@@ -257,7 +292,9 @@ the bundled Fira Code ([`FIRA_CODE_FONT`](https://docs.rs/scrive-iced/latest/scr
 which `required_fonts()` includes there. Enable iced's `fira-sans` feature for
 UI text such as the find bar, and `webgl` for browsers without WebGPU. There
 are no threads, so a large document is highlighted on the UI thread instead of
-the background pool.
+the background pool. The LSP client works in the browser over a WebSocket
+(`lsp-websocket`) or against an in-process server; stdio and TCP are native
+only.
 
 Tree-sitter grammars build for the browser too, with one caveat for older
 grammar crates; see [Tree-sitter on wasm32](#tree-sitter-on-wasm32).
