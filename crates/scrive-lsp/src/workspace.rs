@@ -80,7 +80,7 @@ impl Locations {
                 Location::Plain { uri, range } => (uri, range),
             };
             let uri = uri.parse::<lsp_types::Uri>().ok()?;
-            Some((uri::normalize(&uri), range))
+            Some((uri::Key::new(&uri), range))
         })
     }
 }
@@ -116,7 +116,7 @@ impl Edit {
                 let Ok(uri) = text_document.uri.parse::<lsp_types::Uri>() else {
                     continue;
                 };
-                edit.merge(uri::normalize(&uri), text_document.version, edits)?;
+                edit.merge(uri::Key::new(&uri), text_document.version, edits)?;
             }
         } else if let Some(changes) = result.get("changes") {
             let map = changes
@@ -128,7 +128,7 @@ impl Edit {
                 let Ok(uri) = uri.parse::<lsp_types::Uri>() else {
                     continue;
                 };
-                entries.push((uri::normalize(&uri), edits));
+                entries.push((uri::Key::new(&uri), edits));
             }
             // The map has no order of its own.
             entries.sort_by(|(a, _), (b, _)| a.as_str().cmp(b.as_str()));

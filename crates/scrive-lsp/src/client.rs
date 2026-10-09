@@ -262,7 +262,7 @@ impl Client {
         if matches!(self.state, State::ShuttingDown { .. } | State::Exited) {
             return Ok(Output::default());
         }
-        let key = uri::normalize(uri);
+        let key = uri::Key::new(uri);
         let doc_id = snapshot.doc_id();
         if self
             .tracked
@@ -647,7 +647,7 @@ impl Client {
                         doc_id,
                         set.snapshot(),
                         set.revisions(),
-                        uri::normalize(&location.uri),
+                        uri::Key::new(&location.uri),
                         location.range,
                     )
                 });
@@ -817,7 +817,7 @@ impl Client {
             });
         }
         let params: PublishDiagnosticsParams = decode(&notification.method, notification.params)?;
-        let key = uri::normalize(&params.uri);
+        let key = uri::Key::new(&params.uri);
         let Some(tracked) = self.tracked.iter().find(|t| t.key == key) else {
             // A versioned publish cannot apply to a closed URI, but it does supersede the
             // unversioned set cached for it.
@@ -1316,7 +1316,7 @@ impl Client {
         else {
             return none();
         };
-        let key = uri::normalize(&location.uri);
+        let key = uri::Key::new(&location.uri);
         // The requesting document needs no check: its set is at the synced revision.
         let moved = self
             .tracked
@@ -1632,7 +1632,7 @@ impl Builder {
     /// is `1`.
     #[must_use]
     pub fn build(self) -> (Client, Message) {
-        let root = self.root.as_ref().map(uri::normalize);
+        let root = self.root.as_ref().map(uri::Key::new);
         let request = message::Id::Number(1);
         let initialize = message::Request::new::<lsp_types::request::Initialize>(
             request.clone(),

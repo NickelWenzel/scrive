@@ -9,11 +9,50 @@ use std::str::FromStr;
 
 use lsp_types::Uri;
 
-/// A normalized URI, made by [`normalize`]. Two spellings of one `file:` path produce equal keys.
+/// A normalized URI, made by [`Key::new`]. Two spellings of one `file:` path produce equal keys.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Key(Uri);
 
 impl Key {
+    /// Normalizes `uri` into a key.
+    ///
+    /// For `file:` URIs the scheme and a leading drive letter are lower-cased, a `localhost`
+    /// authority is dropped, and the path is re-encoded with one fixed RFC 3986 set: escapes
+    /// decode, except those that decode to `/`, `%`, `?` or `#` and bytes that are not UTF-8, and
+    /// everything outside the set (all non-ASCII included) is percent-encoded in upper-case hex.
+    /// The query and fragment are kept as they are. URIs of other schemes pass through unchanged.
+    ///
+    /// Normalizing a key's URI again yields the same key.
+    #[must_use]
+    pub fn new(uri: &Uri) -> Self {
+        let raw = uri.as_str();
+        let Some((scheme, rest)) = raw.split_once(':') else {
+            return Key(uri.clone());
+        };
+        if !scheme.eq_ignore_ascii_case("file") {
+            return Key(uri.clone());
+        }
+        let hier = without_query(rest);
+        let tail = &rest[hier.len()..];
+        let mut out = String::from("file:");
+        let path = match hier.strip_prefix("//") {
+            Some(after) => {
+                let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
+                out.push_str("//");
+                if !authority.eq_ignore_ascii_case("localhost") {
+                    out.push_str(authority);
+                }
+                path
+            }
+            None => hier,
+        };
+        out.push_str(&normalize_path(path));
+        out.push_str(tail);
+        // The output holds only characters fluent-uri accepts in a path, so the fallback never
+        // runs; it keeps the function total without a panic.
+        Uri::from_str(&out).map_or_else(|_| Key(uri.clone()), Key)
+    }
+
     /// The normalized URI, as sent to a server.
     #[must_use]
     pub fn uri(&self) -> &Uri {
@@ -48,6 +87,14 @@ impl Key {
             .find(|segment| !segment.is_empty())
             .map_or_else(|| self.as_str().to_owned(), decode)
     }
+
+    /// The file-system path of a `file:` key, `None` for other schemes. A drive letter comes
+    /// back as `c:/…` and a remote host as `//host/share/…`.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn to_path(&self) -> Option<std::path::PathBuf> {
+        self.file_path().map(std::path::PathBuf::from)
+    }
 }
 
 impl fmt::Display for Key {
@@ -56,43 +103,32 @@ impl fmt::Display for Key {
     }
 }
 
-/// Normalizes `uri` into a [`Key`].
-///
-/// For `file:` URIs the scheme and a leading drive letter are lower-cased, a `localhost`
-/// authority is dropped, and the path is re-encoded with one fixed RFC 3986 set: escapes decode,
-/// except those that decode to `/`, `%`, `?` or `#` and bytes that are not UTF-8, and everything
-/// outside the set (all non-ASCII included) is percent-encoded in upper-case hex. The query and
-/// fragment are kept as they are. URIs of other schemes pass through unchanged.
-///
-/// Normalizing a key's URI again yields the same key.
+/// The `file:` URI of the absolute `path`, normalized, with every byte outside RFC 3986's
+/// unreserved set, `/` and `:` percent-encoded. `None` for a relative path or one that is not
+/// UTF-8.
+#[cfg(not(target_family = "wasm"))]
 #[must_use]
-pub fn normalize(uri: &Uri) -> Key {
-    let raw = uri.as_str();
-    let Some((scheme, rest)) = raw.split_once(':') else {
-        return Key(uri.clone());
-    };
-    if !scheme.eq_ignore_ascii_case("file") {
-        return Key(uri.clone());
+pub fn from_path(path: &std::path::Path) -> Option<Uri> {
+    if !path.is_absolute() {
+        return None;
     }
-    let hier = without_query(rest);
-    let tail = &rest[hier.len()..];
-    let mut out = String::from("file:");
-    let path = match hier.strip_prefix("//") {
-        Some(after) => {
-            let (authority, path) = after.split_at(after.find('/').unwrap_or(after.len()));
-            out.push_str("//");
-            if !authority.eq_ignore_ascii_case("localhost") {
-                out.push_str(authority);
-            }
-            path
+    let mut path = path.to_str()?.to_owned();
+    if cfg!(windows) {
+        path = path.replace('\\', "/");
+    }
+    if !path.starts_with('/') {
+        // A drive-letter path: `file:///C:/…`.
+        path.insert(0, '/');
+    }
+    let mut text = String::from("file://");
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            text.push(char::from(byte));
+        } else {
+            push_escape(&mut text, byte);
         }
-        None => hier,
-    };
-    out.push_str(&normalize_path(path));
-    out.push_str(tail);
-    // The output holds only characters fluent-uri accepts in a path, so the fallback never runs;
-    // it keeps the function total without a panic.
-    Uri::from_str(&out).map_or_else(|_| Key(uri.clone()), Key)
+    }
+    Uri::from_str(&text).ok().map(|uri| Key::new(&uri).0)
 }
 
 /// `text` up to its query or fragment.
@@ -226,7 +262,7 @@ mod tests {
     ];
 
     fn key(text: &str) -> Key {
-        normalize(&Uri::from_str(text).expect("fixture URI parses"))
+        Key::new(&Uri::from_str(text).expect("fixture URI parses"))
     }
 
     fn assert_normalizes(pairs: &[(&str, &str)]) {
@@ -299,17 +335,66 @@ mod tests {
         );
     }
 
-    /// Everything `normalize` emits parses as a `Uri`, and normalizing it again changes nothing.
+    /// Everything `Key::new` emits parses as a `Uri`, and normalizing it again changes nothing.
     #[test]
     fn normalized_uris_round_trip_through_uri_from_str() {
         for &(input, _) in FIXTURES {
             let normalized = key(input);
             let reparsed = Uri::from_str(normalized.as_str()).expect("normalized URI parses");
             assert_eq!(
-                normalize(&reparsed),
+                Key::new(&reparsed),
                 normalized,
                 "{input} normalizes idempotently"
             );
         }
+    }
+
+    /// Spaces and non-ASCII are percent-encoded, and the result is already in normal form, so
+    /// the server sees the URI the host built.
+    #[cfg(unix)]
+    #[test]
+    fn from_path_percent_encodes_and_is_already_normalized() {
+        let uri = from_path(std::path::Path::new("/tmp/a dir/é.rs")).expect("an absolute path");
+        assert_eq!(
+            uri.as_str(),
+            "file:///tmp/a%20dir/%C3%A9.rs",
+            "the path is encoded"
+        );
+        assert_eq!(
+            Key::new(&uri).as_str(),
+            uri.as_str(),
+            "normalizing changes nothing"
+        );
+    }
+
+    /// A relative path names no file on its own.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn from_path_refuses_a_relative_path() {
+        assert_eq!(
+            from_path(std::path::Path::new("rel/x.rs")),
+            None,
+            "a relative path has no URI"
+        );
+    }
+
+    /// A path survives the round trip through its URI.
+    #[cfg(unix)]
+    #[test]
+    fn to_path_inverts_from_path() {
+        let path = std::path::Path::new("/tmp/a dir/é.rs");
+        let uri = from_path(path).expect("an absolute path");
+        assert_eq!(
+            Key::new(&uri).to_path().as_deref(),
+            Some(path),
+            "the path comes back"
+        );
+    }
+
+    /// Only `file:` keys name a path.
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn non_file_keys_have_no_path() {
+        assert_eq!(key("untitled:x").to_path(), None, "an untitled key has no path");
     }
 }
