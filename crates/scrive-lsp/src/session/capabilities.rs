@@ -9,8 +9,8 @@ use lsp_types::{
     ParameterInformationSettings, PublishDiagnosticsClientCapabilities, RenameClientCapabilities,
     ServerCapabilities, SignatureHelpClientCapabilities, SignatureInformationSettings,
     TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
-    TextDocumentSyncKind, TextDocumentSyncSaveOptions, WorkspaceClientCapabilities,
-    WorkspaceEditClientCapabilities,
+    TextDocumentSyncKind, TextDocumentSyncSaveOptions, WindowClientCapabilities,
+    WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
 };
 
 use crate::Encoding;
@@ -202,6 +202,12 @@ pub(crate) fn client() -> ClientCapabilities {
                 }),
             }),
             ..TextDocumentClientCapabilities::default()
+        }),
+        // `$/progress` reaches the host as a notification; `window/workDoneProgress/create` is
+        // answered with `null`.
+        window: Some(WindowClientCapabilities {
+            work_done_progress: Some(true),
+            ..WindowClientCapabilities::default()
         }),
         general: Some(GeneralClientCapabilities {
             // Preference order: utf-8 positions need no conversion walk.

@@ -1,15 +1,14 @@
 //! A scripted language server for the `lsp` example.
 //!
-//! It speaks raw JSON-RPC values, like the far end of a pipe, and answers at once: each reply is
-//! queued the moment its request arrives, and the example's transport delivers them one per
-//! `Message::Deliver`. Canned: `initialize`, completion, signature help, and hover (on `greet`).
+//! It speaks raw JSON-RPC values on the server end of an in-process `lsp_server::Connection`,
+//! and answers in `step()`, which the app calls after every update. Canned: `initialize`, completion, signature help, and hover (on `greet`).
 //! Computed from the text the client sent: diagnostics (trailing whitespace), definition
 //! (`fn <word>(` in any document), rename (whole-word, every document), formatting (strip
 //! trailing whitespace), and inlay hints: a type hint after `let x = f(…)` for a function some
 //! document defines, a parameter hint before each call's first argument, and their tooltips
 //! through `inlayHint/resolve`. Columns are bytes: the initialize result picks `utf-8` positions.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
@@ -77,12 +76,11 @@ const HOVER: &str = r#"{
 /// comes back as `Jump::Unopened`.
 const STRING_URI: &str = "file:///demo/std/string.rs";
 
-/// The server's state: each document as the client last described it, and the replies not yet
-/// delivered.
-#[derive(Default)]
+/// The server's state: each document as the client last described it, and its end of the
+/// connection.
 pub struct Scripted {
+    connection: lsp::lsp_server::Connection,
     documents: BTreeMap<String, Document>,
-    outbox: VecDeque<lsp::Message>,
 }
 
 struct Document {
@@ -100,9 +98,27 @@ struct Signature<'a> {
 }
 
 impl Scripted {
-    /// Take one message from the client, and queue whatever the server says back.
-    pub fn receive(&mut self, message: &lsp::Message) {
-        let wire = serde_json::to_value(message).expect("envelopes serialize");
+    /// A server on `connection`'s end.
+    pub fn new(connection: lsp::lsp_server::Connection) -> Self {
+        Self {
+            connection,
+            documents: BTreeMap::new(),
+        }
+    }
+
+    /// Answers everything the client has sent so far, and returns whether there was anything.
+    /// It never blocks, so it runs on the UI thread in a browser too.
+    pub fn step(&mut self) -> bool {
+        let mut stepped = false;
+        while let Ok(message) = self.connection.receiver.try_recv() {
+            stepped = true;
+            self.receive(&serde_json::to_value(message).expect("lsp-server messages serialize"));
+        }
+        stepped
+    }
+
+    /// Take one message from the client, and send whatever the server says back.
+    fn receive(&mut self, wire: &Value) {
         // A response to a server request: this server never asks, so there's nothing to match.
         let Some(method) = wire.get("method").and_then(Value::as_str) else {
             return;
@@ -115,16 +131,6 @@ impl Scripted {
             }
             None => self.notified(method, params),
         }
-    }
-
-    /// The next queued reply or notification, in order.
-    pub fn next(&mut self) -> Option<lsp::Message> {
-        self.outbox.pop_front()
-    }
-
-    /// Whether everything the server said has been delivered.
-    pub fn is_idle(&self) -> bool {
-        self.outbox.is_empty()
     }
 
     /// The text the server holds for `uri`, which is what the client's syncs built.
@@ -402,9 +408,10 @@ impl Scripted {
     }
 
     fn push(&mut self, envelope: Value) {
-        self.outbox.push_back(
-            serde_json::from_value(envelope).expect("the script writes valid envelopes"),
-        );
+        let message =
+            serde_json::from_value(envelope).expect("the script writes valid lsp-server messages");
+        // The client end is gone: nobody is left to answer.
+        let _ = self.connection.sender.send(message);
     }
 }
 

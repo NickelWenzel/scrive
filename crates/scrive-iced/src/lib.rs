@@ -102,7 +102,7 @@ pub use editor::{default_autoscroll_margin, Action, Editor, Wake, SCROLLBAR_WIDT
 pub use metrics::Metrics;
 
 /// The Language Server Protocol bridge, re-exported so a host names one crate:
-/// `scrive_iced::lsp::Client`, `scrive_iced::lsp::Message`, `scrive_iced::lsp::update`.
+/// `scrive_iced::lsp::Client`, `scrive_iced::lsp::client::Events`, `scrive_iced::lsp::update`.
 /// Needs the `lsp` feature.
 #[cfg(feature = "lsp")]
 pub use scrive_lsp as lsp;

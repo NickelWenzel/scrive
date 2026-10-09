@@ -5,33 +5,55 @@ edition.workspace = true
 license.workspace = true
 readme = "README.md"
 repository.workspace = true
-description = "A headless, I/O-free Language Server Protocol client for scrive: a pure state machine over JSON-RPC messages that syncs scrive-core documents and turns server replies into editor updates."
+description = "A headless Language Server Protocol client for scrive: it syncs scrive-core documents with a language server over a bridge it owns, and turns the server's replies into editor updates."
 keywords = ["lsp", "language-server", "editor", "headless"]
 categories = ["text-editors", "development-tools"]
 
-# HARD STRUCTURAL RULE: scrive-lsp does no I/O and depends on no GUI crate. The
-# host owns the transport and hands this crate one JSON-RPC message at a time;
-# every entry point returns the messages to send and the updates to apply. It
-# builds for wasm32, and CI runs `cargo tree -p scrive-lsp` and fails if
-# `iced`/`winit`/`wgpu` appears in its normal dependency graph.
+# STRUCTURAL RULE: only two module trees do I/O, spawn threads or read clocks:
+# `client` (the public `Client`, its builder and its `Events` stream) and
+# `transport` (the bridges). `session`, the LSP state machine, and everything it
+# calls stay pure, data in and data out, so they test without a server and their
+# unit tests run on wasm32-wasip1. No GUI crate and no async runtime: CI runs
+# `cargo tree -p scrive-lsp` and fails if `iced`/`winit`/`wgpu` appears in its
+# normal dependency graph.
 #
 # Dependency budget — each entry earns its place with a consumer:
-#   scrive-core — the document model the client syncs; its `Snapshot` is what
-#                 LSP positions convert against.
-#   lsp-types   — the LSP payload types, re-exported as `scrive_lsp::lsp_types`
-#                 so hosts and the client agree on one version. Pure data plus
-#                 serde; wasm-safe.
-#   serde       — the envelope's hand-written (De)Serialize impls, and derives on
-#                 the envelope's error object.
-#   serde_json  — `Value` for params and results that are decoded lazily, one
-#                 payload at a time.
-#   thiserror   — the crate's error enums.
+#   scrive-core       — the document model the client syncs; its `Snapshot` is
+#                       what LSP positions convert against.
+#   lsp-types         — the LSP payload types, re-exported as
+#                       `scrive_lsp::lsp_types`. Pure data plus serde; wasm-safe.
+#   lsp-server        — the memory bridge's `Connection`, re-exported as
+#                       `scrive_lsp::lsp_server` so host and client agree on one
+#                       version.
+#   crossbeam-channel — lsp-server's channels, which the memory bridge polls and
+#                       watches directly.
+#   futures-core      — the `Stream` that `client::Events` implements.
+#   futures-channel   — the channel the client feeds its own events through.
+#   serde, serde_json — the envelope's (de)serialization; `Value` payloads.
+#   thiserror         — the crate's error enums.
+#   wasmtimer         — browser only: the memory bridge's poll timer, since
+#                       `std::time` panics there.
 [dependencies]
 scrive-core.workspace = true
 lsp-types = "0.97"   # LSP payloads (re-exported; never wrapped)
+lsp-server = "0.10"  # the memory bridge's Connection (re-exported)
+crossbeam-channel = "0.5"
+futures-core = "0.3"
+futures-channel = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"     # envelope params/results as `Value`
 thiserror = "2"      # library error enums
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+wasmtimer = "0.4"    # default features, as iced's wasm tree already has them
+
+[dev-dependencies]
+# `now_or_never` and `StreamExt` for the deterministic memory tests, which run on wasip1 too.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+# `block_on` for the tests that use threads.
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 
 [package.metadata.docs.rs]
 all-features = true

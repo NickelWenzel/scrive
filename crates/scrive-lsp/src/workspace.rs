@@ -194,7 +194,7 @@ impl File {
 fn decode(source: serde_json::Error) -> Error {
     Error::Decode {
         method: lsp_types::request::Rename::METHOD.to_owned(),
-        source,
+        source: std::sync::Arc::new(source),
     }
 }
 
