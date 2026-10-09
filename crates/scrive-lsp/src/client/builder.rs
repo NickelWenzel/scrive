@@ -44,6 +44,8 @@ pub struct Builder {
     restart: restart::Policy,
     #[cfg(not(target_family = "wasm"))]
     backoff: Option<Duration>,
+    #[cfg(not(target_family = "wasm"))]
+    initialize_timeout: Option<Duration>,
 }
 
 impl Builder {
@@ -101,6 +103,17 @@ impl Builder {
         self
     }
 
+    /// How long the server may take to answer `initialize`; unset by default, because servers
+    /// index before they answer. Running out counts as losing the server: before its first
+    /// successful start the client stops with [`Reason::Timeout`](super::Reason::Timeout),
+    /// later the [restart policy](Self::restart) decides. A reply that arrives just before the
+    /// deadline can still lose the race against it.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn initialize_timeout(mut self, timeout: Duration) -> Self {
+        self.initialize_timeout = Some(timeout);
+        self
+    }
+
     /// The first wait before a lost server is started again, growing ×1.3 per attempt up to
     /// 10 s. Defaults to 1 second. For tests.
     #[doc(hidden)]
@@ -141,9 +154,10 @@ impl Builder {
             grace: self.grace.unwrap_or(GRACE),
             backoff: self.backoff.unwrap_or(BACKOFF),
             limit: self.backlog.unwrap_or(BACKLOG),
+            initialize_timeout: self.initialize_timeout,
         };
         let trace = self.trace;
-        let recovery = super::recovery::State::new(self.restart);
+        let recovery = super::recovery::State::new(self.restart, self.initialize_timeout);
         let started = transport::stdio::spawn(command, settings)?;
         let (session, initialize) = self.session(Some(std::process::id()));
         let (local, queued) = futures_channel::mpsc::unbounded();
@@ -170,7 +184,7 @@ impl Builder {
     pub fn memory(self, connection: lsp_server::Connection) -> (Client, Events) {
         let trace = self.trace;
         #[cfg(not(target_family = "wasm"))]
-        let recovery = super::recovery::State::new(self.restart);
+        let recovery = super::recovery::State::new(self.restart, None);
         let (session, initialize) = self.session(None);
         let lsp_server::Connection { sender, receiver } = connection;
         let (local, queued) = futures_channel::mpsc::unbounded();

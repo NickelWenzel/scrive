@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use super::{Id, Reason};
+use super::{Id, Status};
 use crate::{trace, transport};
 #[cfg(not(target_family = "wasm"))]
 use crate::log;
@@ -23,8 +23,8 @@ pub(crate) enum Payload {
     Transport(transport::Event),
     /// A message the client sent, traced.
     Sent(trace::Entry),
-    /// The client ended the connection itself: shutdown, or a failed `initialize`.
-    Stopped(Reason),
+    /// A status the client decided outside `receive`: a restart, or memory's own stops.
+    Status(Status),
 }
 
 /// A summary only: iced's `debug` feature formats every message, and a payload can be megabytes.
@@ -41,9 +41,8 @@ impl fmt::Debug for Event {
                 .field("direction", &trace::Direction::Outgoing)
                 .field("method", &entry.method())
                 .field("bytes", &entry.json().len()),
-            Payload::Transport(transport::Event::Stopped(reason)) | Payload::Stopped(reason) => {
-                event.field("stopped", reason)
-            }
+            Payload::Transport(transport::Event::Stopped(reason)) => event.field("stopped", reason),
+            Payload::Status(status) => event.field("status", status),
             #[cfg(not(target_family = "wasm"))]
             Payload::Transport(transport::Event::Log(entries)) => event
                 .field("log", &entries.first().map(log::Entry::source))
@@ -82,12 +81,18 @@ impl Event {
     }
 
     /// Whether the stream ends after this event: a bridge's own `Stopped`, or a stop the client
-    /// queued, which only a bridge that cannot restart does. A stop the client decides on a loss
-    /// is returned by `receive` instead, and the stream runs on.
+    /// queued for a bridge that cannot restart. A stop the client decides on a loss is returned
+    /// by `receive` instead, and the stream runs on for
+    /// [`Client::restart`](super::Client::restart).
     pub(crate) fn stops(&self) -> bool {
         match &self.payload {
-            Payload::Transport(transport::Event::Stopped(_)) | Payload::Stopped(_) => true,
-            Payload::Transport(transport::Event::Message { .. }) | Payload::Sent(_) => false,
+            Payload::Transport(transport::Event::Stopped(_))
+            | Payload::Status(Status::Stopped(_)) => true,
+            Payload::Transport(transport::Event::Message { .. })
+            | Payload::Sent(_)
+            | Payload::Status(Status::Starting | Status::Running | Status::Restarting { .. }) => {
+                false
+            }
             #[cfg(not(target_family = "wasm"))]
             Payload::Transport(
                 transport::Event::Log(_)

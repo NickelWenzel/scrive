@@ -7,11 +7,11 @@ mod tests;
 
 use std::io;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use super::{Client, Connection, Error, Reason, Status};
+use super::{documents, Client, Connection, Error, Reason, Status};
 use crate::transport::{self, Generation, Handshake, Lifecycle};
-use crate::{restart, Update};
+use crate::{restart, update, Update};
 
 /// What the client keeps to decide on losses.
 #[derive(Debug)]
@@ -25,6 +25,8 @@ pub(super) struct State {
     handshake: Handshake,
     /// Attempts since the client last reached `Running`.
     attempt: u32,
+    /// The builder's `initialize_timeout`, which `Error::Timeout` reports.
+    initialize_timeout: Option<Duration>,
 }
 
 /// What the client makes of a loss.
@@ -34,12 +36,13 @@ enum Decision {
 }
 
 impl State {
-    pub(super) fn new(policy: restart::Policy) -> Self {
+    pub(super) fn new(policy: restart::Policy, initialize_timeout: Option<Duration>) -> Self {
         Self {
             generation: Generation::FIRST,
             restarts: restart::Window::new(policy),
             handshake: Handshake::Pending,
             attempt: 0,
+            initialize_timeout,
         }
     }
 
@@ -79,7 +82,17 @@ impl Client {
         self.recovery.generation = generation;
         let live = matches!(self.connection, Connection::Live { .. });
         self.connection = Connection::Reconnecting;
-        let mut updates = if live { self.disconnect() } else { Vec::new() };
+        let mut updates = Vec::new();
+        if reason == Reason::Timeout {
+            let after = self
+                .recovery
+                .initialize_timeout
+                .expect("only an armed deadline runs out");
+            updates.push(Update::Error(Error::Timeout { after }));
+        }
+        if live {
+            updates.extend(self.disconnect());
+        }
         let status = match self.decide(reason) {
             Decision::Restart => {
                 self.recovery.attempt += 1;
@@ -145,6 +158,27 @@ impl Client {
         );
         self.send(output.messages, None);
         Vec::new()
+    }
+
+    /// `restart()` on a bridge whose worker can start the server again.
+    pub(super) fn restart_worker(&mut self) -> Vec<update::Document> {
+        if matches!(self.connection, Connection::Shut(_)) {
+            return Vec::new();
+        }
+        let settled = if matches!(self.connection, Connection::Live { .. }) {
+            self.disconnect()
+        } else {
+            Vec::new()
+        };
+        self.recovery.generation = self.recovery.generation.next();
+        self.connection = Connection::Reconnecting;
+        self.recovery.restarts.reset();
+        self.recovery.attempt = 1;
+        self.control
+            .send(Lifecycle::Restart(self.recovery.generation));
+        self.status = Status::Restarting { attempt: 1 };
+        self.queue(self.status.clone());
+        documents(settled)
     }
 
     /// No restart before the first successful `initialize`: a server that can't start once

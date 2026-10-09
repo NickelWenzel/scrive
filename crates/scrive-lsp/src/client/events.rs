@@ -15,8 +15,8 @@ use crate::transport;
 /// traces, its stops) before the bridge's. Until the host runs it, no reply reaches the client.
 ///
 /// It ends when the client is dropped, after `Stopped(Shutdown)`, and after any stop of a
-/// bridge that cannot restart. A server process that is lost and not started again leaves the
-/// stream running.
+/// bridge that cannot restart. A stop the client can recover from with
+/// [`Client::restart`](super::Client::restart) leaves the stream running.
 #[must_use = "a client whose Events nobody runs never sees a reply"]
 pub struct Events {
     client: Id,

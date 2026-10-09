@@ -48,6 +48,8 @@ pub(crate) struct Settings {
     pub(crate) backoff: Duration,
     /// Unwritten bytes past which the server counts as unresponsive.
     pub(crate) limit: usize,
+    /// How long a process may take to answer `initialize`; `None` waits forever.
+    pub(crate) initialize_timeout: Option<Duration>,
 }
 
 /// One connection's outgoing queue. Bodies go to the writer thread, which frames and writes them
@@ -163,6 +165,8 @@ struct Process {
     /// client's messages.
     link: Link,
     readers: Readers,
+    /// When the process has to have answered `initialize`, until the client says it did.
+    deadline: Option<Instant>,
 }
 
 /// Which of one connection's readers reached EOF.
@@ -203,6 +207,8 @@ enum Cause {
     Gone,
     /// It stopped reading its input.
     Unresponsive,
+    /// It did not answer `initialize` in time.
+    Timeout,
 }
 
 /// Splits stderr into lines across reads.
@@ -290,7 +296,9 @@ impl Supervisor {
         let wait = match &self.state {
             // A live process usually announces its end through its stdout reader; the timeout
             // catches one whose pipes a grandchild holds open.
-            State::Live(_) => Some(IDLE),
+            State::Live(process) => Some(process.deadline.map_or(IDLE, |deadline| {
+                IDLE.min(deadline.saturating_duration_since(now))
+            })),
             State::Closing { sequence, .. } => {
                 Some(POLL.min(sequence.until().saturating_duration_since(now)))
             }
@@ -366,9 +374,10 @@ impl Supervisor {
                 self.report(transport::Event::Stopped(client::Reason::Shutdown));
                 return ControlFlow::Break(());
             }
-            (Lifecycle::Handshaken(generation), State::Live(process))
+            (Lifecycle::Handshaken(generation), State::Live(mut process))
                 if generation == self.generation =>
             {
+                process.deadline = None;
                 self.retry = 0;
                 State::Live(process)
             }
@@ -378,7 +387,9 @@ impl Supervisor {
                 }
             }
             // A live connection is closed without `shutdown`, as a failed `initialize` needs.
-            (Lifecycle::Stop(generation), State::Live(process)) if generation == self.generation => {
+            (Lifecycle::Stop(generation), State::Live(process))
+                if generation == self.generation =>
+            {
                 self.generation = generation.next();
                 self.close(process, Handshake::Pending, Ending::Idle, now)
             }
@@ -388,6 +399,32 @@ impl Supervisor {
             ) if generation == self.generation => {
                 self.generation = generation.next();
                 State::Idle
+            }
+            // Whatever runs is killed without a loss: the client already let go of it.
+            (
+                Lifecycle::Restart(generation),
+                State::Live(mut process)
+                | State::Closing {
+                    mut process,
+                    ending: Ending::Idle,
+                    ..
+                },
+            ) if generation >= self.generation => {
+                let _ = process.end();
+                self.respawn(generation)
+            }
+            (
+                Lifecycle::Restart(generation),
+                State::Draining { .. } | State::Waiting | State::Backoff { .. } | State::Idle,
+            ) if generation >= self.generation => self.respawn(generation),
+            // A restart never runs behind the client, and a shutdown under way wins.
+            (Lifecycle::Restart(generation), state) => {
+                debug_assert!(
+                    generation >= self.generation,
+                    "restart {generation} is behind {}",
+                    self.generation
+                );
+                state
             }
             (
                 Lifecycle::Handshaken(_) | Lifecycle::Reconnect(_) | Lifecycle::Stop(_),
@@ -434,6 +471,9 @@ impl Supervisor {
         let state = std::mem::replace(&mut self.state, State::Idle);
         self.state = match state {
             State::Live(mut process) => match process.child.try_wait() {
+                Ok(None) if process.deadline.is_some_and(|deadline| now >= deadline) => {
+                    self.drain(process, Cause::Timeout, now)
+                }
                 Ok(None) => State::Live(process),
                 Ok(Some(_)) | Err(_) => self.drain(process, Cause::Gone, now),
             },
@@ -517,12 +557,20 @@ impl Supervisor {
                 signal: exit.signal,
             },
             Cause::Unresponsive => client::Reason::Unresponsive,
+            Cause::Timeout => client::Reason::Timeout,
         };
         State::Draining {
             readers: process.readers,
             reason,
             until: now + self.settings.grace,
         }
+    }
+
+    /// Starts connection `generation` at once, with the backoff starting over.
+    fn respawn(&mut self, generation: Generation) -> State {
+        self.generation = generation;
+        self.retry = 0;
+        self.connect()
     }
 
     /// Starts the process of the current generation. The connection is announced before its
@@ -542,7 +590,7 @@ impl Supervisor {
                     generation: self.generation,
                     link: Link::Stdio(spawned.writer.clone()),
                 });
-                State::Live(spawned.start())
+                State::Live(spawned.start(self.settings.initialize_timeout))
             }
             Err(Failure::Spawn(error) | Failure::Thread(error)) => {
                 self.report(transport::Event::Attempting {
@@ -575,8 +623,8 @@ impl Process {
 }
 
 impl Spawned {
-    /// Lets the readers start, and hands the process over.
-    fn start(self) -> Process {
+    /// Lets the readers start, and hands the process over with its `initialize` deadline armed.
+    fn start(self, initialize_timeout: Option<Duration>) -> Process {
         let Self {
             child,
             writer,
@@ -590,6 +638,7 @@ impl Spawned {
             child,
             link: Link::Stdio(writer),
             readers,
+            deadline: initialize_timeout.map(|timeout| Instant::now() + timeout),
         }
     }
 
@@ -682,13 +731,13 @@ pub(crate) fn spawn(
     let control = Control {
         notices: sender.clone(),
     };
-    let (handoff, slot) = mpsc::sync_channel(1);
+    let (handoff, slot) = mpsc::sync_channel::<(process::Command, Spawned)>(1);
     let supervisor = move || {
         if let Ok((command, spawned)) = slot.recv() {
             let supervisor = Supervisor {
                 command,
                 generation,
-                state: State::Live(Spawned::start(spawned)),
+                state: State::Live(spawned.start(settings.initialize_timeout)),
                 retry: 1,
                 settings,
                 events,
