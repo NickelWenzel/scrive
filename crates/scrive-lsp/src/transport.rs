@@ -8,18 +8,34 @@ mod generation;
 pub(crate) mod lifecycle;
 pub(crate) mod memory;
 #[cfg(not(target_family = "wasm"))]
+mod reader;
+#[cfg(not(target_family = "wasm"))]
+mod settings;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) mod stdio;
+#[cfg(all(test, not(target_family = "wasm")))]
+pub(crate) mod tap;
+#[cfg(not(target_family = "wasm"))]
+mod writer;
 
 #[cfg(not(target_family = "wasm"))]
 use core::pin::Pin;
 #[cfg(not(target_family = "wasm"))]
 use std::io;
+#[cfg(not(target_family = "wasm"))]
+use std::sync::mpsc;
 use std::sync::Arc;
+#[cfg(not(target_family = "wasm"))]
+use std::thread;
 use std::task::{Context, Poll};
 
 pub(crate) use generation::Generation;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use lifecycle::{Handshake, Lifecycle};
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use settings::Settings;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use writer::Writer;
 
 use crate::client;
 #[cfg(not(target_family = "wasm"))]
@@ -35,9 +51,9 @@ pub(crate) const SHUTDOWN_ID: &str = "scrive-lsp/shutdown";
 pub(crate) enum Link {
     /// The memory bridge.
     Memory(memory::Link),
-    /// The stdio bridge's writer thread.
+    /// A worker bridge's writer thread, on a pipe or a socket.
     #[cfg(not(target_family = "wasm"))]
-    Stdio(stdio::Writer),
+    Stream(Writer),
 }
 
 /// What a bridge reports. Protocol traffic names the connection it came from, so the client can
@@ -94,7 +110,50 @@ pub(crate) enum Control {
     Memory,
     /// The stdio bridge's supervisor.
     #[cfg(not(target_family = "wasm"))]
-    Stdio(stdio::Control),
+    Stdio(Handle),
+}
+
+/// The channel a worker bridge's threads report on.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) type Feed = futures_channel::mpsc::UnboundedSender<Event>;
+
+/// The client's line to a worker bridge's worker.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+pub(crate) struct Handle {
+    notices: mpsc::Sender<Notice>,
+}
+
+/// What a worker is told: by the client, and by the threads of one connection.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Debug)]
+pub(crate) enum Notice {
+    /// From the client.
+    Control(Lifecycle),
+    /// A reader of connection `generation` reached EOF or stopped reading.
+    Ended { generation: Generation, pipe: Pipe },
+    /// The writer of connection `generation` could not write.
+    WriteFailed(Generation),
+    /// The hung-server guard of connection `generation` tripped.
+    Backlog(Generation),
+    /// The stream reader of connection `generation` saw the reply to the shutdown request.
+    Replied(Generation),
+}
+
+/// The input of a connection a reader reads.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pipe {
+    Stdout,
+    Stderr,
+}
+
+/// A started worker bridge: what the client keeps, and the stream its traffic arrives on.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) struct Started {
+    pub(crate) link: Link,
+    pub(crate) control: Control,
+    pub(crate) inbound: Inbound,
 }
 
 impl Link {
@@ -103,7 +162,7 @@ impl Link {
         match self {
             Link::Memory(link) => link.send(&body),
             #[cfg(not(target_family = "wasm"))]
-            Link::Stdio(writer) => writer.send(body),
+            Link::Stream(writer) => writer.send(body),
         }
     }
 
@@ -113,7 +172,7 @@ impl Link {
     pub(crate) fn close(&self) {
         match self {
             Link::Memory(_) => {}
-            Link::Stdio(writer) => writer.close(),
+            Link::Stream(writer) => writer.close(),
         }
     }
 }
@@ -145,7 +204,32 @@ impl Control {
     pub(crate) fn send(&self, lifecycle: Lifecycle) {
         match self {
             Self::Memory => {}
-            Self::Stdio(control) => control.send(lifecycle),
+            Self::Stdio(handle) => handle.send(lifecycle),
         }
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Handle {
+    /// Tells the worker what the client decided. Ignored once the worker has stopped.
+    pub(crate) fn send(&self, lifecycle: Lifecycle) {
+        let _ = self.notices.send(Notice::Control(lifecycle));
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl Pipe {
+    /// The log entry for a line of non-LSP text read from this input.
+    fn noise(self, text: String) -> log::Entry {
+        match self {
+            Pipe::Stdout => log::Entry::stdout(text),
+            Pipe::Stderr => log::Entry::stderr(text),
+        }
+    }
+}
+
+/// Runs `body` on a new thread called `name`.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn start(name: String, body: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    thread::Builder::new().name(name).spawn(body).map(drop)
 }

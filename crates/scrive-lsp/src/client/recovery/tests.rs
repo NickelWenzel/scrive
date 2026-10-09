@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::client::{event, Builder, Event, Id};
-use crate::transport::stdio::tap;
+use crate::transport::tap;
 use crate::{trace, update};
 
 /// A stdio-flavoured client whose worker and connections are the test's.

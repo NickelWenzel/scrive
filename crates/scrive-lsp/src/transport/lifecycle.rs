@@ -151,12 +151,12 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::transport::stdio;
+    use crate::transport::tap;
 
     const GRACE: Duration = Duration::from_secs(2);
 
     /// The methods queued on `tap` since the last call, `close` for the close.
-    fn queued(tap: &stdio::tap::Queue) -> Vec<String> {
+    fn queued(tap: &tap::Queue) -> Vec<String> {
         tap.items()
             .into_iter()
             .map(|item| match item {
@@ -199,7 +199,7 @@ mod tests {
     /// After the handshake, `shutdown` goes out first; its reply sends `exit` and the close.
     #[test]
     fn sequence_sends_exit_after_the_reply() {
-        let (link, tap) = stdio::tap::Queue::link(Generation::FIRST);
+        let (link, tap) = tap::Queue::link(Generation::FIRST);
         let now = Instant::now();
         let mut sequence = Sequence::begin(&link, Handshake::Done, GRACE, now);
         let items = tap.items();
@@ -218,7 +218,7 @@ mod tests {
     /// A reply that doesn't come in time is given up on, and `exit` goes out anyway.
     #[test]
     fn sequence_moves_on_to_exit_when_the_reply_is_late() {
-        let (link, tap) = stdio::tap::Queue::link(Generation::FIRST);
+        let (link, tap) = tap::Queue::link(Generation::FIRST);
         let now = Instant::now();
         let mut sequence = Sequence::begin(&link, Handshake::Done, GRACE, now);
         let _ = tap.items();
@@ -239,7 +239,7 @@ mod tests {
     /// A server still there after the exit grace is killed.
     #[test]
     fn sequence_kills_after_the_exit_grace() {
-        let (link, _tap) = stdio::tap::Queue::link(Generation::FIRST);
+        let (link, _tap) = tap::Queue::link(Generation::FIRST);
         let now = Instant::now();
         let mut sequence = Sequence::begin(&link, Handshake::Done, GRACE, now);
         let _ = sequence.expired(&link, GRACE, now + GRACE);
@@ -253,7 +253,7 @@ mod tests {
     /// Before the handshake, only `exit` and the close go out.
     #[test]
     fn pending_handshake_skips_the_shutdown_request() {
-        let (link, tap) = stdio::tap::Queue::link(Generation::FIRST);
+        let (link, tap) = tap::Queue::link(Generation::FIRST);
         let mut sequence = Sequence::begin(&link, Handshake::Pending, GRACE, Instant::now());
         assert_eq!(queued(&tap), ["exit", "close"], "no shutdown request");
         assert_eq!(
@@ -266,7 +266,7 @@ mod tests {
     /// The close is queued behind `exit`'s body, so the server reads `exit` before EOF.
     #[test]
     fn the_close_follows_exit() {
-        let (link, tap) = stdio::tap::Queue::link(Generation::FIRST);
+        let (link, tap) = tap::Queue::link(Generation::FIRST);
         let _ = Sequence::begin(&link, Handshake::Pending, GRACE, Instant::now());
         let items = tap.items();
         let [Some(exit), None] = items.as_slice() else {

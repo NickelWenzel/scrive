@@ -2,17 +2,16 @@
 //! A supervisor thread owns the process and starts it again when the client says so; each
 //! process gets a writer, a stdout reader and a stderr reader of its own.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::ops::ControlFlow;
-use std::process::{self, Child, ChildStdin, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::process::{self, Child, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use super::frame;
 use super::lifecycle::{self, Handshake, Lifecycle};
-use super::{Generation, Link};
+use super::reader::{self, Reader};
+use super::{frame, Feed, Generation, Handle, Link, Notice, Pipe, Settings, Started, Writer};
 use crate::client::builder;
 use crate::{client, log, transport};
 
@@ -20,93 +19,9 @@ use crate::{client, log, transport};
 const IDLE: Duration = Duration::from_secs(1);
 /// How often it checks while the shutdown sequence runs.
 const POLL: Duration = Duration::from_millis(50);
-/// How much each respawn's backoff grows, and where it stops (monaco's reconnecting socket).
-const GROWTH: f64 = 1.3;
-const CAP: Duration = Duration::from_secs(10);
-/// Bytes per read from the server's stdout and stderr.
-const CHUNK: usize = 64 * 1024;
 /// Win32's `CREATE_NO_WINDOW` process creation flag.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// The channel the bridge's threads report on.
-type Feed = futures_channel::mpsc::UnboundedSender<transport::Event>;
-
-/// A started server: what the client keeps, and the stream its traffic arrives on.
-pub(crate) struct Started {
-    pub(crate) writer: Writer,
-    pub(crate) control: Control,
-    pub(crate) events: futures_channel::mpsc::UnboundedReceiver<transport::Event>,
-}
-
-/// What the builder hands the supervisor.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Settings {
-    /// How long each step of the shutdown sequence, and a dead process's output, may take.
-    pub(crate) grace: Duration,
-    /// The first delay before a respawn.
-    pub(crate) backoff: Duration,
-    /// Unwritten bytes past which the server counts as unresponsive.
-    pub(crate) limit: usize,
-    /// How long a process may take to answer `initialize`; `None` waits forever.
-    pub(crate) initialize_timeout: Option<Duration>,
-}
-
-/// One connection's outgoing queue. Bodies go to the writer thread, which frames and writes them
-/// in order. Clones share the queue; the server's stdin closes on [`Writer::close`], or once every
-/// clone is gone.
-#[derive(Clone, Debug)]
-pub(crate) struct Writer {
-    queue: mpsc::Sender<Item>,
-    backlog: Arc<Backlog>,
-    /// Where the guard reports its trip.
-    notices: mpsc::Sender<Notice>,
-    generation: Generation,
-}
-
-/// One entry of a connection's outgoing queue.
-#[derive(Debug)]
-enum Item {
-    /// A serialized message, framed by the writer thread.
-    Body(Arc<[u8]>),
-    /// Close the server's stdin; nothing after it is written.
-    Close,
-}
-
-/// Bytes queued for the server but not yet written, and the hung-server guard on them.
-#[derive(Debug)]
-struct Backlog {
-    unwritten: AtomicUsize,
-    limit: usize,
-    tripped: AtomicBool,
-}
-
-/// The client's line to the supervisor.
-#[derive(Debug)]
-pub(crate) struct Control {
-    notices: mpsc::Sender<Notice>,
-}
-
-/// What the supervisor is told: by the client, and by the threads of one connection.
-#[derive(Debug)]
-enum Notice {
-    /// From the client.
-    Control(Lifecycle),
-    /// A reader of connection `generation` reached EOF or stopped reading.
-    Ended { generation: Generation, pipe: Pipe },
-    /// The writer of connection `generation` could not write.
-    WriteFailed(Generation),
-    /// The hung-server guard of connection `generation` tripped.
-    Backlog(Generation),
-    /// The stdout reader of connection `generation` saw the reply to the shutdown request.
-    Replied(Generation),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pipe {
-    Stdout,
-    Stderr,
-}
 
 /// Owns the server process across its generations: reaps it, kills it, starts it again, and
 /// reports each loss for the client to decide on.
@@ -232,50 +147,6 @@ impl From<ExitStatus> for Exit {
     }
 }
 
-impl Writer {
-    /// Queues one serialized message. Dropped once the guard has tripped or the writer is gone.
-    pub(crate) fn send(&self, body: Arc<[u8]>) {
-        if self.backlog.tripped.load(Ordering::Relaxed) {
-            return;
-        }
-        let length = body.len();
-        // Counted before the send and given back after the write, so the count never goes
-        // below zero.
-        let unwritten = self.backlog.unwritten.fetch_add(length, Ordering::Relaxed) + length;
-        if self.queue.send(Item::Body(body)).is_err() {
-            self.backlog.unwritten.fetch_sub(length, Ordering::Relaxed);
-            return;
-        }
-        // Checked here, on the sending thread: the writer thread is the one stuck in
-        // `write_all` when the server stops reading.
-        if unwritten > self.backlog.limit && !self.backlog.tripped.swap(true, Ordering::Relaxed) {
-            let _ = self.notices.send(Notice::Backlog(self.generation));
-        }
-    }
-
-    /// Queues the close of the server's stdin behind everything queued so far.
-    pub(crate) fn close(&self) {
-        let _ = self.queue.send(Item::Close);
-    }
-}
-
-impl Backlog {
-    fn new(limit: usize) -> Self {
-        Self {
-            unwritten: AtomicUsize::new(0),
-            limit,
-            tripped: AtomicBool::new(false),
-        }
-    }
-}
-
-impl Control {
-    /// Tells the supervisor what the client decided. Ignored once the supervisor has stopped.
-    pub(crate) fn send(&self, lifecycle: Lifecycle) {
-        let _ = self.notices.send(Notice::Control(lifecycle));
-    }
-}
-
 impl Supervisor {
     fn run(mut self) {
         loop {
@@ -383,7 +254,7 @@ impl Supervisor {
             }
             (Lifecycle::Reconnect(generation), State::Waiting) if generation == self.generation => {
                 State::Backoff {
-                    until: now + delay(self.settings.backoff, self.retry),
+                    until: now + self.settings.delay(self.retry),
                 }
             }
             // A live connection is closed without `shutdown`, as a failed `initialize` needs.
@@ -576,7 +447,7 @@ impl Supervisor {
     /// Starts the process of the current generation. The connection is announced before its
     /// readers start, so the client holds it before anything it sends arrives.
     fn connect(&mut self) -> State {
-        let delay = delay(self.settings.backoff, self.retry);
+        let delay = self.settings.delay(self.retry);
         self.retry = self.retry.saturating_add(1);
         match launch(
             &mut self.command,
@@ -588,7 +459,7 @@ impl Supervisor {
             Ok(spawned) => {
                 self.report(transport::Event::Reconnected {
                     generation: self.generation,
-                    link: Link::Stdio(spawned.writer.clone()),
+                    link: Link::Stream(spawned.writer.clone()),
                 });
                 State::Live(spawned.start(self.settings.initialize_timeout))
             }
@@ -636,7 +507,7 @@ impl Spawned {
         }
         Process {
             child,
-            link: Link::Stdio(writer),
+            link: Link::Stream(writer),
             readers,
             deadline: initialize_timeout.map(|timeout| Instant::now() + timeout),
         }
@@ -701,7 +572,6 @@ impl Lines {
     }
 }
 
-
 /// Starts `command` with piped stdio, the threads that serve it, and the supervisor that owns
 /// it from then on.
 pub(crate) fn spawn(
@@ -728,7 +598,7 @@ pub(crate) fn spawn(
             }
         })?;
     let writer = spawned.writer.clone();
-    let control = Control {
+    let handle = Handle {
         notices: sender.clone(),
     };
     let (handoff, slot) = mpsc::sync_channel::<(process::Command, Spawned)>(1);
@@ -749,7 +619,7 @@ pub(crate) fn spawn(
     };
     // The supervisor gets its process only once its thread runs, so a failed start leaves the
     // process here to be killed.
-    if let Err(error) = start("scrive-lsp supervisor".to_owned(), supervisor) {
+    if let Err(error) = transport::start("scrive-lsp supervisor".to_owned(), supervisor) {
         spawned.abandon();
         return Err(builder::Error::Thread(error));
     }
@@ -757,9 +627,9 @@ pub(crate) fn spawn(
         .send((command, spawned))
         .expect("the supervisor waits for its process before anything else");
     Ok(Started {
-        writer,
-        control,
-        events: incoming,
+        link: Link::Stream(writer),
+        control: transport::Control::Stdio(handle),
+        inbound: transport::Inbound::Channel(incoming),
     })
 }
 
@@ -777,27 +647,23 @@ fn launch(
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
 
-    let (queue, outgoing) = mpsc::channel();
-    let backlog = Arc::new(Backlog::new(settings.limit));
-    let writer = Writer {
-        queue,
-        backlog: Arc::clone(&backlog),
-        notices: notices.clone(),
-        generation,
-    };
+    let (writer, outgoing) = Writer::new(generation, settings.limit, notices);
     let closing = Arc::new(AtomicBool::new(false));
     let (stdout_gate, stdout_opened) = mpsc::channel();
     let (stderr_gate, stderr_opened) = mpsc::channel::<()>();
 
-    let writing = {
-        let notices = notices.clone();
-        move || write(stdin, &outgoing, &backlog, &notices, generation)
-    };
+    let writing = move || outgoing.write(stdin, drop);
     let reading = {
-        let (events, notices, closing) = (events.clone(), notices.clone(), Arc::clone(&closing));
+        let reader = Reader {
+            events: events.clone(),
+            notices: notices.clone(),
+            generation,
+            pipe: Pipe::Stdout,
+            closing: Arc::clone(&closing),
+        };
         move || {
             if stdout_opened.recv().is_ok() {
-                read(stdout, &events, &notices, generation, &closing);
+                reader.read(stdout);
             }
         }
     };
@@ -810,9 +676,9 @@ fn launch(
         }
     };
     let name = |role: &str| format!("scrive-lsp {role} #{generation}");
-    let started = start(name("writer"), writing)
-        .and_then(|()| start(name("reader"), reading))
-        .and_then(|()| start(name("stderr"), draining));
+    let started = transport::start(name("writer"), writing)
+        .and_then(|()| transport::start(name("reader"), reading))
+        .and_then(|()| transport::start(name("stderr"), draining));
     if let Err(error) = started {
         // The threads already running end on their own: the writer's queue closes with
         // `writer`, and the readers' gates close unopened.
@@ -833,142 +699,6 @@ fn launch(
     })
 }
 
-fn start(name: String, body: impl FnOnce() + Send + 'static) -> io::Result<()> {
-    thread::Builder::new().name(name).spawn(body).map(drop)
-}
-
-/// The wait before respawn number `retry`: `base`, growing ×1.3 per retry up to 10 s.
-fn delay(base: Duration, retry: u32) -> Duration {
-    if base.is_zero() {
-        return Duration::ZERO;
-    }
-    let exponent = i32::try_from(retry).unwrap_or(i32::MAX);
-    Duration::try_from_secs_f64(base.as_secs_f64() * GROWTH.powi(exponent))
-        .map_or(CAP, |delay| delay.min(CAP))
-}
-
-/// Frames and writes every queued body until the close, or until every `Writer` is gone, then
-/// closes stdin by dropping it.
-fn write(
-    mut stdin: ChildStdin,
-    outgoing: &mpsc::Receiver<Item>,
-    backlog: &Backlog,
-    notices: &mpsc::Sender<Notice>,
-    generation: Generation,
-) {
-    for item in outgoing {
-        let Item::Body(body) = item else {
-            return;
-        };
-        let written = stdin.write_all(&frame::encode(&body));
-        backlog.unwritten.fetch_sub(body.len(), Ordering::Relaxed);
-        if written.is_err() {
-            let _ = notices.send(Notice::WriteFailed(generation));
-            return;
-        }
-    }
-}
-
-/// Decodes stdout until EOF, then tells the supervisor. It reads on after `Events` is dropped,
-/// so the server never blocks on a full pipe. Once `closing` is set, the reply to the shutdown
-/// request goes to the supervisor instead of the client.
-fn read(
-    mut stdout: impl Read,
-    events: &Feed,
-    notices: &mpsc::Sender<Notice>,
-    generation: Generation,
-    closing: &AtomicBool,
-) {
-    let mut decoder = frame::Decoder::default();
-    let mut chunk = vec![0; CHUNK];
-    let sink = Sink {
-        events,
-        notices,
-        generation,
-        closing,
-    };
-    loop {
-        let read = match stdout.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
-        };
-        if !sink.deliver(decoder.push(&chunk[..read])) {
-            break;
-        }
-    }
-    if let Some(line) = decoder.finish() {
-        let _ = events.unbounded_send(transport::Event::Log(Arc::from([log::Entry::stdout(line)])));
-    }
-    let _ = notices.send(Notice::Ended {
-        generation,
-        pipe: Pipe::Stdout,
-    });
-}
-
-/// Where the stdout reader of one connection sends what it decodes.
-struct Sink<'a> {
-    events: &'a Feed,
-    notices: &'a mpsc::Sender<Notice>,
-    generation: Generation,
-    closing: &'a AtomicBool,
-}
-
-impl Sink<'_> {
-    /// Forwards one read's items in order, consecutive noise lines as one log batch. `false`
-    /// once the stream is corrupt.
-    fn deliver(&self, items: Vec<frame::Item>) -> bool {
-        let generation = self.generation;
-        let mut noise = Vec::new();
-        for item in items {
-            let (event, corrupt) = match item {
-                frame::Item::Noise(text) => {
-                    noise.push(log::Entry::stdout(text));
-                    continue;
-                }
-                frame::Item::Body(body)
-                    if self.closing.load(Ordering::Relaxed)
-                        && lifecycle::is_shutdown_reply(&body) =>
-                {
-                    let _ = self.notices.send(Notice::Replied(generation));
-                    continue;
-                }
-                frame::Item::Body(body) => (
-                    transport::Event::Message {
-                        generation,
-                        body: Arc::from(body),
-                    },
-                    false,
-                ),
-                frame::Item::Skipped { length } => (self.oversized(length), false),
-                frame::Item::Corrupt { length } => (self.oversized(length), true),
-            };
-            flush(&mut noise, self.events);
-            let _ = self.events.unbounded_send(event);
-            if corrupt {
-                return false;
-            }
-        }
-        flush(&mut noise, self.events);
-        true
-    }
-
-    fn oversized(&self, length: u64) -> transport::Event {
-        transport::Event::Error {
-            generation: self.generation,
-            error: client::Error::Oversized { length },
-        }
-    }
-}
-
-/// Sends the batched noise lines as one log event, if there are any.
-fn flush(noise: &mut Vec<log::Entry>, events: &Feed) {
-    if !noise.is_empty() {
-        let _ = events.unbounded_send(transport::Event::Log(Arc::from(std::mem::take(noise))));
-    }
-}
-
 /// Reads stderr until EOF, one log event per read with one entry per line, then tells the
 /// supervisor.
 fn drain(
@@ -978,7 +708,7 @@ fn drain(
     generation: Generation,
 ) {
     let mut lines = Lines::default();
-    let mut chunk = vec![0; CHUNK];
+    let mut chunk = vec![0; reader::CHUNK];
     loop {
         match stderr.read(&mut chunk) {
             Ok(0) => break,
@@ -1002,210 +732,9 @@ fn send_lines(lines: Vec<String>, events: &Feed) {
     let _ = events.unbounded_send(transport::Event::Log(entries));
 }
 
-/// Stand-ins for a writer thread and a supervisor, for tests that read what the client sends.
-#[cfg(test)]
-pub(crate) mod tap {
-    use std::sync::{mpsc, Arc};
-
-    use super::{Backlog, Control, Item, Notice, Writer};
-    use crate::transport::{Generation, Lifecycle, Link};
-
-    /// A stdio link's queue, read by the test instead of a writer thread.
-    pub(crate) struct Queue(mpsc::Receiver<Item>);
-
-    /// A supervisor's inbox, read by the test.
-    pub(crate) struct Inbox(mpsc::Receiver<Notice>);
-
-    impl Queue {
-        /// A link of connection `generation`, and the tap on its queue. Its guard never trips.
-        pub(crate) fn link(generation: Generation) -> (Link, Self) {
-            let (queue, outgoing) = mpsc::channel();
-            let (notices, _) = mpsc::channel();
-            let writer = Writer {
-                queue,
-                backlog: Arc::new(Backlog::new(usize::MAX)),
-                notices,
-                generation,
-            };
-            (Link::Stdio(writer), Self(outgoing))
-        }
-
-        /// What was queued since the last call: each body as JSON, `None` for the close.
-        pub(crate) fn items(&self) -> Vec<Option<serde_json::Value>> {
-            self.0
-                .try_iter()
-                .map(|item| match item {
-                    Item::Body(body) => {
-                        Some(serde_json::from_slice(&body).expect("queued bodies are JSON"))
-                    }
-                    Item::Close => None,
-                })
-                .collect()
-        }
-    }
-
-    impl Inbox {
-        /// A control line to nobody but the test.
-        pub(crate) fn control() -> (Control, Self) {
-            let (notices, inbox) = mpsc::channel();
-            (Control { notices }, Self(inbox))
-        }
-
-        /// What the client told the supervisor since the last call.
-        pub(crate) fn lifecycles(&self) -> Vec<Lifecycle> {
-            self.0
-                .try_iter()
-                .filter_map(|notice| match notice {
-                    Notice::Control(lifecycle) => Some(lifecycle),
-                    Notice::Ended { .. }
-                    | Notice::WriteFailed(_)
-                    | Notice::Backlog(_)
-                    | Notice::Replied(_) => None,
-                })
-                .collect()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Everything the reader sent, in order.
-    fn sent(
-        mut incoming: futures_channel::mpsc::UnboundedReceiver<transport::Event>,
-    ) -> Vec<transport::Event> {
-        let mut events = Vec::new();
-        while let Ok(event) = incoming.try_recv() {
-            events.push(event);
-        }
-        events
-    }
-
-    /// The texts of a log event's entries, or `None` for any other event.
-    fn texts(event: &transport::Event) -> Option<Vec<&str>> {
-        let transport::Event::Log(entries) = event else {
-            return None;
-        };
-        Some(entries.iter().map(log::Entry::text).collect())
-    }
-
-    fn body(event: &transport::Event) -> Option<&[u8]> {
-        let transport::Event::Message { body, .. } = event else {
-            return None;
-        };
-        Some(body)
-    }
-
-    /// Frames become messages, and the noise lines between them one log batch per run.
-    #[test]
-    fn the_reader_forwards_frames_and_batches_noise_per_read() {
-        let mut stdout = b"banner\n".to_vec();
-        stdout.extend(frame::encode(b"{\"a\":1}"));
-        stdout.extend(b"a\nb\n");
-        stdout.extend(frame::encode(b"{\"b\":2}"));
-        let (events, incoming) = futures_channel::mpsc::unbounded();
-        let (notices, received) = mpsc::channel();
-        read(
-            stdout.as_slice(),
-            &events,
-            &notices,
-            Generation::FIRST,
-            &AtomicBool::new(false),
-        );
-        let events = sent(incoming);
-        assert_eq!(events.len(), 4, "four events: {events:?}");
-        assert_eq!(texts(&events[0]), Some(vec!["banner"]), "the banner");
-        assert_eq!(body(&events[1]), Some(&b"{\"a\":1}"[..]), "the first frame");
-        assert_eq!(
-            texts(&events[2]),
-            Some(vec!["a", "b"]),
-            "both lines in one batch"
-        );
-        assert_eq!(
-            body(&events[3]),
-            Some(&b"{\"b\":2}"[..]),
-            "the second frame"
-        );
-        assert!(
-            matches!(
-                received.try_recv(),
-                Ok(Notice::Ended {
-                    pipe: Pipe::Stdout,
-                    ..
-                })
-            ),
-            "the supervisor hears of the EOF"
-        );
-        assert!(
-            matches!(&events[0], transport::Event::Log(entries)
-                if entries[0].source() == log::Source::Stdout),
-            "the noise is stdout's"
-        );
-    }
-
-    /// While closing, the reply to the shutdown request goes to the supervisor, not the client;
-    /// before that it is an ordinary message.
-    #[test]
-    fn the_reader_swallows_the_shutdown_reply_only_while_closing() {
-        let reply = frame::encode(br#"{"id":"scrive-lsp/shutdown","result":null}"#);
-        for (closing, forwarded) in [(false, 1), (true, 0)] {
-            let (events, incoming) = futures_channel::mpsc::unbounded();
-            let (notices, received) = mpsc::channel();
-            read(
-                reply.as_slice(),
-                &events,
-                &notices,
-                Generation::FIRST,
-                &AtomicBool::new(closing),
-            );
-            assert_eq!(sent(incoming).len(), forwarded, "closing: {closing}");
-            let replied = received
-                .try_iter()
-                .any(|notice| matches!(notice, Notice::Replied(_)));
-            assert_eq!(replied, closing, "the supervisor hears of it while closing");
-        }
-    }
-
-    /// A length above 1 GiB is reported and ends the reading; a frame after it is not
-    /// forwarded.
-    #[test]
-    fn the_reader_stops_on_a_corrupt_length() {
-        let mut stdout = b"Content-Length: 2000000000\r\n\r\n".to_vec();
-        stdout.extend(frame::encode(b"{}"));
-        let (events, incoming) = futures_channel::mpsc::unbounded();
-        let (notices, received) = mpsc::channel();
-        read(
-            stdout.as_slice(),
-            &events,
-            &notices,
-            Generation::FIRST,
-            &AtomicBool::new(false),
-        );
-        let events = sent(incoming);
-        assert!(
-            matches!(
-                events.as_slice(),
-                [transport::Event::Error {
-                    error: client::Error::Oversized {
-                        length: 2_000_000_000
-                    },
-                    ..
-                }]
-            ),
-            "only the error: {events:?}"
-        );
-        assert!(
-            matches!(
-                received.try_recv(),
-                Ok(Notice::Ended {
-                    pipe: Pipe::Stdout,
-                    ..
-                })
-            ),
-            "the supervisor hears of the end"
-        );
-    }
 
     /// A character split between two reads decodes whole.
     #[test]
@@ -1253,69 +782,5 @@ mod tests {
         let mut lines = Lines::default();
         assert!(lines.push(b"last words").is_empty(), "no line yet");
         assert_eq!(lines.finish().as_deref(), Some("last words"), "flushed");
-    }
-
-    /// A writer whose queue nobody drains, with room for `limit` bytes.
-    fn stalled(limit: usize) -> (Writer, mpsc::Receiver<Item>, mpsc::Receiver<Notice>) {
-        let (queue, outgoing) = mpsc::channel();
-        let (notices, received) = mpsc::channel();
-        let writer = Writer {
-            queue,
-            backlog: Arc::new(Backlog::new(limit)),
-            notices,
-            generation: Generation::FIRST,
-        };
-        (writer, outgoing, received)
-    }
-
-    /// The first send past the limit trips the guard once; later sends are dropped.
-    #[test]
-    fn the_guard_trips_once_past_its_limit() {
-        let (writer, outgoing, received) = stalled(10);
-        writer.send(Arc::from(&b"123456"[..]));
-        assert!(
-            received.try_recv().is_err(),
-            "below the limit nothing trips"
-        );
-        writer.send(Arc::from(&b"123456"[..]));
-        assert!(
-            matches!(received.try_recv(), Ok(Notice::Backlog(Generation::FIRST))),
-            "past the limit the guard trips"
-        );
-        writer.send(Arc::from(&b"123456"[..]));
-        assert!(received.try_recv().is_err(), "it trips once");
-        assert_eq!(
-            outgoing.try_iter().count(),
-            2,
-            "the send after the trip is dropped"
-        );
-    }
-
-    /// The backoff starts at its base, grows by 30% per retry and stops at 10 s.
-    #[test]
-    fn backoff_grows_by_thirty_percent_up_to_ten_seconds() {
-        let second = Duration::from_secs(1);
-        assert_eq!(delay(second, 0), second, "the base");
-        assert_eq!(delay(second, 1), Duration::from_millis(1300), "30% more");
-        assert_eq!(delay(second, 100), CAP, "capped");
-        assert_eq!(delay(second, u32::MAX), CAP, "still capped");
-        assert_eq!(delay(Duration::ZERO, 7), Duration::ZERO, "no backoff stays none");
-    }
-
-    /// A send that finds the writer gone takes its bytes back, so a dead writer never trips the
-    /// guard.
-    #[test]
-    fn a_send_to_a_gone_writer_gives_its_bytes_back() {
-        let (writer, outgoing, received) = stalled(10);
-        drop(outgoing);
-        for _ in 0..3 {
-            writer.send(Arc::from(&b"123456"[..]));
-        }
-        assert_eq!(
-            writer.backlog.unwritten.load(Ordering::Relaxed),
-            0,
-            "nothing is counted"
-        );
-        assert!(received.try_recv().is_err(), "the guard never trips");
     }
 }
