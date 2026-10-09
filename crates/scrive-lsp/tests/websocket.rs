@@ -1,6 +1,7 @@
 //! The WebSocket bridge against `tungstenite::accept` on loopback.
 #![cfg(not(target_family = "wasm"))]
 
+use std::io::Read;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -587,6 +588,58 @@ fn a_close_frame_is_logged_before_the_status_change() {
     harness.until(running);
     harness.shut_down();
     server.join().expect("the second server ran");
+}
+
+/// A server that answers the client's close frame but never closes TCP, though RFC 6455 §7.1.1
+/// has the server close first, is let go of within the shutdown grace: the client drops the
+/// socket and stops.
+#[test]
+fn shutdown_ends_when_the_server_answers_the_close_but_keeps_tcp_open() {
+    let grace = Duration::from_millis(200);
+    let (listener, url) = listener();
+    let mut harness = Harness::new(
+        Client::builder()
+            .shutdown_grace(grace)
+            .websocket(&url)
+            .expect("the worker starts"),
+    );
+    let server = thread::spawn(move || {
+        let mut peer = Peer::accept(&listener);
+        peer.initialize();
+        loop {
+            match peer.read() {
+                Some(Frame::Data { body, .. }) => {
+                    let message: Value =
+                        serde_json::from_str(&body).expect("the client sends JSON");
+                    if message["method"] == "shutdown" {
+                        peer.send(&reply(&message["id"], Value::Null));
+                    }
+                }
+                Some(Frame::Close) => break,
+                None => panic!("the client sends a close frame before it goes"),
+            }
+        }
+        // Reading the close wrote tungstenite's reply; this only flushes what is left of it.
+        let _ = peer.socket.flush();
+        let mut buffer = [0; 64];
+        loop {
+            match peer.socket.get_mut().read(&mut buffer) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) => panic!("the client closes TCP: {error}"),
+            }
+        }
+    });
+    harness.until(running);
+    let asked = Instant::now();
+    harness.shut_down();
+    let elapsed = asked.elapsed();
+    // The shutdown reply comes at once, so the stop waits out one grace period; the rest is slack.
+    assert!(
+        elapsed < grace + Duration::from_secs(2),
+        "the stop came within the grace: {elapsed:?}"
+    );
+    server.join().expect("the server saw the client close TCP");
 }
 
 /// A ping from the server is answered while the client is idle.
