@@ -11,7 +11,7 @@ use futures::StreamExt;
 use scrive_core::intel::ticket::Counter;
 use scrive_core::{Diagnostic, Document, HoverInfo, HoverRequest};
 use scrive_lsp::client::{self, Client, Reason, Status};
-use scrive_lsp::lsp_server::{Message, Notification, RequestId, Response};
+use scrive_lsp::lsp_server::{Connection, Message, Notification, RequestId, Response};
 use scrive_lsp::{update, Update};
 use serde_json::{json, Value};
 
@@ -172,7 +172,7 @@ impl Peer {
             panic!("the client opens with a request");
         };
         assert_eq!(request.method, "initialize", "the first message");
-        self.write(Response::new_ok(request.id, capabilities()));
+        self.write(Response::new_ok(request.id, initialized()));
         request.params
     }
 
@@ -188,12 +188,10 @@ impl Peer {
                     let result = match request.method.as_str() {
                         "initialize" => {
                             transcript.process_id = Some(request.params["processId"].clone());
-                            capabilities()
+                            initialized()
                         }
                         "textDocument/hover" => {
-                            let pid = transcript.process_id.clone().unwrap_or_default();
-                            let value = format!("pid {pid}");
-                            json!({ "contents": { "kind": "markdown", "value": value } })
+                            hover(transcript.process_id.as_ref().unwrap_or(&Value::Null))
                         }
                         "shutdown" => {
                             transcript.shutdown = Some(request.id.clone());
@@ -218,8 +216,19 @@ impl Peer {
     }
 }
 
+/// Hover and full sync.
 fn capabilities() -> Value {
-    json!({ "capabilities": { "hoverProvider": true, "textDocumentSync": 1 } })
+    json!({ "hoverProvider": true, "textDocumentSync": 1 })
+}
+
+/// The `initialize` result with [`capabilities`].
+fn initialized() -> Value {
+    json!({ "capabilities": capabilities() })
+}
+
+/// A hover answer naming `process_id`.
+fn hover(process_id: &Value) -> Value {
+    json!({ "contents": { "kind": "markdown", "value": format!("pid {process_id}") } })
 }
 
 /// One `fake` diagnostic over `value` for `uri`, at `version`.
@@ -248,6 +257,11 @@ fn vacant() -> SocketAddr {
     TcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
         .expect("a loopback port is free")
+}
+
+/// Port 0 on loopback, for the OS to pick a port.
+fn loopback() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
 /// A listener on a free loopback port, and its address.
@@ -543,4 +557,131 @@ fn shutdown_both_wakes_a_reader_blocked_on_a_silent_peer() {
         matches!(result, Ok(Ok(0) | Err(_))),
         "the reader returned: {result:?}"
     );
+}
+
+/// An lsp-server that dials in runs the whole conversation, and its loop ends after `exit`.
+#[test]
+fn listen_carries_a_whole_conversation_from_a_connecting_lsp_server() {
+    let mut harness = Harness::new(builder().listen(loopback()).expect("the port binds"));
+    let address = harness.client.listening_on().expect("a listen client");
+    let server = thread::spawn(move || {
+        let (connection, _threads) = Connection::connect(address).expect("the client listens");
+        let params = connection
+            .initialize(capabilities())
+            .expect("the client initializes");
+        let mut log = Vec::new();
+        for message in &connection.receiver {
+            match message {
+                Message::Request(request) => {
+                    log.push(request.method.clone());
+                    // A request between `shutdown` and `exit` fails this, which ends the
+                    // conversation as well.
+                    if connection.handle_shutdown(&request).unwrap_or(true) {
+                        log.push("exit".to_owned());
+                        break;
+                    }
+                    let result = match request.method.as_str() {
+                        "textDocument/hover" => hover(&params["processId"]),
+                        _ => Value::Null,
+                    };
+                    connection
+                        .sender
+                        .send(Response::new_ok(request.id, result).into())
+                        .expect("lsp-server's writer runs");
+                }
+                Message::Notification(notification) => {
+                    log.push(notification.method.clone());
+                    if notification.method == "textDocument/didOpen" {
+                        let document = &notification.params["textDocument"];
+                        connection
+                            .sender
+                            .send(publish(&document["uri"], &document["version"]).into())
+                            .expect("lsp-server's writer runs");
+                    }
+                }
+                Message::Response(_) => log.push("reply".to_owned()),
+            }
+        }
+        (params, log)
+    });
+    harness.until(running);
+    let doc = harness.open();
+    harness.until(published_fake);
+    let request = harness.hover(&doc);
+    harness.until(|update| {
+        hovered(update, &request)
+            .flatten()
+            .is_some_and(|card| card.markdown.contains("pid null"))
+    });
+    harness.shut_down();
+    let (params, log) = server.join().expect("the server ran");
+    assert_eq!(
+        params["processId"],
+        Value::Null,
+        "no process id over a socket"
+    );
+    assert!(
+        log.ends_with(&["shutdown".to_owned(), "exit".to_owned()]),
+        "the loop ended after shutdown and exit: {log:?}"
+    );
+}
+
+/// A server that dialed in and disconnects stops the client for good: the stream ends, and
+/// there is nothing to restart.
+#[test]
+fn listen_stops_closed_when_its_server_disconnects() {
+    let mut harness = Harness::new(builder().listen(loopback()).expect("the port binds"));
+    let address = harness.client.listening_on().expect("a listen client");
+    let mut peer = Peer::new(TcpStream::connect(address).expect("the client listens"));
+    let _ = peer.initialize();
+    harness.until(running);
+    peer.writer
+        .get_ref()
+        .shutdown(Shutdown::Both)
+        .expect("the connection shuts down");
+    drop(peer);
+    let end = harness.to_end();
+    assert_eq!(
+        end.last().and_then(stopped),
+        Some(&Reason::Closed),
+        "the stop is last and says closed: {end:#?}"
+    );
+    assert!(
+        matches!(
+            harness.client.restart(),
+            Err(scrive_lsp::Error::Unrestartable)
+        ),
+        "a listen client can't restart"
+    );
+    assert_eq!(
+        harness.client.listening_on(),
+        Some(address),
+        "the bound address stays"
+    );
+}
+
+/// A listener no server dialed closes on shutdown and on drop, and its port is free again.
+#[test]
+fn listen_releases_its_port_when_shut_down_before_any_dial() {
+    let address = vacant();
+    let mut harness = Harness::new(builder().listen(address).expect("the port binds"));
+    let asked = Instant::now();
+    harness.shut_down();
+    let elapsed = asked.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "the stop came at once: {elapsed:?}"
+    );
+    drop(TcpListener::bind(address).expect("the port is free after the stop"));
+
+    let dropped = builder().listen(address).expect("the port binds again");
+    drop(dropped);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while let Err(error) = TcpListener::bind(address) {
+        assert!(
+            Instant::now() < deadline,
+            "the port is free within a poll of the drop: {error}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }

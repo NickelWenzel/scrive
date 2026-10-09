@@ -4,7 +4,7 @@
 pub mod error;
 
 #[cfg(not(target_family = "wasm"))]
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
@@ -200,6 +200,32 @@ impl Builder {
         let budget = self.connect_timeout.unwrap_or(CONNECT_TIMEOUT);
         let started = transport::tcp::connect(address, budget, self.settings())?;
         Ok(self.start(started, None))
+    }
+
+    /// Waits for a language server to connect to `address`: the client side of
+    /// `lsp_server::Connection::connect`. The client sends `initialize` at once, queued until the
+    /// server connects, with `processId` `null`.
+    ///
+    /// The listener is bound before this returns, so [`Client::listening_on`] can tell the server
+    /// where to dial, also when `address` has port 0. It accepts exactly one connection and then
+    /// closes. When that connection ends, the client stops with
+    /// [`Reason::Closed`](super::Reason::Closed) and its [`Events`] ends; it can't be restarted.
+    /// Dropping the client or [`Client::shutdown`] before the server connected closes the
+    /// listener. Otherwise it behaves like [`connect`](Self::connect), keepalive caveat
+    /// included: no TCP keepalive is set.
+    ///
+    /// Whoever connects first receives the text of every open document. Bind a loopback address
+    /// such as `127.0.0.1`, not `0.0.0.0`.
+    ///
+    /// # Errors
+    /// [`Error::Bind`] when `address` can't be bound, [`Error::Thread`] when the worker thread
+    /// cannot be created.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn listen(self, address: SocketAddr) -> Result<(Client, Events), Error> {
+        let (started, bound) = transport::tcp::listen(address, self.settings())?;
+        let (mut client, events) = self.start(started, None);
+        client.listening_on = Some(bound);
+        Ok((client, events))
     }
 
     /// A client on the client end of an in-process pair from

@@ -78,7 +78,9 @@ pub enum Error {
         /// The builder's `initialize_timeout`.
         after: Duration,
     },
-    /// This bridge cannot start its server again: an in-process server belongs to the host.
+    /// This bridge cannot start its server again: an in-process server belongs to the host, and
+    /// a server that dialed in to [`listen`](super::Builder::listen) is started again by
+    /// whoever started it.
     #[error("this bridge cannot restart its server")]
     Unrestartable,
 }

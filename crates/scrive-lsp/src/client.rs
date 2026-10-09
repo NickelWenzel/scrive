@@ -11,6 +11,8 @@ mod status;
 #[cfg(test)]
 mod tests;
 
+#[cfg(not(target_family = "wasm"))]
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -50,8 +52,9 @@ const OWNED: [&str; 8] = {
     ]
 };
 
-/// One connection to one language server, over the bridge its [`Builder`] chose: a child
-/// process with `Builder::stdio`, or an in-process server with [`Builder::memory`].
+/// One connection to one language server, over the bridge its [`Builder`] chose: natively, a
+/// child process with `Builder::stdio` or a socket with `Builder::connect` and
+/// `Builder::listen`; on every target, an in-process server with [`Builder::memory`].
 ///
 /// The client sends by itself; the host runs the [`Events`] stream the builder returned and
 /// passes each event to [`receive`](Self::receive), which folds it in and returns the updates.
@@ -73,6 +76,9 @@ pub struct Client {
     /// Losing and regaining the server, which only a worker bridge does.
     #[cfg(not(target_family = "wasm"))]
     recovery: recovery::State,
+    /// The address a `listen` client bound.
+    #[cfg(not(target_family = "wasm"))]
+    listening_on: Option<SocketAddr>,
 }
 
 /// A process-unique client identity, so an editor can tell which client it is registered with.
@@ -119,7 +125,9 @@ impl Drop for Client {
             #[cfg(not(target_family = "wasm"))]
             (
                 Connection::Live { generation, .. },
-                transport::Control::Stdio(handle) | transport::Control::Tcp(handle),
+                transport::Control::Stdio(handle)
+                | transport::Control::Tcp(handle)
+                | transport::Control::Listen(handle),
             ) => {
                 handle.send(transport::Lifecycle::Shutdown {
                     generation: *generation,
@@ -394,7 +402,9 @@ impl Client {
                     self.stop(Reason::Shutdown);
                 }
                 #[cfg(not(target_family = "wasm"))]
-                transport::Control::Stdio(handle) | transport::Control::Tcp(handle) => {
+                transport::Control::Stdio(handle)
+                | transport::Control::Tcp(handle)
+                | transport::Control::Listen(handle) => {
                     let connection =
                         std::mem::replace(&mut self.connection, Connection::Shut(None));
                     if let Connection::Live { generation, link } = connection {
@@ -428,14 +438,26 @@ impl Client {
     /// documents.
     ///
     /// # Errors
-    /// [`Error::Unrestartable`] on a bridge that cannot start its server (memory).
+    /// [`Error::Unrestartable`] on a bridge that cannot start its server: memory, and a
+    /// `listen` client.
     #[must_use = "the settled documents clear the editors' awaited slots"]
     pub fn restart(&mut self) -> Result<Vec<update::Document>, Error> {
         match &self.control {
+            #[cfg(not(target_family = "wasm"))]
+            transport::Control::Listen(_) => Err(Error::Unrestartable),
             transport::Control::Memory => Err(Error::Unrestartable),
             #[cfg(not(target_family = "wasm"))]
             transport::Control::Stdio(_) | transport::Control::Tcp(_) => Ok(self.restart_worker()),
         }
+    }
+
+    /// The address a `listen` client bound, with the port the OS picked for port 0, so the
+    /// server can be told where to dial. `None` for every other bridge. It stays the bound
+    /// address after the server connected and the listener closed.
+    #[cfg(not(target_family = "wasm"))]
+    #[must_use]
+    pub fn listening_on(&self) -> Option<SocketAddr> {
+        self.listening_on
     }
 
     /// Folds one event from this client's [`Events`] in, and returns what the host must act on,
@@ -512,6 +534,8 @@ impl Client {
             status: Status::Starting,
             #[cfg(not(target_family = "wasm"))]
             recovery,
+            #[cfg(not(target_family = "wasm"))]
+            listening_on: None,
         }
     }
 
@@ -630,9 +654,9 @@ impl Client {
             match &self.control {
                 transport::Control::Memory => self.stop(Reason::Initialize),
                 #[cfg(not(target_family = "wasm"))]
-                transport::Control::Stdio(_) | transport::Control::Tcp(_) => {
-                    updates.extend(self.refused());
-                }
+                transport::Control::Stdio(_)
+                | transport::Control::Tcp(_)
+                | transport::Control::Listen(_) => updates.extend(self.refused()),
             }
         }
         updates
