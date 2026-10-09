@@ -26,6 +26,19 @@ pub enum Reason {
     Initialize,
     /// The bridge could not run, for example a thread failed to spawn.
     Failed(Arc<io::Error>),
+    /// The server process ended. On Unix `signal` is set when a signal killed it (a `SIGSEGV`
+    /// or `SIGABRT` means a crash); otherwise `code` is its exit code. A process the client
+    /// killed shows the kill (`signal: Some(9)` on Unix, `code: Some(1)` on Windows): one whose
+    /// stdout closed while it kept running, or that announced a message over 1 GiB.
+    Exited {
+        /// The exit code, when it exited by itself.
+        code: Option<i32>,
+        /// The signal that killed it, on Unix.
+        signal: Option<i32>,
+    },
+    /// The server stopped reading its input: more messages than it could take waited to be
+    /// written (256 MiB), so it was killed.
+    Unresponsive,
 }
 
 /// `Stopped` compares by its reason.
@@ -47,9 +60,25 @@ impl PartialEq for Reason {
         match (self, other) {
             (Self::Shutdown, Self::Shutdown)
             | (Self::Closed, Self::Closed)
-            | (Self::Initialize, Self::Initialize) => true,
+            | (Self::Initialize, Self::Initialize)
+            | (Self::Unresponsive, Self::Unresponsive) => true,
             (Self::Failed(a), Self::Failed(b)) => a.kind() == b.kind(),
-            (Self::Shutdown | Self::Closed | Self::Initialize | Self::Failed(_), _) => false,
+            (
+                Self::Exited { code, signal },
+                Self::Exited {
+                    code: other_code,
+                    signal: other_signal,
+                },
+            ) => code == other_code && signal == other_signal,
+            (
+                Self::Shutdown
+                | Self::Closed
+                | Self::Initialize
+                | Self::Failed(_)
+                | Self::Exited { .. }
+                | Self::Unresponsive,
+                _,
+            ) => false,
         }
     }
 }

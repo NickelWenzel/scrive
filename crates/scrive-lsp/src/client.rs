@@ -1,7 +1,7 @@
 //! The language-server client: one connection to one server, built by a [`Builder`] terminal,
 //! with incoming traffic as the [`Events`] stream.
 
-mod builder;
+pub mod builder;
 pub mod error;
 mod event;
 mod events;
@@ -48,7 +48,8 @@ const OWNED: [&str; 8] = {
     ]
 };
 
-/// One connection to one language server, over the bridge its [`Builder`] chose.
+/// One connection to one language server, over the bridge its [`Builder`] chose: a child
+/// process with `Builder::stdio`, or an in-process server with [`Builder::memory`].
 ///
 /// The client sends by itself; the host runs the [`Events`] stream the builder returned and
 /// passes each event to [`receive`](Self::receive), which folds it in and returns the updates.
@@ -63,6 +64,8 @@ pub struct Client {
     /// The current connection's outgoing queue; `None` once it is over, and messages are then
     /// dropped.
     connection: Option<transport::Link>,
+    /// The bridge's worker, told when the client is done with the server.
+    control: transport::Control,
     /// Feeds the client's own events into `Events`: outgoing traces and its stops.
     local: futures_channel::mpsc::UnboundedSender<Event>,
     trace: trace::Mode,
@@ -82,9 +85,20 @@ struct Answering {
 /// Dropping the client ends the connection as [`Client::shutdown`] would, without tracing.
 impl Drop for Client {
     fn drop(&mut self) {
-        if let Some(connection) = self.connection.take() {
-            for message in self.goodbye() {
-                connection.send(serialize(&message));
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        match &self.control {
+            transport::Control::Memory => {
+                for message in self.goodbye() {
+                    connection.send(serialize(&message));
+                }
+            }
+            #[cfg(not(target_family = "wasm"))]
+            transport::Control::Stdio(control) => {
+                control.send(transport::Lifecycle::Shutdown {
+                    handshake: self.handshake(),
+                });
             }
         }
     }
@@ -326,19 +340,30 @@ impl Client {
     /// Ends the connection: every request in flight settles with its empty answer, returned for
     /// the editors to apply; from then on nothing is synced and every request declines. The
     /// server is sent `shutdown` and `exit` (only `exit` before the handshake completed), and
-    /// [`Status::Stopped`]`(`[`Reason::Shutdown`]`)` follows through [`Events`]. A second call
-    /// does nothing.
+    /// [`Status::Stopped`]`(`[`Reason::Shutdown`]`)` follows through [`Events`]: for a server
+    /// process, once it exited or was killed after the grace period. A second call does nothing.
     #[must_use]
     pub fn shutdown(&mut self) -> Vec<update::Document> {
         let goodbye = self.goodbye();
+        #[cfg(not(target_family = "wasm"))]
+        let handshake = self.handshake();
         let settled = self.session.shutdown();
         debug_assert!(
             settled.messages.is_empty(),
             "the session sends no shutdown of its own"
         );
         if self.connection.is_some() {
-            self.send(goodbye, None);
-            self.stop(Reason::Shutdown);
+            match &self.control {
+                transport::Control::Memory => {
+                    self.send(goodbye, None);
+                    self.stop(Reason::Shutdown);
+                }
+                #[cfg(not(target_family = "wasm"))]
+                transport::Control::Stdio(control) => {
+                    control.send(transport::Lifecycle::Shutdown { handshake });
+                    self.connection = None;
+                }
+            }
         }
         documents(settled.updates)
     }
@@ -359,6 +384,12 @@ impl Client {
         }
         match payload {
             event::Payload::Transport(transport::Event::Message(body)) => self.received(body),
+            #[cfg(not(target_family = "wasm"))]
+            event::Payload::Transport(transport::Event::Log(entries)) => {
+                entries.iter().cloned().map(Update::Log).collect()
+            }
+            #[cfg(not(target_family = "wasm"))]
+            event::Payload::Transport(transport::Event::Error(error)) => vec![Update::Error(error)],
             event::Payload::Sent(entry) => vec![Update::Trace(entry)],
             event::Payload::Transport(transport::Event::Stopped(reason))
             | event::Payload::Stopped(reason) => self.stopped(reason),
@@ -369,6 +400,7 @@ impl Client {
         id: Id,
         session: Session,
         link: transport::Link,
+        control: transport::Control,
         local: futures_channel::mpsc::UnboundedSender<Event>,
         trace: trace::Mode,
     ) -> Self {
@@ -376,6 +408,7 @@ impl Client {
             id,
             session,
             connection: Some(link),
+            control,
             local,
             trace,
             status: Status::Starting,
@@ -487,6 +520,10 @@ impl Client {
             updates.push(Update::Status(Status::Running));
         } else if initializing && !self.session.initializing() {
             // No capabilities, so nothing can be synced: the connection is over.
+            #[cfg(not(target_family = "wasm"))]
+            self.control.send(transport::Lifecycle::Shutdown {
+                handshake: transport::Handshake::Pending,
+            });
             self.stop(Reason::Initialize);
         }
         updates
@@ -520,6 +557,16 @@ impl Client {
         );
         vec![message::Message::Request(shutdown), exit]
     }
+
+    /// Whether the server answered `initialize`, for the worker's shutdown sequence.
+    #[cfg(not(target_family = "wasm"))]
+    fn handshake(&self) -> transport::Handshake {
+        if self.session.running() {
+            transport::Handshake::Done
+        } else {
+            transport::Handshake::Pending
+        }
+    }
 }
 
 impl Id {
@@ -529,7 +576,7 @@ impl Id {
 }
 
 /// `message` as the JSON text that goes on the wire.
-fn serialize(message: &message::Message) -> Arc<[u8]> {
+pub(crate) fn serialize(message: &message::Message) -> Arc<[u8]> {
     serde_json::to_vec(message)
         .expect("envelopes serialize to JSON")
         .into()

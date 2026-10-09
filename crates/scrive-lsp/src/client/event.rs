@@ -4,6 +4,8 @@ use core::fmt;
 
 use super::{Id, Reason};
 use crate::{trace, transport};
+#[cfg(not(target_family = "wasm"))]
+use crate::log;
 
 /// One item of a client's [`Events`](super::Events): hand it to
 /// [`Client::receive`](super::Client::receive). Cheap to clone, and `Send` on every target, so it
@@ -41,6 +43,12 @@ impl fmt::Debug for Event {
             Payload::Transport(transport::Event::Stopped(reason)) | Payload::Stopped(reason) => {
                 event.field("stopped", reason)
             }
+            #[cfg(not(target_family = "wasm"))]
+            Payload::Transport(transport::Event::Log(entries)) => event
+                .field("log", &entries.first().map(log::Entry::source))
+                .field("lines", &entries.len()),
+            #[cfg(not(target_family = "wasm"))]
+            Payload::Transport(transport::Event::Error(error)) => event.field("error", error),
         };
         event.finish()
     }
@@ -60,6 +68,8 @@ impl Event {
         match &self.payload {
             Payload::Transport(transport::Event::Stopped(_)) | Payload::Stopped(_) => true,
             Payload::Transport(transport::Event::Message(_)) | Payload::Sent(_) => false,
+            #[cfg(not(target_family = "wasm"))]
+            Payload::Transport(transport::Event::Log(_) | transport::Event::Error(_)) => false,
         }
     }
 }
