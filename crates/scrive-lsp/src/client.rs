@@ -61,9 +61,7 @@ const OWNED: [&str; 8] = {
 pub struct Client {
     id: Id,
     session: Session,
-    /// The current connection's outgoing queue; `None` once it is over, and messages are then
-    /// dropped.
-    connection: Option<transport::Link>,
+    connection: Connection,
     /// The bridge's worker, told when the client is done with the server.
     control: transport::Control,
     /// Feeds the client's own events into `Events`: outgoing traces and its stops.
@@ -76,6 +74,17 @@ pub struct Client {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Id(u64);
 
+/// What the client holds of its transport, which decides where messages go.
+#[derive(Debug)]
+enum Connection {
+    /// The session's messages go to `link`.
+    Live { link: transport::Link },
+    /// `shutdown()` ran or the connection stopped: absorbing. After a worker bridge's
+    /// `shutdown()` the link stays, so server requests during the grace period still get their
+    /// `null` answers.
+    Shut(Option<transport::Link>),
+}
+
 /// The server request a response answers: its id and method.
 struct Answering {
     id: message::Id,
@@ -85,13 +94,13 @@ struct Answering {
 /// Dropping the client ends the connection as [`Client::shutdown`] would, without tracing.
 impl Drop for Client {
     fn drop(&mut self) {
-        let Some(connection) = self.connection.take() else {
+        let Connection::Live { link } = &self.connection else {
             return;
         };
         match &self.control {
             transport::Control::Memory => {
                 for message in self.goodbye() {
-                    connection.send(serialize(&message));
+                    link.send(serialize(&message));
                 }
             }
             #[cfg(not(target_family = "wasm"))]
@@ -340,8 +349,9 @@ impl Client {
     /// Ends the connection: every request in flight settles with its empty answer, returned for
     /// the editors to apply; from then on nothing is synced and every request declines. The
     /// server is sent `shutdown` and `exit` (only `exit` before the handshake completed), and
-    /// [`Status::Stopped`]`(`[`Reason::Shutdown`]`)` follows through [`Events`]: for a server
-    /// process, once it exited or was killed after the grace period. A second call does nothing.
+    /// [`Status::Stopped`]`(`[`Reason::Shutdown`]`)` follows through [`Events`]. A server process
+    /// gets the grace period for its reply to `shutdown`, then for exiting after `exit`, and is
+    /// killed after that. A second call does nothing.
     #[must_use]
     pub fn shutdown(&mut self) -> Vec<update::Document> {
         let goodbye = self.goodbye();
@@ -352,7 +362,7 @@ impl Client {
             settled.messages.is_empty(),
             "the session sends no shutdown of its own"
         );
-        if self.connection.is_some() {
+        if let Connection::Live { .. } = self.connection {
             match &self.control {
                 transport::Control::Memory => {
                     self.send(goodbye, None);
@@ -361,7 +371,11 @@ impl Client {
                 #[cfg(not(target_family = "wasm"))]
                 transport::Control::Stdio(control) => {
                     control.send(transport::Lifecycle::Shutdown { handshake });
-                    self.connection = None;
+                    let connection =
+                        std::mem::replace(&mut self.connection, Connection::Shut(None));
+                    if let Connection::Live { link } = connection {
+                        self.connection = Connection::Shut(Some(link));
+                    }
                 }
             }
         }
@@ -407,7 +421,7 @@ impl Client {
         Self {
             id,
             session,
-            connection: Some(link),
+            connection: Connection::Live { link },
             control,
             local,
             trace,
@@ -437,8 +451,9 @@ impl Client {
                     .local
                     .unbounded_send(Event::new(self.id, event::Payload::Sent(entry)));
             }
-            if let Some(connection) = &self.connection {
-                connection.send(body);
+            match &self.connection {
+                Connection::Live { link } | Connection::Shut(Some(link)) => link.send(body),
+                Connection::Shut(None) => {}
             }
         }
     }
@@ -467,7 +482,7 @@ impl Client {
 
     /// Ends the connection from this side: drops the link and queues `Stopped(reason)`.
     fn stop(&mut self, reason: Reason) {
-        self.connection = None;
+        self.connection = Connection::Shut(None);
         // `Events` was dropped: nobody is left to tell.
         let _ = self
             .local
@@ -531,7 +546,7 @@ impl Client {
 
     /// The connection is over: settles and clears through `disconnected`, once, then reports it.
     fn stopped(&mut self, reason: Reason) -> Vec<Update> {
-        self.connection = None;
+        self.connection = Connection::Shut(None);
         let session::Output {
             messages,
             mut updates,

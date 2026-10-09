@@ -82,6 +82,16 @@ impl Link {
             Link::Stdio(writer) => writer.send(body),
         }
     }
+
+    /// Closes the server's input once everything queued before this call is written. Memory's
+    /// end closes when its sender drops instead.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn close(&self) {
+        match self {
+            Link::Memory(_) => {}
+            Link::Stdio(writer) => writer.close(),
+        }
+    }
 }
 
 impl Inbound {

@@ -65,8 +65,8 @@ impl Builder {
         self
     }
 
-    /// How long the server gets to exit after `shutdown` and `exit` before it is killed, and how
-    /// long its output may stay open after it exits. Defaults to 2 seconds.
+    /// How long the server gets to answer `shutdown`, and then to exit after `exit`, before it is
+    /// killed; also how long its output may stay open after it exits. Defaults to 2 seconds.
     #[cfg(not(target_family = "wasm"))]
     pub fn shutdown_grace(mut self, grace: Duration) -> Self {
         self.grace = Some(grace);
