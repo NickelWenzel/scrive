@@ -42,6 +42,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown, wasm32-wasip1
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
@@ -56,6 +57,10 @@ jobs:
       # examples must build.
       - name: Build for wasm32-unknown-unknown
         run: cargo build --workspace --all-targets --all-features --target wasm32-unknown-unknown
+
+      # The memory bridge's browser poll compiles only for this target; lint it.
+      - name: Clippy scrive-lsp for wasm32-unknown-unknown (no warnings)
+        run: cargo clippy -p scrive-lsp --all-features --target wasm32-unknown-unknown -- -D warnings
 
       # The tree-sitter backend runs in the browser target, with no imports.
       - name: Run the tree-sitter wasm smoke test
