@@ -14,8 +14,8 @@ categories = ["text-editors", "development-tools"]
 # `transport` (the bridges). `session`, the LSP state machine, and everything it
 # calls stay pure, data in and data out, so they test without a server and their
 # unit tests run on wasm32-wasip1. No GUI crate and no async runtime: CI runs
-# `cargo tree -p scrive-lsp` and fails if `iced`/`winit`/`wgpu` appears in its
-# normal dependency graph.
+# `cargo tree -p scrive-lsp --target all`, with default and with all features,
+# and fails if `iced`/`winit`/`wgpu`/`tokio` appears in its normal dependency graph.
 #
 # Dependency budget — each entry earns its place with a consumer:
 #   scrive-core       — the document model the client syncs; its `Snapshot` is
