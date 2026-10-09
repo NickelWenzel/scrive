@@ -16,8 +16,9 @@
 //! one for its tooltip. Ctrl+I (Cmd+I on macOS) turns them off and on.
 //!
 //! The update loop is the one `examples/lsp` uses, cut down to one editor. The server runs as a
-//! child process started by `Builder::stdio`, which owns its pipes, threads and shutdown. The
-//! server's log goes to this process's stderr. Closing the window shuts the server down first.
+//! child process started by `Builder::stdio`, which owns its pipes, threads and shutdown, and
+//! starts it again if it crashes. The status bar shows where the server stands, and the line
+//! under it the server's latest log line. Closing the window shuts the server down first.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> iced::Result {
@@ -91,6 +92,10 @@ fn main() {
         file: PathBuf,
         /// The one-line status bar.
         status: String,
+        /// The server's latest stderr or `window/logMessage` line.
+        log: String,
+        /// Set by the close request: the window closes once the server has shut down.
+        closing: bool,
         /// Whether rust-analyzer runs `cargo check` on save; the button flips it.
         check_on_save: bool,
         /// Whether inlay hints show; Ctrl+I flips it.
@@ -199,6 +204,8 @@ fn main() {
                 client,
                 file: workspace.file.clone(),
                 status: format!("starting {SERVER}…"),
+                log: String::new(),
+                closing: false,
                 check_on_save: true,
                 hints: true,
             };
@@ -212,6 +219,8 @@ fn main() {
                 client,
                 file,
                 status,
+                log,
+                closing,
                 check_on_save,
                 hints,
             } = self;
@@ -285,28 +294,27 @@ fn main() {
                             }
                             lsp::Update::Status(lsp::client::Status::Stopped(
                                 lsp::client::Reason::Shutdown,
-                            )) => return iced::exit(),
-                            lsp::Update::Status(other) => {
-                                *status = format!("{SERVER}: {other:?}");
-                            }
+                            )) if *closing => return iced::exit(),
+                            // A dead server's progress never ends, so every status replaces
+                            // the progress headline.
+                            lsp::Update::Status(other) => *status = described(&other),
                             lsp::Update::Error(error) => *status = format!("error: {error}"),
-                            // rust-analyzer's own log stays on this process's stderr.
-                            lsp::Update::Log(entry)
-                                if entry.source() == lsp::log::Source::Stderr =>
-                            {
-                                eprintln!("{}", entry.text());
+                            lsp::Update::Log(entry) => {
+                                if let Some(line) = entry.text().lines().next() {
+                                    *log = line.to_owned();
+                                }
                             }
-                            lsp::Update::Log(_)
-                            | lsp::Update::Notification(_)
-                            | lsp::Update::Trace(_) => {}
+                            lsp::Update::Notification(_) | lsp::Update::Trace(_) => {}
                         }
                     }
                     Task::none()
                 }
                 Message::CloseRequested => {
-                    if let lsp::client::Status::Stopped(_) = client.status() {
+                    let shut = lsp::client::Status::Stopped(lsp::client::Reason::Shutdown);
+                    if client.status() == &shut {
                         return iced::exit();
                     }
+                    *closing = true;
                     for document in client.shutdown() {
                         let _ = editor.apply_lsp(client, document);
                     }
@@ -325,11 +333,15 @@ fn main() {
                 "check on save: off"
             };
             let check = button(text(check).size(12)).on_press(Message::ToggleCheck);
+            let log = text(self.log.as_str())
+                .size(12)
+                .font(scrive_iced::DEFAULT_FONT);
             column![
                 container(self.editor.view().map(Message::Editor))
                     .width(Fill)
                     .height(Fill),
                 container(row![check, status].spacing(8)).padding([2, 8]),
+                container(log).padding([0, 8]),
             ]
             .into()
         }
@@ -431,6 +443,44 @@ fn main() {
         }
     }
 
+    /// The status line for where the server stands.
+    fn described(status: &lsp::client::Status) -> String {
+        match status {
+            lsp::client::Status::Starting => format!("starting {SERVER}…"),
+            lsp::client::Status::Running => format!("{SERVER} ready"),
+            lsp::client::Status::Restarting { attempt } => {
+                format!("{SERVER} stopped; restarting (attempt {attempt})…")
+            }
+            lsp::client::Status::Stopped(reason) => {
+                format!("{SERVER} stopped: {}", stopped(reason))
+            }
+        }
+    }
+
+    /// Why the server stopped, for a person.
+    fn stopped(reason: &lsp::client::Reason) -> String {
+        match reason {
+            lsp::client::Reason::Shutdown => "shut down".to_owned(),
+            lsp::client::Reason::Closed => "it closed the connection".to_owned(),
+            lsp::client::Reason::Initialize => "it failed to initialize".to_owned(),
+            lsp::client::Reason::Failed(error) => format!("the connection failed: {error}"),
+            lsp::client::Reason::Exited {
+                signal: Some(signal),
+                ..
+            } => format!("it was killed by signal {signal}"),
+            lsp::client::Reason::Exited {
+                code: Some(code), ..
+            } => format!("it exited with code {code}"),
+            lsp::client::Reason::Exited {
+                code: None,
+                signal: None,
+            } => "it exited".to_owned(),
+            lsp::client::Reason::Unresponsive => "it stopped reading its input".to_owned(),
+            lsp::client::Reason::GaveUp => "it kept crashing, so it was given up on".to_owned(),
+            lsp::client::Reason::Timeout => "it did not answer initialize in time".to_owned(),
+        }
+    }
+
     /// The status line an update earns: a message the server asked to show, and the title of a
     /// `$/progress` report.
     fn headline(update: &lsp::Update) -> Option<String> {
@@ -528,6 +578,38 @@ fn main() {
                 )
                 .is_empty(),
                 "log messages stay off the bar"
+            );
+        }
+
+        /// Every stop reason reads as a sentence on the status bar.
+        #[test]
+        fn stopped_reasons_read_as_sentences() {
+            let stop = |reason| described(&lsp::client::Status::Stopped(reason));
+            assert_eq!(
+                stop(lsp::client::Reason::Exited {
+                    code: Some(101),
+                    signal: None
+                }),
+                "rust-analyzer stopped: it exited with code 101",
+                "an exit code"
+            );
+            assert_eq!(
+                stop(lsp::client::Reason::Exited {
+                    code: None,
+                    signal: Some(11)
+                }),
+                "rust-analyzer stopped: it was killed by signal 11",
+                "a signal"
+            );
+            assert_eq!(
+                stop(lsp::client::Reason::GaveUp),
+                "rust-analyzer stopped: it kept crashing, so it was given up on",
+                "the policy gave up"
+            );
+            assert_eq!(
+                described(&lsp::client::Status::Restarting { attempt: 2 }),
+                "rust-analyzer stopped; restarting (attempt 2)…",
+                "a restart"
             );
         }
 
