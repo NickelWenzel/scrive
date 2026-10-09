@@ -2,7 +2,8 @@
 //!
 //! A [`Client`] owns its connection to one server. A [`client::Builder`] terminal picks the
 //! bridge (natively `Builder::stdio` for a server process, and `Builder::connect` and
-//! `Builder::listen` for a server on a TCP socket; everywhere
+//! `Builder::listen` for a server on a TCP socket; with the `websocket` feature
+//! `Builder::websocket` for one behind a WebSocket; everywhere
 //! [`Builder::memory`](client::Builder::memory) for an in-process server) and returns the client
 //! with its [`client::Events`], the stream of everything the server sends. The host runs that
 //! stream and hands each event to [`Client::receive`], which returns the [`Update`]s to apply.
@@ -24,7 +25,8 @@
 //! - URI identity and file paths → [`uri`]
 //!
 //! Payloads are [`lsp_types`], and the in-process bridge takes an [`lsp_server`] connection;
-//! both are re-exported so a host and this crate always agree on one version.
+//! both are re-exported so a host and this crate always agree on one version. So is `rustls`
+//! natively with the `websocket` feature, for `Builder::tls`.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
@@ -53,4 +55,6 @@ pub use client::{Client, Error};
 pub(crate) use encoding::Encoding;
 pub use lsp_server;
 pub use lsp_types;
+#[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+pub use rustls;
 pub use update::Update;

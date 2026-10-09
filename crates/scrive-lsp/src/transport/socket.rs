@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use super::lifecycle::{self, Handshake, Lifecycle};
 use super::settings::grow;
+#[cfg(feature = "websocket")]
+use super::websocket;
 use super::writer::Outgoing;
 use super::{tcp, Feed, Generation, Handle, Link, Notice, Settings, Started, Writer};
 use crate::client::builder;
@@ -112,17 +114,25 @@ enum Ending {
 pub(crate) enum Endpoint {
     /// A TCP address, resolved again on each dial.
     Tcp(tcp::Dial),
+    /// A WebSocket URL.
+    #[cfg(feature = "websocket")]
+    Websocket(websocket::Endpoint),
 }
 
 /// A connection's outgoing queue, made before its socket so the client can send at once.
 enum Queue {
     /// Bodies framed with `Content-Length`, written by a writer thread.
     Stream { writer: Writer, outgoing: Outgoing },
+    /// Messages sent one per frame by a WebSocket's I/O thread.
+    #[cfg(feature = "websocket")]
+    Websocket(websocket::Queue),
 }
 
 /// A socket that is up, before its threads run.
 enum Dialed {
     Tcp(TcpStream),
+    #[cfg(feature = "websocket")]
+    Websocket(websocket::Socket),
 }
 
 /// A connection's threads, started and waiting for its queue.
@@ -131,12 +141,16 @@ enum Pending {
         threads: tcp::Threads,
         stream: TcpStream,
     },
+    #[cfg(feature = "websocket")]
+    Websocket(websocket::Pending),
 }
 
 /// What tears a started connection down.
 enum Socket {
     /// Shut down to release the reader and the writer, which are never joined.
     Tcp(TcpStream),
+    #[cfg(feature = "websocket")]
+    Websocket(websocket::Connection),
 }
 
 /// One connection: the worker's handle on its socket and queue, and what its reader reported.
@@ -575,6 +589,8 @@ impl Worker {
         };
         match endpoint {
             Endpoint::Tcp(dial) => dial(deadline).map(Dialed::Tcp),
+            #[cfg(feature = "websocket")]
+            Endpoint::Websocket(endpoint) => endpoint.dial(deadline).map(Dialed::Websocket),
         }
     }
 
@@ -656,6 +672,11 @@ impl Mode {
                 let (writer, outgoing) = Writer::new(generation, limit, notices);
                 Ok(Queue::Stream { writer, outgoing })
             }
+            #[cfg(feature = "websocket")]
+            Mode::Connect {
+                endpoint: Endpoint::Websocket(_),
+                ..
+            } => websocket::Queue::new(generation, limit, notices).map(Queue::Websocket),
         }
     }
 
@@ -667,6 +688,11 @@ impl Mode {
                 ..
             }
             | Mode::Listen => "tcp",
+            #[cfg(feature = "websocket")]
+            Mode::Connect {
+                endpoint: Endpoint::Websocket(_),
+                ..
+            } => "websocket",
         }
     }
 }
@@ -676,6 +702,8 @@ impl Queue {
     fn link(&self) -> Link {
         match self {
             Queue::Stream { writer, .. } => Link::Stream(writer.clone()),
+            #[cfg(feature = "websocket")]
+            Queue::Websocket(queue) => queue.link(),
         }
     }
 }
@@ -698,6 +726,11 @@ impl Pending {
                     }
                 }
             }
+            #[cfg(feature = "websocket")]
+            Dialed::Websocket(socket) => {
+                websocket::Pending::start(socket, generation, events, notices)
+                    .map(Pending::Websocket)
+            }
         }
     }
 
@@ -707,6 +740,16 @@ impl Pending {
         match (self, queue) {
             (Pending::Tcp { threads, stream }, Queue::Stream { outgoing, .. }) => {
                 (Socket::Tcp(stream), threads.go(outgoing))
+            }
+            #[cfg(feature = "websocket")]
+            (Pending::Websocket(pending), Queue::Websocket(queue)) => {
+                let (connection, closing) = pending.go(queue);
+                (Socket::Websocket(connection), closing)
+            }
+            #[cfg(feature = "websocket")]
+            (Pending::Tcp { .. }, Queue::Websocket(_))
+            | (Pending::Websocket(_), Queue::Stream { .. }) => {
+                unreachable!("a worker's connections and queues come from its one endpoint")
             }
         }
     }
@@ -720,6 +763,8 @@ impl Connection {
             Socket::Tcp(stream) => {
                 let _ = stream.shutdown(Shutdown::Both);
             }
+            #[cfg(feature = "websocket")]
+            Socket::Websocket(connection) => connection.end(),
         }
     }
 }
@@ -766,6 +811,11 @@ fn spawn(
             endpoint: Endpoint::Tcp(_),
             ..
         } => transport::Control::Tcp(handle),
+        #[cfg(feature = "websocket")]
+        Mode::Connect {
+            endpoint: Endpoint::Websocket(_),
+            ..
+        } => transport::Control::Websocket(handle),
         Mode::Listen => transport::Control::Listen(handle),
     };
     let name = format!("scrive-lsp {} #{generation}", mode.name());

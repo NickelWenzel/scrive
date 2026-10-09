@@ -388,16 +388,15 @@ fn main() {
 
     /// Why the server did not start, for a person.
     fn describe(error: &lsp::client::builder::Error) -> String {
-        match error {
-            lsp::client::builder::Error::Spawn(spawn) if spawn.kind() == io::ErrorKind::NotFound => {
-                format!(
+        // Not a match: the `websocket` feature adds variants this example never sees.
+        if let lsp::client::builder::Error::Spawn(spawn) = error {
+            if spawn.kind() == io::ErrorKind::NotFound {
+                return format!(
                     "{SERVER} is not on PATH; install it with `rustup component add rust-analyzer`"
-                )
+                );
             }
-            lsp::client::builder::Error::Spawn(_)
-            | lsp::client::builder::Error::Thread(_)
-            | lsp::client::builder::Error::Bind { .. } => error.to_string(),
         }
+        error.to_string()
     }
 
     /// Ctrl+S, or Cmd+S on macOS, without Shift or Alt and not repeated. The editor ignores it,

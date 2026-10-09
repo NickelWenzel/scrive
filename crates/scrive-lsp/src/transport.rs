@@ -19,6 +19,8 @@ pub(crate) mod stdio;
 pub(crate) mod tap;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod tcp;
+#[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+pub(crate) mod websocket;
 #[cfg(not(target_family = "wasm"))]
 mod writer;
 
@@ -58,6 +60,12 @@ pub(crate) enum Link {
     /// A worker bridge's writer thread, on a pipe or a socket.
     #[cfg(not(target_family = "wasm"))]
     Stream(Writer),
+    /// A WebSocket connection's I/O thread, which `waker` wakes.
+    #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+    Websocket {
+        writer: Writer,
+        waker: Arc<mio::Waker>,
+    },
 }
 
 /// What a bridge reports. Protocol traffic names the connection it came from, so the client can
@@ -121,6 +129,9 @@ pub(crate) enum Control {
     /// The worker of a TCP bridge that accepted its server once.
     #[cfg(not(target_family = "wasm"))]
     Listen(Handle),
+    /// The worker of a WebSocket bridge.
+    #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+    Websocket(Handle),
 }
 
 /// The channel a worker bridge's threads report on.
@@ -174,6 +185,12 @@ impl Link {
             Link::Memory(link) => link.send(&body),
             #[cfg(not(target_family = "wasm"))]
             Link::Stream(writer) => writer.send(body),
+            #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+            Link::Websocket { writer, waker } => {
+                writer.send(body);
+                // A thread that is gone reports its loss to the worker on its own.
+                let _ = waker.wake();
+            }
         }
     }
 
@@ -184,6 +201,11 @@ impl Link {
         match self {
             Link::Memory(_) => {}
             Link::Stream(writer) => writer.close(),
+            #[cfg(feature = "websocket")]
+            Link::Websocket { writer, waker } => {
+                writer.close();
+                let _ = waker.wake();
+            }
         }
     }
 }
@@ -218,6 +240,8 @@ impl Control {
             Self::Stdio(handle) | Self::Tcp(handle) | Self::Listen(handle) => {
                 handle.send(lifecycle);
             }
+            #[cfg(feature = "websocket")]
+            Self::Websocket(handle) => handle.send(lifecycle),
         }
     }
 }

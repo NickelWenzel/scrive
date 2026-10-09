@@ -33,6 +33,12 @@ categories = ["text-editors", "development-tools"]
 #   thiserror         — the crate's error enums.
 #   wasmtimer         — browser only: the memory bridge's poll timer, since
 #                       `std::time` panics there.
+#   tungstenite       — `websocket`, native: the WebSocket handshake and framing.
+#   rustls            — `websocket`, native: TLS for `wss://` with the ring
+#                       provider; re-exported for `Builder::tls`.
+#   webpki-roots      — `websocket`, native: the default roots `wss://` trusts.
+#   mio               — `websocket`, native: the readiness loop of a connection's
+#                       one I/O thread.
 #   windows-sys       — tests on Windows only: the stdio test's console-window
 #                       check.
 [dependencies]
@@ -46,6 +52,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"     # envelope params/results as `Value`
 thiserror = "2"      # library error enums
 
+[features]
+# The WebSocket bridge (`Builder::websocket`). Native: tungstenite, rustls (ring) with the
+# webpki roots, mio. Opt-in: 24 crates new to an iced host.
+websocket = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots", "dep:mio"]
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+mio = { version = "1", default-features = false, features = ["os-poll", "net"], optional = true }
+
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 wasmtimer = "0.4"    # default features, as iced's wasm tree already has them
 
@@ -56,6 +73,8 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 # `block_on` for the tests that use threads.
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+# The WebSocket test's fake server.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 # The console check reads `GetConsoleWindow`, which needs `unsafe` (allowed in the test crate).
@@ -65,6 +84,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [[test]]
 name = "stdio"
 harness = false
+
+[[test]]
+name = "websocket"
+required-features = ["websocket"]
 
 [package.metadata.docs.rs]
 all-features = true

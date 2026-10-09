@@ -58,11 +58,11 @@ pub enum Error {
         operation: String,
     },
     /// A server message announced a body longer than the client decodes (64 MiB). It was
-    /// dropped unread, and a dropped reply never settles its request; above 1 GiB the
-    /// connection ended too.
+    /// dropped unread, and a dropped reply never settles its request. Above 1 GiB, and always
+    /// on a WebSocket, the connection ended too.
     #[error("a server message announced {length} bytes, more than the client decodes")]
     Oversized {
-        /// The announced `Content-Length`.
+        /// The announced length: the `Content-Length`, or the WebSocket message's.
         length: u64,
     },
     /// An attempt to start the server again failed; the next one follows after a backoff,
