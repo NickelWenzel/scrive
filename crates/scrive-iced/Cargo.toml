@@ -24,6 +24,9 @@ iced = { version = "0.15.0-dev", features = ["advanced"] }
 [features]
 default = ["syntect"]
 lsp = ["dep:scrive-lsp"]
+# The WebSocket transport for the language-server client: `lsp::Client::builder().websocket(url)`,
+# natively and in the browser. Pulls tungstenite and rustls on native targets.
+lsp-websocket = ["lsp", "scrive-lsp/websocket"]
 # Syntect highlighting: `CodeEditor::language` accepts a
 # `scrive_core::SyntaxDef`, and big documents tokenize on worker threads.
 # Forwards to scrive-core's backend.
