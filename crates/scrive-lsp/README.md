@@ -24,9 +24,9 @@ let (mut client, events) = scrive_lsp::Client::builder()
 `memory` can't fail. The other four return `client::builder::Error`, whose variants depend on the
 target and on the `websocket` feature: `Spawn`, `Thread` and `Bind` are native, `Url` comes with
 `websocket`, and `Tls` with `websocket` natively. Cargo unifies features across a build, so any
-crate in the tree that turns on `websocket` adds variants to your match. Match the variants you
-handle and end with a wildcard arm (or use `if let`), so the match compiles with and without the
-feature.
+crate in the tree that turns on `websocket` adds variants to your match. The enum is
+`#[non_exhaustive]`, so the compiler enforces it: match the variants you handle and end with a
+wildcard arm (or use `if let`).
 
 The modules a host uses:
 
