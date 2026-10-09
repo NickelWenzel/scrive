@@ -1,7 +1,7 @@
 //! The TCP bridge against lsp-server and raw sockets on loopback.
 #![cfg(not(target_family = "wasm"))]
 
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
@@ -537,8 +537,13 @@ fn shutdown_completes_against_a_peer_that_never_answers() {
 
 /// Shutting a socket down both ways wakes a thread blocked reading it, though the peer stays
 /// open and silent. The bridge releases a dead connection's reader this way.
+// Winsock doesn't wake a `recv` blocked on another handle of the socket, so on Windows the
+// reader stays parked until the peer closes; the generation filter drops what it delivers then.
+#[cfg(not(windows))]
 #[test]
 fn shutdown_both_wakes_a_reader_blocked_on_a_silent_peer() {
+    use std::io::Read;
+
     let (listener, address) = listener();
     let stream = TcpStream::connect(address).expect("the listener accepts");
     let (_peer, _) = listener.accept().expect("the dial arrives");
