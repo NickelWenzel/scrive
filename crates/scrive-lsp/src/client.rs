@@ -117,8 +117,11 @@ impl Drop for Client {
                 }
             }
             #[cfg(not(target_family = "wasm"))]
-            (Connection::Live { generation, .. }, transport::Control::Stdio(control)) => {
-                control.send(transport::Lifecycle::Shutdown {
+            (
+                Connection::Live { generation, .. },
+                transport::Control::Stdio(handle) | transport::Control::Tcp(handle),
+            ) => {
+                handle.send(transport::Lifecycle::Shutdown {
                     generation: *generation,
                     handshake: self.handshake(),
                 });
@@ -391,11 +394,11 @@ impl Client {
                     self.stop(Reason::Shutdown);
                 }
                 #[cfg(not(target_family = "wasm"))]
-                transport::Control::Stdio(control) => {
+                transport::Control::Stdio(handle) | transport::Control::Tcp(handle) => {
                     let connection =
                         std::mem::replace(&mut self.connection, Connection::Shut(None));
                     if let Connection::Live { generation, link } = connection {
-                        control.send(transport::Lifecycle::Shutdown {
+                        handle.send(transport::Lifecycle::Shutdown {
                             generation,
                             handshake,
                         });
@@ -431,7 +434,7 @@ impl Client {
         match &self.control {
             transport::Control::Memory => Err(Error::Unrestartable),
             #[cfg(not(target_family = "wasm"))]
-            transport::Control::Stdio(_) => Ok(self.restart_worker()),
+            transport::Control::Stdio(_) | transport::Control::Tcp(_) => Ok(self.restart_worker()),
         }
     }
 
@@ -627,7 +630,9 @@ impl Client {
             match &self.control {
                 transport::Control::Memory => self.stop(Reason::Initialize),
                 #[cfg(not(target_family = "wasm"))]
-                transport::Control::Stdio(_) => updates.extend(self.refused()),
+                transport::Control::Stdio(_) | transport::Control::Tcp(_) => {
+                    updates.extend(self.refused());
+                }
             }
         }
         updates
