@@ -15,16 +15,12 @@
 //! Inlay hints are on: double-click a type hint to insert it, Ctrl+click a part to jump, hover
 //! one for its tooltip. Ctrl+I (Cmd+I on macOS) turns them off and on.
 //!
-//! The update loop is the one `examples/lsp` uses, cut down to one editor. The client owns its
-//! connection: the server end of an in-process `lsp_server::Connection`, which a reader and a
-//! writer thread pump to and from a child process's stdout and stdin, in the LSP base protocol.
-//! The server's log goes to this process's stderr. Closing the window shuts the server down
-//! first.
+//! The update loop is the one `examples/lsp` uses, cut down to one editor. The server runs as a
+//! child process started by `Builder::stdio`, which owns its pipes, threads and shutdown. The
+//! server's log goes to this process's stderr. Closing the window shuts the server down first.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> iced::Result {
-    use scrive_iced::lsp;
-
     let workspace = match app::Workspace::from_args() {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -32,294 +28,12 @@ fn main() -> iced::Result {
             std::process::exit(1);
         }
     };
-    let (near, far) = lsp::lsp_server::Connection::memory();
-    if let Err(error) = transport::spawn(far) {
-        eprintln!("rust_analyzer: {}", transport::describe(&error));
-        std::process::exit(1);
-    }
-    app::run(workspace, near)
+    app::run(workspace)
 }
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
     eprintln!("the rust_analyzer example spawns a process, so it needs a native target");
-}
-
-/// The LSP base protocol: a `Content-Length` header, a blank line, then that many bytes of JSON.
-#[cfg(not(target_arch = "wasm32"))]
-mod frame {
-    use core::fmt;
-
-    use scrive_iced::lsp;
-
-    const SEPARATOR: &[u8] = b"\r\n\r\n";
-
-    /// Why the bytes read so far are not a frame.
-    #[derive(Debug)]
-    pub enum Error {
-        /// A header line that is not `Name: value`, or a `Content-Length` that is not a number.
-        Header(String),
-        /// A header block with no `Content-Length`.
-        MissingLength,
-        /// A body that is not a JSON-RPC message.
-        Body(serde_json::Error),
-    }
-
-    impl fmt::Display for Error {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                Error::Header(line) => write!(f, "malformed header line {line:?}"),
-                Error::MissingLength => f.write_str("header without Content-Length"),
-                Error::Body(error) => write!(f, "body is not a JSON-RPC message: {error}"),
-            }
-        }
-    }
-
-    /// `message` framed for the wire.
-    pub fn encode(message: &lsp::lsp_server::Message) -> Vec<u8> {
-        let body = serde_json::to_vec(message).expect("lsp-server messages serialize");
-        let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
-        frame.extend(body);
-        frame
-    }
-
-    /// Takes the first complete frame off the front of `buffer`. `Ok(None)` means more bytes are
-    /// needed, and leaves `buffer` as it was.
-    pub fn decode(buffer: &mut Vec<u8>) -> Result<Option<lsp::lsp_server::Message>, Error> {
-        let Some(end) = buffer
-            .windows(SEPARATOR.len())
-            .position(|window| window == SEPARATOR)
-        else {
-            return Ok(None);
-        };
-        let header = String::from_utf8_lossy(&buffer[..end]);
-        let mut length = None;
-        for line in header.split("\r\n") {
-            let (name, value) = line
-                .split_once(':')
-                .ok_or_else(|| Error::Header(line.to_owned()))?;
-            // LSP §baseProtocol: `Content-Type` is the only other header, and it is optional.
-            if name.trim().eq_ignore_ascii_case("content-length") {
-                let value = value.trim().parse::<usize>();
-                length = Some(value.map_err(|_| Error::Header(line.to_owned()))?);
-            }
-        }
-        let length = length.ok_or(Error::MissingLength)?;
-        let start = end + SEPARATOR.len();
-        if buffer.len() < start + length {
-            return Ok(None);
-        }
-        let frame: Vec<u8> = buffer.drain(..start + length).collect();
-        serde_json::from_slice(&frame[start..])
-            .map(Some)
-            .map_err(Error::Body)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use serde_json::{json, Value};
-
-        use super::*;
-
-        fn message(text: &str) -> lsp::lsp_server::Message {
-            serde_json::from_value(json!({
-                "jsonrpc": "2.0",
-                "method": "window/showMessage",
-                "params": { "type": 3, "message": text },
-            }))
-            .expect("the fixture is an lsp-server message")
-        }
-
-        /// `message` as JSON, since lsp-server's messages have no equality.
-        fn json(message: &lsp::lsp_server::Message) -> Value {
-            serde_json::to_value(message).expect("lsp-server messages serialize")
-        }
-
-        /// The decoded messages as JSON.
-        fn decoded(
-            result: Result<Option<lsp::lsp_server::Message>, Error>,
-        ) -> Option<Value> {
-            result.ok().flatten().as_ref().map(json)
-        }
-
-        /// A decoded frame is the message that was encoded, and the buffer is left empty. The
-        /// body holds non-ASCII text, so the length counts bytes.
-        #[test]
-        fn a_frame_round_trips() {
-            let sent = message("héllo, wörld");
-            let mut buffer = encode(&sent);
-            let received = decode(&mut buffer).expect("the frame decodes");
-            assert_eq!(
-                received.as_ref().map(json),
-                Some(json(&sent)),
-                "the message survives the wire"
-            );
-            assert!(buffer.is_empty(), "the frame is consumed");
-        }
-
-        /// A frame that arrives one byte at a time decodes only once its last byte is in.
-        #[test]
-        fn a_frame_split_across_reads_waits_for_its_last_byte() {
-            let sent = message("split");
-            let wire = encode(&sent);
-            let mut buffer = Vec::new();
-            for (index, byte) in wire.iter().enumerate() {
-                buffer.push(*byte);
-                let decoded = decode(&mut buffer).expect("a partial frame is not an error");
-                if index + 1 < wire.len() {
-                    assert!(decoded.is_none(), "byte {index} does not complete the frame");
-                } else {
-                    assert_eq!(
-                        decoded.as_ref().map(json),
-                        Some(json(&sent)),
-                        "the last byte completes it"
-                    );
-                }
-            }
-        }
-
-        /// Two frames and the start of a third in one read decode in order, and the partial one
-        /// stays buffered.
-        #[test]
-        fn frames_in_one_read_decode_in_order() {
-            let (first, second, third) = (message("one"), message("two"), message("three"));
-            let mut buffer = encode(&first);
-            buffer.extend(encode(&second));
-            let third_wire = encode(&third);
-            buffer.extend(&third_wire[..10]);
-            assert_eq!(
-                decoded(decode(&mut buffer)),
-                Some(json(&first)),
-                "first frame"
-            );
-            assert_eq!(
-                decoded(decode(&mut buffer)),
-                Some(json(&second)),
-                "second frame"
-            );
-            assert_eq!(decoded(decode(&mut buffer)), None, "third frame is partial");
-            assert_eq!(buffer, third_wire[..10], "the partial frame stays buffered");
-        }
-
-        /// A header block without `Content-Length` is an error, even with a valid body after it.
-        #[test]
-        fn a_header_without_content_length_is_rejected() {
-            let mut buffer = b"Content-Type: application/vscode-jsonrpc\r\n\r\n{}".to_vec();
-            assert!(
-                matches!(decode(&mut buffer), Err(Error::MissingLength)),
-                "the length is required",
-            );
-        }
-
-        /// Header lines that are not `Name: value`, or a length that is not a number, are errors.
-        #[test]
-        fn a_garbage_header_is_rejected() {
-            for garbage in [&b"hello\r\n\r\n{}"[..], b"Content-Length: many\r\n\r\n{}"] {
-                let mut buffer = garbage.to_vec();
-                assert!(
-                    matches!(decode(&mut buffer), Err(Error::Header(_))),
-                    "{:?} is rejected",
-                    String::from_utf8_lossy(garbage),
-                );
-            }
-        }
-    }
-}
-
-/// rust-analyzer as a child process, pumped to and from the server end of an in-process
-/// connection: a reader thread decodes its stdout, and a writer thread owns its stdin.
-#[cfg(not(target_arch = "wasm32"))]
-mod transport {
-    use std::io::{self, Read, Write};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-    use std::thread;
-
-    use scrive_iced::lsp;
-
-    use crate::frame;
-
-    /// The command that starts the server, looked up on `PATH`.
-    pub const SERVER: &str = "rust-analyzer";
-
-    /// Start the server with piped stdin and stdout and an inherited stderr, and pump `server`'s
-    /// messages to and from it. When the process is gone, `server`'s sender drops, which the
-    /// client reads as the connection closing.
-    pub fn spawn(server: lsp::lsp_server::Connection) -> io::Result<()> {
-        let mut child = Command::new(SERVER)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let stdin = child.stdin.take().expect("stdin is piped");
-        let stdout = child.stdout.take().expect("stdout is piped");
-        let lsp::lsp_server::Connection { sender, receiver } = server;
-        thread::spawn(move || write(stdin, &receiver));
-        thread::spawn(move || read(child, stdout, |message| sender.send(message).is_ok()));
-        Ok(())
-    }
-
-    /// Why `spawn` failed, for a person.
-    pub fn describe(error: &io::Error) -> String {
-        match error.kind() {
-            io::ErrorKind::NotFound => format!(
-                "{SERVER} is not on PATH; install it with `rustup component add rust-analyzer`"
-            ),
-            _ => format!("could not start {SERVER}: {error}"),
-        }
-    }
-
-    /// Writes until the client's last sender is gone, then closes stdin by dropping it.
-    fn write(
-        mut stdin: ChildStdin,
-        outgoing: impl IntoIterator<Item = lsp::lsp_server::Message>,
-    ) {
-        for message in outgoing {
-            let written = stdin.write_all(&frame::encode(&message));
-            if written.and_then(|()| stdin.flush()).is_err() {
-                return;
-            }
-        }
-    }
-
-    /// Decodes stdout into `deliver`, which says whether anyone still listens, until EOF.
-    fn read(
-        mut child: Child,
-        mut stdout: ChildStdout,
-        deliver: impl Fn(lsp::lsp_server::Message) -> bool,
-    ) {
-        let mut buffer = Vec::new();
-        let mut chunk = [0; 8192];
-        let failure = loop {
-            match frame::decode(&mut buffer) {
-                Ok(Some(message)) => {
-                    if !deliver(message) {
-                        break Some(format!("nobody listens to {SERVER} any more"));
-                    }
-                    continue;
-                }
-                Ok(None) => {}
-                Err(error) => break Some(format!("{SERVER} sent a bad frame: {error}")),
-            }
-            match stdout.read(&mut chunk) {
-                Ok(0) => break None,
-                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => break Some(format!("reading from {SERVER} failed: {error}")),
-            }
-        };
-        if failure.is_some() {
-            // It may be blocked writing to a pipe nobody reads any more.
-            let _ = child.kill();
-        }
-        let exit = match child.wait() {
-            Ok(status) => format!("{SERVER} exited ({status})"),
-            Err(error) => format!("{SERVER} is gone: {error}"),
-        };
-        match failure {
-            Some(failure) => eprintln!("{failure}; {exit}"),
-            None => eprintln!("{exit}"),
-        }
-    }
 }
 
 /// The application: one editor and its client.
@@ -337,7 +51,8 @@ mod app {
     use scrive_core::SyntaxDef;
     use scrive_iced::{lsp, CodeEditor, Event};
 
-    use crate::transport;
+    /// The command that starts the server, looked up on `PATH`.
+    const SERVER: &str = "rust-analyzer";
 
     /// Where the scratch crate goes when no file is given, under the system temp directory.
     const SCRATCH: &str = "scrive-rust-analyzer-example";
@@ -462,16 +177,15 @@ fn main() {
     }
 
     impl App {
-        /// The app on `connection`, and its client's event stream, before anything runs it.
-        /// Tests drive the stream themselves.
+        /// The app on a freshly started server, and its client's event stream, before anything
+        /// runs it. Tests drive the stream themselves.
         fn boot(
             workspace: &Workspace,
-            connection: lsp::lsp_server::Connection,
-        ) -> (Self, lsp::client::Events) {
+        ) -> Result<(Self, lsp::client::Events), lsp::client::builder::Error> {
             let (mut client, events) = lsp::Client::builder()
                 .root(workspace.root_uri().clone())
                 .configuration(json!({ "rust-analyzer": { "checkOnSave": true } }))
-                .memory(connection);
+                .stdio(std::process::Command::new(SERVER))?;
             let mut editor = CodeEditor::new(workspace.text())
                 .language(rust())
                 .rename(true)
@@ -484,19 +198,11 @@ fn main() {
                 editor,
                 client,
                 file: workspace.file.clone(),
-                status: format!("starting {}…", transport::SERVER),
+                status: format!("starting {SERVER}…"),
                 check_on_save: true,
                 hints: true,
             };
-            (app, events)
-        }
-
-        fn new(
-            workspace: &Workspace,
-            connection: lsp::lsp_server::Connection,
-        ) -> (Self, Task<Message>) {
-            let (app, events) = Self::boot(workspace, connection);
-            (app, Task::run(events, Message::Lsp))
+            Ok((app, events))
         }
 
         /// `now` is the instant iced stamps on the message (`iced::application::timed`).
@@ -581,9 +287,15 @@ fn main() {
                                 lsp::client::Reason::Shutdown,
                             )) => return iced::exit(),
                             lsp::Update::Status(other) => {
-                                *status = format!("{}: {other:?}", transport::SERVER);
+                                *status = format!("{SERVER}: {other:?}");
                             }
                             lsp::Update::Error(error) => *status = format!("error: {error}"),
+                            // rust-analyzer's own log stays on this process's stderr.
+                            lsp::Update::Log(entry)
+                                if entry.source() == lsp::log::Source::Stderr =>
+                            {
+                                eprintln!("{}", entry.text());
+                            }
                             lsp::Update::Log(_)
                             | lsp::Update::Notification(_)
                             | lsp::Update::Trace(_) => {}
@@ -632,13 +344,25 @@ fn main() {
         }
     }
 
-    pub fn run(workspace: Workspace, connection: lsp::lsp_server::Connection) -> iced::Result {
+    /// Starts the server, then opens the window on it. A server that does not start is reported
+    /// before any window opens.
+    pub fn run(workspace: Workspace) -> iced::Result {
         let title = format!("scrive — rust-analyzer — {}", workspace.file.display());
-        // iced's boot is `Fn`, so the connection moves out of a cell the one time it runs.
-        let connection = std::cell::Cell::new(Some(connection));
+        let booted = match App::boot(&workspace) {
+            Ok(booted) => booted,
+            Err(error) => {
+                eprintln!("rust_analyzer: {}", describe(&error));
+                std::process::exit(1);
+            }
+        };
+        // iced's boot is `Fn`, so the app moves out of a cell the one time it runs.
+        let booted = std::cell::Cell::new(Some(booted));
         // `timed` hands `update` each message's instant, which the editor's debounces run on.
         iced::application::timed(
-            move || App::new(&workspace, connection.take().expect("iced boots the app once")),
+            move || {
+                let (app, events) = booted.take().expect("iced boots the app once");
+                (app, Task::run(events, Message::Lsp))
+            },
             App::update,
             App::subscription,
             App::view,
@@ -648,6 +372,20 @@ fn main() {
         .exit_on_close_request(false)
         .fonts(scrive_iced::required_fonts().iter().copied())
         .run()
+    }
+
+    /// Why the server did not start, for a person.
+    fn describe(error: &lsp::client::builder::Error) -> String {
+        match error {
+            lsp::client::builder::Error::Spawn(spawn) if spawn.kind() == io::ErrorKind::NotFound => {
+                format!(
+                    "{SERVER} is not on PATH; install it with `rustup component add rust-analyzer`"
+                )
+            }
+            lsp::client::builder::Error::Spawn(_) | lsp::client::builder::Error::Thread(_) => {
+                error.to_string()
+            }
+        }
     }
 
     /// Ctrl+S, or Cmd+S on macOS, without Shift or Alt and not repeated. The editor ignores it,
@@ -857,9 +595,8 @@ fn main() {
         /// Starts rust-analyzer on `workspace` and boots the app on it, tracing, with its events
         /// handed over by a thread so a test can wait with a deadline.
         fn started(workspace: &Workspace) -> (App, mpsc::Receiver<lsp::client::Event>) {
-            let (near, far) = lsp::lsp_server::Connection::memory();
-            transport::spawn(far).unwrap_or_else(|error| panic!("{}", transport::describe(&error)));
-            let (mut app, events) = App::boot(workspace, near);
+            let (mut app, events) =
+                App::boot(workspace).unwrap_or_else(|error| panic!("{}", describe(&error)));
             app.client.set_trace(lsp::trace::Mode::Messages);
             (app, forward(events))
         }
@@ -1007,7 +744,6 @@ fn main() {
         }
 
         /// Shut the server down, as closing the window does, and wait for the client to stop.
-        /// The reader thread logs how the process exited.
         fn shut_down(app: &mut App, events: &mpsc::Receiver<lsp::client::Event>) {
             for document in app.client.shutdown() {
                 let _ = app.editor.apply_lsp(&mut app.client, document);
