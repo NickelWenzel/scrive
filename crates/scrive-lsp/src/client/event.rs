@@ -33,8 +33,9 @@ impl fmt::Debug for Event {
         let mut event = f.debug_struct("Event");
         event.field("client", &self.client);
         match &self.payload {
-            Payload::Transport(transport::Event::Message(body)) => event
+            Payload::Transport(transport::Event::Message { generation, body }) => event
                 .field("direction", &trace::Direction::Incoming)
+                .field("generation", generation)
                 .field("bytes", &body.len()),
             Payload::Sent(entry) => event
                 .field("direction", &trace::Direction::Outgoing)
@@ -48,7 +49,24 @@ impl fmt::Debug for Event {
                 .field("log", &entries.first().map(log::Entry::source))
                 .field("lines", &entries.len()),
             #[cfg(not(target_family = "wasm"))]
-            Payload::Transport(transport::Event::Error(error)) => event.field("error", error),
+            Payload::Transport(transport::Event::Error { generation, error }) => event
+                .field("generation", generation)
+                .field("error", error),
+            #[cfg(not(target_family = "wasm"))]
+            Payload::Transport(transport::Event::Lost { generation, reason }) => event
+                .field("lost", reason)
+                .field("generation", generation),
+            #[cfg(not(target_family = "wasm"))]
+            Payload::Transport(transport::Event::Attempting {
+                generation,
+                failure,
+            }) => event
+                .field("attempt_failed", &failure.kind())
+                .field("generation", generation),
+            #[cfg(not(target_family = "wasm"))]
+            Payload::Transport(transport::Event::Reconnected { generation, .. }) => {
+                event.field("reconnected", generation)
+            }
         };
         event.finish()
     }
@@ -63,13 +81,21 @@ impl Event {
         (self.client, self.payload)
     }
 
-    /// Whether the stream ends after this event: after every stop.
+    /// Whether the stream ends after this event: a bridge's own `Stopped`, or a stop the client
+    /// queued, which only a bridge that cannot restart does. A stop the client decides on a loss
+    /// is returned by `receive` instead, and the stream runs on.
     pub(crate) fn stops(&self) -> bool {
         match &self.payload {
             Payload::Transport(transport::Event::Stopped(_)) | Payload::Stopped(_) => true,
-            Payload::Transport(transport::Event::Message(_)) | Payload::Sent(_) => false,
+            Payload::Transport(transport::Event::Message { .. }) | Payload::Sent(_) => false,
             #[cfg(not(target_family = "wasm"))]
-            Payload::Transport(transport::Event::Log(_) | transport::Event::Error(_)) => false,
+            Payload::Transport(
+                transport::Event::Log(_)
+                | transport::Event::Error { .. }
+                | transport::Event::Lost { .. }
+                | transport::Event::Attempting { .. }
+                | transport::Event::Reconnected { .. },
+            ) => false,
         }
     }
 }

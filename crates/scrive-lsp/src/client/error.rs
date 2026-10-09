@@ -1,6 +1,7 @@
 //! What went wrong with a message or a command, reported as [`Update::Error`](crate::Update::Error).
 
 use core::fmt;
+use std::io;
 use std::sync::Arc;
 
 use scrive_core::DocId;
@@ -62,6 +63,13 @@ pub enum Error {
     Oversized {
         /// The announced `Content-Length`.
         length: u64,
+    },
+    /// An attempt to start the server again failed; the next one follows after a backoff,
+    /// unless the restart policy gives up.
+    #[error("could not start the server again: {source}")]
+    Reconnect {
+        /// Why the attempt failed.
+        source: Arc<io::Error>,
     },
 }
 

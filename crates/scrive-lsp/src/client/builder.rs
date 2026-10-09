@@ -13,6 +13,8 @@ use serde_json::Value;
 pub use error::Error;
 
 use super::{Client, Events, Id};
+#[cfg(not(target_family = "wasm"))]
+use crate::restart;
 use crate::session::{self, Session};
 use crate::{message, trace, transport, uri};
 
@@ -22,6 +24,9 @@ const GRACE: Duration = Duration::from_secs(2);
 /// Unwritten bytes past which a server counts as unresponsive, unless the builder says.
 #[cfg(not(target_family = "wasm"))]
 const BACKLOG: usize = 256 * 1024 * 1024;
+/// The first wait before a lost server is started again, unless the builder says.
+#[cfg(not(target_family = "wasm"))]
+const BACKOFF: Duration = Duration::from_secs(1);
 
 /// Configures a [`Client`] and connects it through one bridge.
 #[must_use]
@@ -35,6 +40,10 @@ pub struct Builder {
     grace: Option<Duration>,
     #[cfg(not(target_family = "wasm"))]
     backlog: Option<usize>,
+    #[cfg(not(target_family = "wasm"))]
+    restart: restart::Policy,
+    #[cfg(not(target_family = "wasm"))]
+    backoff: Option<Duration>,
 }
 
 impl Builder {
@@ -82,6 +91,25 @@ impl Builder {
         self
     }
 
+    /// When a lost server is started again; [`restart::Policy::default`] unless set.
+    ///
+    /// A server whose own child process still holds its output leaves one reader thread behind
+    /// per restart, until that child exits.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn restart(mut self, policy: restart::Policy) -> Self {
+        self.restart = policy;
+        self
+    }
+
+    /// The first wait before a lost server is started again, growing ×1.3 per attempt up to
+    /// 10 s. Defaults to 1 second. For tests.
+    #[doc(hidden)]
+    #[cfg(not(target_family = "wasm"))]
+    pub fn backoff(mut self, first: Duration) -> Self {
+        self.backoff = Some(first);
+        self
+    }
+
     /// Starts `command` as the language server, and talks to it over its stdin and stdout. The
     /// client sends `initialize` at once, with this process's id as `processId`.
     ///
@@ -92,11 +120,13 @@ impl Builder {
     ///
     /// Each line the server writes to stderr arrives as an [`Update::Log`](crate::Update::Log)
     /// from [`Source::Stderr`](crate::log::Source::Stderr), and output on stdout that is not LSP
-    /// as one from [`Source::Stdout`](crate::log::Source::Stdout). A server that exits, or whose
-    /// stdout closes, stops the client with [`Reason::Exited`](super::Reason::Exited) once its
-    /// stderr is read to the end or the grace period passes. [`Client::shutdown`], or dropping
-    /// the client, sends `shutdown` and `exit` and kills the process if it is still alive after
-    /// the [grace period](Self::shutdown_grace).
+    /// as one from [`Source::Stdout`](crate::log::Source::Stdout). A server that exits, whose
+    /// stdout closes, or that stops reading is killed if need be, and lost once its output is
+    /// read to the end or the grace period passes. The [restart policy](Self::restart) then
+    /// decides whether it starts again, as [`Status::Restarting`](super::Status::Restarting);
+    /// a server that never completed `initialize` is not restarted.
+    /// [`Client::shutdown`], or dropping the client, runs the LSP shutdown handshake and kills
+    /// the process if it is still alive after the [grace period](Self::shutdown_grace).
     ///
     /// A write to a server that died fails rather than killing this process, because Rust
     /// programs ignore `SIGPIPE`; a host that is not a Rust program must ignore it too. If this
@@ -106,18 +136,22 @@ impl Builder {
     /// [`Error::Spawn`] when the process does not start, [`Error::Thread`] when a thread the
     /// bridge needs cannot be created.
     #[cfg(not(target_family = "wasm"))]
-    pub fn stdio(self, mut command: std::process::Command) -> Result<(Client, Events), Error> {
-        let grace = self.grace.unwrap_or(GRACE);
-        let limit = self.backlog.unwrap_or(BACKLOG);
+    pub fn stdio(self, command: std::process::Command) -> Result<(Client, Events), Error> {
+        let settings = transport::stdio::Settings {
+            grace: self.grace.unwrap_or(GRACE),
+            backoff: self.backoff.unwrap_or(BACKOFF),
+            limit: self.backlog.unwrap_or(BACKLOG),
+        };
         let trace = self.trace;
-        let started = transport::stdio::spawn(&mut command, grace, limit)?;
+        let recovery = super::recovery::State::new(self.restart);
+        let started = transport::stdio::spawn(command, settings)?;
         let (session, initialize) = self.session(Some(std::process::id()));
         let (local, queued) = futures_channel::mpsc::unbounded();
         let id = Id::next();
         let events = Events::new(id, queued, transport::Inbound::Channel(started.events));
         let link = transport::Link::Stdio(started.writer);
         let control = transport::Control::Stdio(started.control);
-        let mut client = Client::new(id, session, link, control, local, trace);
+        let mut client = Client::new(id, session, link, control, local, trace, recovery);
         client.send(vec![initialize], None);
         Ok((client, events))
     }
@@ -135,6 +169,8 @@ impl Builder {
     /// client with [`Reason::Closed`](super::Reason::Closed); nothing restarts it.
     pub fn memory(self, connection: lsp_server::Connection) -> (Client, Events) {
         let trace = self.trace;
+        #[cfg(not(target_family = "wasm"))]
+        let recovery = super::recovery::State::new(self.restart);
         let (session, initialize) = self.session(None);
         let lsp_server::Connection { sender, receiver } = connection;
         let (local, queued) = futures_channel::mpsc::unbounded();
@@ -142,7 +178,16 @@ impl Builder {
         let inbound = transport::Inbound::Memory(transport::memory::Inbox::new(receiver));
         let events = Events::new(id, queued, inbound);
         let link = transport::Link::Memory(transport::memory::Link::new(sender));
-        let mut client = Client::new(id, session, link, transport::Control::Memory, local, trace);
+        let mut client = Client::new(
+            id,
+            session,
+            link,
+            transport::Control::Memory,
+            local,
+            trace,
+            #[cfg(not(target_family = "wasm"))]
+            recovery,
+        );
         client.send(vec![initialize], None);
         (client, events)
     }

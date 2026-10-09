@@ -6,6 +6,9 @@ fn main() {}
 
 #[cfg(not(target_family = "wasm"))]
 fn main() {
+    if std::env::var_os(native::GRANDCHILD).is_some() {
+        return native::fake::grandchild();
+    }
     match std::env::var(native::FAKE) {
         Ok(mode) => native::fake::serve(&mode),
         Err(_) => native::run(),
@@ -24,12 +27,16 @@ mod native {
     use scrive_core::intel::ticket::Counter;
     use scrive_core::{Diagnostic, Document, HoverInfo, HoverRequest};
     use scrive_lsp::client::{self, Client, Reason, Status};
-    use scrive_lsp::{log, trace, update, Update};
+    use scrive_lsp::{log, restart, trace, update, Update};
 
     /// The variable that turns this binary into a fake server, naming its mode.
     pub const FAKE: &str = "SCRIVE_LSP_FAKE_SERVER";
     /// The prefix of the knobs the `conversation` mode reads.
     pub const KNOB: &str = "SCRIVE_LSP_FAKE_";
+    /// The variable that turns this binary into a crashed server's grandchild.
+    pub const GRANDCHILD: &str = "SCRIVE_LSP_GRANDCHILD";
+    /// What the crashed server's grandchild publishes about, besides the open document.
+    pub const UNOPENED: &str = "grandchild.rs";
     const GRACE: Duration = Duration::from_millis(100);
     /// Room for the first spawn under Windows Defender.
     const PATIENCE: Duration = Duration::from_secs(30);
@@ -102,7 +109,10 @@ mod native {
             for (knob, value) in env {
                 command.env(format!("{KNOB}{knob}"), value);
             }
-            let (client, events) = configure(Client::builder().shutdown_grace(GRACE))
+            let builder = Client::builder()
+                .shutdown_grace(GRACE)
+                .backoff(Duration::from_millis(10));
+            let (client, events) = configure(builder)
                 .stdio(command)
                 .expect("the fake server starts");
             let (sender, receiver) = mpsc::channel();
@@ -156,12 +166,16 @@ mod native {
             }
         }
 
-        /// Opens `let value = 1;` on the running server.
+        /// Opens `let value = 1;` as `fake.rs`.
         fn open(&mut self) -> Document {
+            self.open_as("fake.rs")
+        }
+
+        /// Opens `let value = 1;` as `name` in the temp directory, where it caches nothing.
+        fn open_as(&mut self, name: &str) -> Document {
             let mut doc = Document::new("let value = 1;").expect("the fixture loads");
             doc.observe_changes(true);
-            let uri = scrive_lsp::uri::from_path(&std::env::temp_dir().join("fake.rs"))
-                .expect("the temp directory is absolute and UTF-8");
+            let uri = temp_uri(name);
             let answer = self
                 .client
                 .open(&doc.snapshot(), &uri, "rust")
@@ -177,6 +191,12 @@ mod native {
             assert!(answer.is_none(), "the hover goes to the server");
             request
         }
+    }
+
+    /// `name` in the temp directory, as a URI.
+    pub fn temp_uri(name: &str) -> scrive_lsp::lsp_types::Uri {
+        scrive_lsp::uri::from_path(&std::env::temp_dir().join(name))
+            .expect("the temp directory is absolute and UTF-8")
     }
 
     fn tests() -> Vec<(&'static str, fn())> {
@@ -225,6 +245,46 @@ mod native {
                 "dropping_the_client_runs_the_shutdown_sequence",
                 dropping_the_client_runs_the_shutdown_sequence,
             ),
+            (
+                "a_crash_restarts_and_reopens_the_documents",
+                a_crash_restarts_and_reopens_the_documents,
+            ),
+            (
+                "restarts_follow_the_policy_then_give_up",
+                restarts_follow_the_policy_then_give_up,
+            ),
+            (
+                "crash_text_arrives_before_the_status_change",
+                crash_text_arrives_before_the_status_change,
+            ),
+            (
+                "nothing_from_a_dead_server_is_applied_after_its_loss",
+                nothing_from_a_dead_server_is_applied_after_its_loss,
+            ),
+            (
+                "a_grandchild_holding_stdout_does_not_delay_the_loss_past_the_grace",
+                a_grandchild_holding_stdout_does_not_delay_the_loss_past_the_grace,
+            ),
+            (
+                "the_new_process_receives_nothing_meant_for_the_old",
+                the_new_process_receives_nothing_meant_for_the_old,
+            ),
+            (
+                "a_crash_right_after_initialize_is_restarted_not_stopped",
+                a_crash_right_after_initialize_is_restarted_not_stopped,
+            ),
+            (
+                "a_crash_before_initialize_stops_without_restarting",
+                a_crash_before_initialize_stops_without_restarting,
+            ),
+            (
+                "shutdown_during_a_backoff_stops_at_once",
+                shutdown_during_a_backoff_stops_at_once,
+            ),
+            (
+                "a_reconnect_racing_shutdown_never_shows_running",
+                a_reconnect_racing_shutdown_never_shows_running,
+            ),
         ];
         #[cfg(windows)]
         let tests = [
@@ -272,6 +332,38 @@ mod native {
 
     fn running(update: &Update) -> bool {
         matches!(update, Update::Status(Status::Running))
+    }
+
+    fn restarting(update: &Update) -> bool {
+        matches!(update, Update::Status(Status::Restarting { .. }))
+    }
+
+    /// The statuses among `updates`, in order.
+    fn statuses(updates: &[Update]) -> Vec<Status> {
+        updates
+            .iter()
+            .filter_map(|update| {
+                let Update::Status(status) = update else {
+                    return None;
+                };
+                Some(status.clone())
+            })
+            .collect()
+    }
+
+    /// The log lines of spawn `n` of the fake server.
+    fn spawn_lines(lines: &[String], n: usize) -> Vec<String> {
+        lines
+            .iter()
+            .skip_while(|line| **line != format!("spawn {n}"))
+            .skip(1)
+            .take_while(|line| !line.starts_with("spawn "))
+            .cloned()
+            .collect()
+    }
+
+    fn spawns(lines: &[String]) -> usize {
+        lines.iter().filter(|line| line.starts_with("spawn ")).count()
     }
 
     /// The reason of a stop update.
@@ -354,15 +446,17 @@ mod native {
         );
     }
 
-    /// A server that exits mid-request settles the request empty, clears its diagnostics, and
-    /// stops the client with its exit code after its last stderr line.
+    /// A server that exits mid-request settles the request empty, clears its diagnostics, and,
+    /// with no restarts, stops the client with its exit code after its last stderr line.
     fn a_crash_stops_the_client_and_settles_its_requests() {
-        let mut harness = Harness::start("crash-on-hover", &[], |builder| builder);
+        let mut harness = Harness::start("crash-on-hover", &[], |builder| {
+            builder.restart(restart::Policy::Never)
+        });
         harness.until(running);
         let doc = harness.open();
         harness.until(published_fake);
         let request = harness.hover(&doc);
-        let end = harness.to_end();
+        let end = harness.until(|update| stopped(update).is_some());
         assert!(
             end.iter()
                 .any(|update| matches!(hovered(update, &request), Some(None))),
@@ -414,37 +508,33 @@ mod native {
         assert!(elapsed < PATIENCE, "then it was killed: {elapsed:?}");
     }
 
-    /// A server that closes its stdout but keeps running is killed and reaped, and the stop
-    /// shows the kill.
+    /// A server that closes its stdout but keeps running is killed and reaped; it never
+    /// completed `initialize`, so the client stops at once. The server would park forever, so
+    /// only the kill can produce the stop.
     fn a_live_server_whose_stdout_closes_is_killed_and_reaped() {
-        let mut harness = Harness::start("close-stdout", &[], |builder| builder);
-        let end = harness.to_end();
-        #[cfg(unix)]
-        let killed = Reason::Exited {
-            code: None,
-            signal: Some(9),
-        };
-        #[cfg(windows)]
-        let killed = Reason::Exited {
-            code: Some(1),
-            signal: None,
-        };
-        assert_eq!(
-            end.last().and_then(stopped),
-            Some(&killed),
-            "the stop shows the kill: {end:#?}"
+        let mut harness = Harness::start("close-stdout", &[], |builder| {
+            builder.restart(restart::Policy::Never)
+        });
+        let end = harness.until(|update| stopped(update).is_some());
+        assert!(
+            matches!(end.last().and_then(stopped), Some(Reason::Exited { .. })),
+            "the stop shows the exit: {end:#?}"
         );
     }
 
     /// A server that stops reading its stdin is killed once the unwritten messages pass the
     /// limit.
     fn the_hung_server_guard_stops_a_server_that_stops_reading() {
-        let mut harness = Harness::start("deaf", &[], |builder| builder.backlog_limit(16 * 1024));
+        let mut harness = Harness::start("deaf", &[], |builder| {
+            builder
+                .backlog_limit(16 * 1024)
+                .restart(restart::Policy::Never)
+        });
         harness.until(running);
         for _ in 0..4096 {
             harness.client.notify::<Blob>("x".repeat(4096));
         }
-        let end = harness.to_end();
+        let end = harness.until(|update| stopped(update).is_some());
         assert_eq!(
             end.last().and_then(stopped),
             Some(&Reason::Unresponsive),
@@ -452,7 +542,8 @@ mod native {
         );
     }
 
-    /// Dropping a client neither panics nor blocks, and ends its event stream.
+    /// Dropping a client neither panics nor blocks, and its event stream ends because the
+    /// client is gone. `dropping_the_client_runs_the_shutdown_sequence` proves the sequence.
     fn dropping_the_client_shuts_the_server_down() {
         let mut harness = Harness::start("conversation", &[], |builder| builder);
         harness.until(running);
@@ -626,6 +717,281 @@ mod native {
         );
     }
 
+    fn restarting_once() -> Vec<Status> {
+        vec![
+            Status::Running,
+            Status::Restarting { attempt: 1 },
+            Status::Running,
+        ]
+    }
+
+    /// A server that crashes after the handshake is restarted: the same client reopens its
+    /// document on the new process and answers from it.
+    fn a_crash_restarts_and_reopens_the_documents() {
+        let mut harness = Harness::start(
+            "conversation",
+            &[("CRASH_AFTER", "3"), ("CRASHES", "1")],
+            |builder| builder,
+        );
+        let id = harness.client.id();
+        let mut updates = harness.until(running);
+        let doc = harness.open();
+        updates.extend(harness.until(running));
+        assert_eq!(statuses(&updates), restarting_once(), "{updates:#?}");
+        // The answer comes after the server read everything sent before the hover.
+        let request = harness.hover(&doc);
+        harness.until(|update| hovered(update, &request).flatten().is_some());
+        let lines = harness.log.lines();
+        let respawned = spawn_lines(&lines, 1);
+        assert_eq!(
+            respawned.get(..3),
+            Some(
+                &[
+                    "recv initialize".to_owned(),
+                    "recv initialized".to_owned(),
+                    "recv textDocument/didOpen let value = 1;".to_owned(),
+                ][..]
+            ),
+            "the new process is initialized and gets the document: {lines:#?}"
+        );
+        assert_eq!(harness.client.id(), id, "the same client");
+    }
+
+    /// Each crash is restarted until the policy's window is full; then the client stops, and
+    /// its stream runs on until a shutdown ends it.
+    fn restarts_follow_the_policy_then_give_up() {
+        let policy = restart::Policy::UpTo {
+            count: 2,
+            within: Duration::from_secs(60),
+        };
+        let mut harness = Harness::start("conversation", &[("CRASH_AFTER", "3")], |builder| {
+            builder.restart(policy)
+        });
+        let mut updates = harness.until(running);
+        let _doc = harness.open();
+        updates.extend(harness.until(|update| stopped(update).is_some()));
+        assert_eq!(
+            statuses(&updates),
+            [
+                Status::Running,
+                Status::Restarting { attempt: 1 },
+                Status::Running,
+                Status::Restarting { attempt: 1 },
+                Status::Running,
+                Status::Stopped(Reason::GaveUp),
+            ],
+            "{updates:#?}"
+        );
+        assert_eq!(spawns(&harness.log.lines()), 3, "three processes");
+        let _ = harness.client.shutdown();
+        let end = harness.to_end();
+        assert_eq!(
+            statuses(&end),
+            [Status::Stopped(Reason::Shutdown)],
+            "the stream outlived the stop: {end:#?}"
+        );
+    }
+
+    /// The dead server's last stderr line reaches the host before the restart does.
+    fn crash_text_arrives_before_the_status_change() {
+        let mut harness = Harness::start(
+            "conversation",
+            &[("STDERR", "2"), ("CRASH_AFTER", "3"), ("CRASHES", "1")],
+            |builder| builder,
+        );
+        harness.until(running);
+        let _doc = harness.open();
+        let updates = harness.until(restarting);
+        let panicked = updates.iter().position(|update| {
+            logs(update, log::Source::Stderr, "thread 'main' panicked at fake")
+        });
+        assert!(
+            panicked.is_some_and(|at| at + 1 < updates.len()),
+            "the panic text comes first: {updates:#?}"
+        );
+    }
+
+    /// A grandchild of the crashed server that writes to the old stdout after the restart
+    /// changes nothing: its diagnostics are neither applied nor cached.
+    fn nothing_from_a_dead_server_is_applied_after_its_loss() {
+        let mut harness = Harness::start(
+            "conversation",
+            &[
+                ("GRANDCHILD", "publish"),
+                ("CRASH_AFTER", "3"),
+                ("CRASHES", "1"),
+            ],
+            |builder| builder,
+        );
+        harness.until(running);
+        let doc = harness.open();
+        let mut updates = harness.until(restarting);
+        let lost_at = updates.len();
+        updates.extend(harness.until(running));
+        harness
+            .log
+            .until(|lines| lines.iter().any(|line| line == "published"));
+        let request = harness.hover(&doc);
+        updates.extend(harness.until(|update| hovered(update, &request).flatten().is_some()));
+        assert!(
+            !updates[lost_at..].iter().any(|update| diagnostics(update)
+                .is_some_and(|list| list.iter().any(|d| d.message == "grandchild"))),
+            "the grandchild's diagnostics are dropped: {updates:#?}"
+        );
+        let _ = harness.open_as(super::native::UNOPENED);
+    }
+
+    /// A grandchild holding the dead server's stdout doesn't hold up the loss beyond the
+    /// grace period.
+    fn a_grandchild_holding_stdout_does_not_delay_the_loss_past_the_grace() {
+        let grace = Duration::from_millis(300);
+        let mut harness = Harness::start(
+            "conversation",
+            &[
+                ("GRANDCHILD", "publish"),
+                ("CRASH_AFTER", "3"),
+                ("CRASHES", "1"),
+            ],
+            |builder| builder.shutdown_grace(grace),
+        );
+        harness.until(running);
+        let crash = Instant::now();
+        let _doc = harness.open();
+        harness.until(restarting);
+        let elapsed = crash.elapsed();
+        assert!(
+            elapsed < grace + Duration::from_secs(2),
+            "lost in time: {elapsed:?}"
+        );
+    }
+
+    /// What the client does while the server is gone never reaches the new process: it starts
+    /// with `initialize` and gets the edited text in its `didOpen`.
+    fn the_new_process_receives_nothing_meant_for_the_old() {
+        let mut harness = Harness::start(
+            "conversation",
+            &[("CRASH_AFTER", "3"), ("CRASHES", "1")],
+            |builder| builder.backoff(Duration::from_millis(300)),
+        );
+        harness.until(running);
+        let mut doc = harness.open();
+        harness.until(restarting);
+        doc.edit(vec![scrive_core::EditOp::insert(14, " // edited")])
+            .expect("edits");
+        harness.client.sync(&doc.snapshot(), doc.drain_changes());
+        let request = HoverRequest::new(Counter::new().issue(doc.revision()), 5, 4..9);
+        let answer = harness
+            .client
+            .hover(&doc.snapshot(), &request)
+            .expect("the hover declines locally");
+        assert!(
+            matches!(answer.change(), update::Change::Hover(None)),
+            "with no card"
+        );
+        harness.until(running);
+        let request = harness.hover(&doc);
+        harness.until(|update| hovered(update, &request).flatten().is_some());
+        let lines = harness.log.lines();
+        let respawned = spawn_lines(&lines, 1);
+        assert_eq!(
+            respawned.first().map(String::as_str),
+            Some("recv initialize"),
+            "initialize first: {lines:#?}"
+        );
+        let opened = respawned
+            .iter()
+            .position(|line| line.starts_with("recv textDocument/didOpen"))
+            .expect("the document reopens");
+        assert_eq!(
+            respawned[opened], "recv textDocument/didOpen let value = 1; // edited",
+            "with the edited text"
+        );
+        assert!(
+            !respawned[..opened]
+                .iter()
+                .any(|line| line.starts_with("recv textDocument/didChange")),
+            "no change before the open: {lines:#?}"
+        );
+    }
+
+    /// The `initialize` reply that came just before the crash counts: the client had a
+    /// handshake, so the crash restarts it.
+    fn a_crash_right_after_initialize_is_restarted_not_stopped() {
+        let mut harness = Harness::start(
+            "conversation",
+            &[("CRASH_AFTER", "1"), ("CRASHES", "1")],
+            |builder| builder,
+        );
+        let mut updates = harness.until(running);
+        updates.extend(harness.until(restarting));
+        updates.extend(harness.until(running));
+        assert_eq!(statuses(&updates), restarting_once(), "{updates:#?}");
+    }
+
+    /// A server that dies before its first handshake stops the client at once, which stays
+    /// revivable: its stream runs on.
+    fn a_crash_before_initialize_stops_without_restarting() {
+        let mut harness = Harness::start("conversation", &[("CRASH_AFTER", "0")], |builder| {
+            builder
+        });
+        let updates = harness.until(|update| stopped(update).is_some());
+        assert!(
+            matches!(
+                statuses(&updates).as_slice(),
+                [Status::Stopped(Reason::Exited { .. })]
+            ),
+            "stopped with the exit: {updates:#?}"
+        );
+        assert_eq!(spawns(&harness.log.lines()), 1, "one process");
+        let _ = harness.client.shutdown();
+        let end = harness.to_end();
+        assert_eq!(
+            statuses(&end),
+            [Status::Stopped(Reason::Shutdown)],
+            "the stream outlived the stop: {end:#?}"
+        );
+    }
+
+    /// A shutdown during the backoff ends at once, and no process is started.
+    fn shutdown_during_a_backoff_stops_at_once() {
+        let mut harness = Harness::start("conversation", &[("CRASH_AFTER", "3")], |builder| {
+            builder.backoff(Duration::from_secs(10))
+        });
+        harness.until(running);
+        let _doc = harness.open();
+        harness.until(restarting);
+        let asked = Instant::now();
+        let _ = harness.client.shutdown();
+        let end = harness.to_end();
+        let elapsed = asked.elapsed();
+        assert_eq!(
+            statuses(&end),
+            [Status::Stopped(Reason::Shutdown)],
+            "{end:#?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "at once: {elapsed:?}");
+        assert_eq!(spawns(&harness.log.lines()), 1, "no respawn");
+    }
+
+    /// A respawn that races the shutdown is shut down too, and never shows as running.
+    fn a_reconnect_racing_shutdown_never_shows_running() {
+        let mut harness = Harness::start(
+            "conversation",
+            &[("CRASH_AFTER", "3"), ("CRASHES", "1")],
+            |builder| builder.backoff(Duration::ZERO),
+        );
+        harness.until(running);
+        let _doc = harness.open();
+        harness.until(restarting);
+        let _ = harness.client.shutdown();
+        let end = harness.to_end();
+        assert_eq!(
+            statuses(&end),
+            [Status::Stopped(Reason::Shutdown)],
+            "only the shutdown: {end:#?}"
+        );
+    }
+
     /// A console program the server starts opens no console window either.
     #[cfg(windows)]
     fn a_console_grandchild_opens_no_window() {
@@ -685,6 +1051,14 @@ mod native {
             hang_on_exit: bool,
             /// Spawns from this one on never answer `initialize`.
             silent_from: Option<usize>,
+            /// Exit with code 101 after handling this many messages.
+            crash_after: Option<usize>,
+            /// Only spawns before this one crash.
+            crashes: Option<usize>,
+            /// Lines to write to stderr at start, and a panic line before a crash.
+            stderr: Option<usize>,
+            /// Before a crash, leave a grandchild that holds stdout and publishes on it.
+            grandchild: bool,
         }
 
         /// The log file the harness reads, if it set one.
@@ -701,7 +1075,35 @@ mod native {
                     ignore_shutdown: knob("IGNORE_SHUTDOWN").is_some(),
                     hang_on_exit: knob("HANG_ON_EXIT").is_some(),
                     silent_from: number("SILENT_FROM"),
+                    crash_after: number("CRASH_AFTER"),
+                    crashes: number("CRASHES"),
+                    stderr: number("STDERR"),
+                    grandchild: knob("GRANDCHILD").as_deref() == Some("publish"),
                 }
+            }
+
+            /// Whether spawn `spawn` crashes once it handled `handled` messages.
+            fn crashes(&self, spawn: usize, handled: usize) -> bool {
+                self.crash_after == Some(handled) && self.crashes.is_none_or(|k| spawn < k)
+            }
+
+            /// Crashes as configured: panic text, a grandchild, exit 101.
+            fn crash(&self) -> ! {
+                if self.stderr.is_some() {
+                    eprintln!("thread 'main' panicked at fake");
+                }
+                if self.grandchild {
+                    // Outliving this process, which exits at once, is the grandchild's job.
+                    #[allow(clippy::zombie_processes)]
+                    std::process::Command::new(
+                        std::env::current_exe().expect("the test binary has a path"),
+                    )
+                    .env(super::GRANDCHILD, "1")
+                    .stdin(std::process::Stdio::null())
+                    .spawn()
+                    .expect("the grandchild starts");
+                }
+                self.log.exit(101)
             }
         }
 
@@ -769,11 +1171,20 @@ mod native {
                 .and_then(|()| stdout.flush())
                 .expect("stdout is open");
             eprintln!("fake server ready");
+            for line in 0..knobs.stderr.unwrap_or(0) {
+                eprintln!("fake stderr line {line}");
+            }
+            if knobs.crashes(spawn, 0) {
+                knobs.crash();
+            }
             let mut stdin = io::stdin().lock();
             let mut pid = Value::Null;
             let mut shut = false;
+            let mut handled = 0;
             while let Ok(Some(message)) = Message::read(&mut stdin) {
                 knobs.log.line(&format!("recv {}", received(&message)));
+                handled += 1;
+                let crash = knobs.crashes(spawn, handled);
                 match message {
                     Message::Request(request) => {
                         let result = match request.method.as_str() {
@@ -816,28 +1227,58 @@ mod native {
                         if notification.method == "textDocument/didOpen" =>
                     {
                         let document = &notification.params["textDocument"];
-                        let params = json!({
-                            "uri": document["uri"],
-                            "version": document["version"],
-                            "diagnostics": [{
-                                "range": {
-                                    "start": { "line": 0, "character": 4 },
-                                    "end": { "line": 0, "character": 9 },
-                                },
-                                "severity": 1,
-                                "message": "fake",
-                            }],
-                        });
-                        let publish = "textDocument/publishDiagnostics".to_owned();
-                        write(&mut stdout, Notification::new(publish, params).into());
+                        write(&mut stdout, publish(&document["uri"], &document["version"], "fake"));
                     }
                     Message::Notification(_) | Message::Response(_) => {}
+                }
+                if crash {
+                    knobs.crash();
                 }
             }
             if knobs.hang_on_exit {
                 park()
             }
             knobs.log.exit(1)
+        }
+
+        /// A crashed server's grandchild: once the server was started again, it writes
+        /// diagnostics to the dead server's stdout, which it inherited, then lingers a moment.
+        pub fn grandchild() {
+            let log = Knobs::read().log;
+            let respawned = (0..1000).any(|_| {
+                if log.spawns() > 1 {
+                    return true;
+                }
+                thread::sleep(std::time::Duration::from_millis(10));
+                false
+            });
+            if !respawned {
+                return;
+            }
+            let mut stdout = io::stdout().lock();
+            for name in ["fake.rs", super::UNOPENED] {
+                let uri = super::temp_uri(name);
+                write(&mut stdout, publish(&json!(uri.as_str()), &Value::Null, "grandchild"));
+            }
+            log.line("published");
+            thread::sleep(std::time::Duration::from_secs(1));
+        }
+
+        /// One `fake` diagnostic over `value` for `uri`, at `version`.
+        fn publish(uri: &Value, version: &Value, message: &str) -> Message {
+            let params = json!({
+                "uri": uri,
+                "version": version,
+                "diagnostics": [{
+                    "range": {
+                        "start": { "line": 0, "character": 4 },
+                        "end": { "line": 0, "character": 9 },
+                    },
+                    "severity": 1,
+                    "message": message,
+                }],
+            });
+            Notification::new("textDocument/publishDiagnostics".to_owned(), params).into()
         }
 
         /// Runs a console program and waits for it.
@@ -856,6 +1297,12 @@ mod native {
         fn received(message: &Message) -> String {
             match message {
                 Message::Request(request) => request.method.clone(),
+                Message::Notification(notification)
+                    if notification.method == "textDocument/didOpen" =>
+                {
+                    let text = &notification.params["textDocument"]["text"];
+                    format!("{} {}", notification.method, text.as_str().unwrap_or(""))
+                }
                 Message::Notification(notification) => notification.method.clone(),
                 Message::Response(response) => format!("reply {}", response.id),
             }

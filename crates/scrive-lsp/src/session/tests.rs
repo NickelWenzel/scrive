@@ -4776,3 +4776,102 @@ fn method_names_initialize_and_pending_requests_only() {
         "initialize, once answered"
     );
 }
+
+/// `client`'s one `initialize` in `output`, answered with `capabilities`, and what the answer
+/// sent.
+#[cfg(not(target_family = "wasm"))]
+fn reinitialized(client: &mut Session, output: &Output, capabilities: Value) -> Vec<Value> {
+    let [request] = wire(&output.messages)
+        .try_into()
+        .expect("initialize goes out alone");
+    assert_eq!(request["method"], "initialize", "a fresh initialize");
+    let answer = client
+        .receive(from_server(json!({
+            "jsonrpc": "2.0", "id": request["id"], "result": {"capabilities": capabilities},
+        })))
+        .expect("the answer is accepted");
+    wire(&answer.messages)
+}
+
+/// A new connection gets the parameters of the first `initialize` under a fresh id.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn reinitialize_sends_initialize_with_the_stored_params() {
+    let builder = Builder::default()
+        .root(uri("file:///work/proj"))
+        .initialization_options(json!({"a": 1}));
+    let (mut client, first) = builder.session(Some(42));
+    let [first] = wire(&[first]).try_into().expect("one message");
+    let _ = client.disconnected();
+    let output = client.reinitialize();
+    let [again] = wire(&output.messages)
+        .try_into()
+        .expect("initialize goes out alone");
+    assert_eq!(again["params"], first["params"], "the same parameters");
+    assert_eq!(again["params"]["processId"], 42, "the process id among them");
+    assert_ne!(again["id"], first["id"], "a fresh id");
+    assert!(again["id"].is_number(), "a numeric id");
+    assert!(client.initializing(), "initializing again");
+}
+
+/// The new server gets every document with the text synced while it was gone.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn reinitialize_reopens_every_document_with_its_synced_text() {
+    let (mut client, mut doc) = connected("let value = 1;");
+    let _ = client.disconnected();
+    doc.edit(vec![EditOp::insert(14, " // more")])
+        .expect("edits");
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+    let output = client.reinitialize();
+    let sent = reinitialized(&mut client, &output, incremental());
+    let opened: Vec<&Value> = sent
+        .iter()
+        .filter(|message| message["method"] == "textDocument/didOpen")
+        .collect();
+    assert_eq!(opened.len(), 1, "the one document reopens: {sent:?}");
+    assert_eq!(
+        opened[0]["params"]["textDocument"]["text"], "let value = 1; // more",
+        "with its synced text"
+    );
+}
+
+/// A reopen continues the version count, so the new server never sees a version go back.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn versions_stay_monotonic_across_a_reinitialize() {
+    let (mut client, mut doc) = connected("let value = 1;");
+    doc.edit(vec![EditOp::insert(14, " ")]).expect("edits");
+    let sent = wire(&client.sync(&doc.snapshot(), doc.drain_changes()).messages);
+    let before = sent[0]["params"]["textDocument"]["version"]
+        .as_i64()
+        .expect("a version");
+    let _ = client.disconnected();
+    let output = client.reinitialize();
+    let sent = reinitialized(&mut client, &output, incremental());
+    let open = sent
+        .iter()
+        .find(|message| message["method"] == "textDocument/didOpen")
+        .expect("the document reopens");
+    let after = open["params"]["textDocument"]["version"]
+        .as_i64()
+        .expect("a version");
+    assert!(after > before, "{after} follows {before}");
+}
+
+/// The settings set while the server was gone are pushed to the new one.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn reinitialize_pushes_the_configuration_from_configure() {
+    let (mut client, _) = running(Builder::default(), incremental());
+    let _ = client.disconnected();
+    let _ = client.configure(json!({"x": 2}));
+    let output = client.reinitialize();
+    let sent = reinitialized(&mut client, &output, incremental());
+    assert_eq!(
+        sent[1],
+        json!({"jsonrpc": "2.0", "method": "workspace/didChangeConfiguration",
+            "params": {"settings": {"x": 2}}}),
+        "the latest settings, after initialized: {sent:?}"
+    );
+}

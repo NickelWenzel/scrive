@@ -10,8 +10,16 @@ pub enum Status {
     Starting,
     /// The handshake completed; requests go to the server.
     Running,
-    /// The connection is over: nothing goes out, every request declines, and the client's
-    /// [`Events`](super::Events) has ended.
+    /// The server was lost and is being started again; every request declines until it runs.
+    /// `attempt` counts from 1 since the client last reached `Running`.
+    Restarting {
+        /// The attempt this is.
+        attempt: u32,
+    },
+    /// The connection is over: nothing goes out and every request declines. After
+    /// [`Reason::Shutdown`], and for a bridge that cannot restart, this is final and the client's
+    /// [`Events`](super::Events) ends. After any other reason a server process's client keeps
+    /// its stream running.
     Stopped(Reason),
 }
 
@@ -39,15 +47,21 @@ pub enum Reason {
     /// The server stopped reading its input: more messages than it could take waited to be
     /// written (256 MiB), so it was killed.
     Unresponsive,
+    /// The restart policy ran out: too many losses within its window.
+    GaveUp,
 }
 
-/// `Stopped` compares by its reason.
+/// `Restarting` compares by its attempt, `Stopped` by its reason.
 impl PartialEq for Status {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Starting, Self::Starting) | (Self::Running, Self::Running) => true,
+            (Self::Restarting { attempt: a }, Self::Restarting { attempt: b }) => a == b,
             (Self::Stopped(a), Self::Stopped(b)) => a == b,
-            (Self::Starting | Self::Running | Self::Stopped(_), _) => false,
+            (
+                Self::Starting | Self::Running | Self::Restarting { .. } | Self::Stopped(_),
+                _,
+            ) => false,
         }
     }
 }
@@ -61,7 +75,8 @@ impl PartialEq for Reason {
             (Self::Shutdown, Self::Shutdown)
             | (Self::Closed, Self::Closed)
             | (Self::Initialize, Self::Initialize)
-            | (Self::Unresponsive, Self::Unresponsive) => true,
+            | (Self::Unresponsive, Self::Unresponsive)
+            | (Self::GaveUp, Self::GaveUp) => true,
             (Self::Failed(a), Self::Failed(b)) => a.kind() == b.kind(),
             (
                 Self::Exited { code, signal },
@@ -76,7 +91,8 @@ impl PartialEq for Reason {
                 | Self::Initialize
                 | Self::Failed(_)
                 | Self::Exited { .. }
-                | Self::Unresponsive,
+                | Self::Unresponsive
+                | Self::GaveUp,
                 _,
             ) => false,
         }

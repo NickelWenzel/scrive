@@ -12,9 +12,11 @@ use crate::transport;
 /// Everything that reaches a client, as a stream the host runs, e.g. with
 /// `Task::run(events, Message::Lsp)`. Each item goes to
 /// [`Client::receive`](super::Client::receive). It yields the client's own items (outgoing
-/// traces, its stops) before the bridge's, and ends after a
-/// [`Status::Stopped`](super::Status::Stopped), or when the client is dropped. Until the host
-/// runs it, no reply reaches the client.
+/// traces, its stops) before the bridge's. Until the host runs it, no reply reaches the client.
+///
+/// It ends when the client is dropped, after `Stopped(Shutdown)`, and after any stop of a
+/// bridge that cannot restart. A server process that is lost and not started again leaves the
+/// stream running.
 #[must_use = "a client whose Events nobody runs never sees a reply"]
 pub struct Events {
     client: Id,

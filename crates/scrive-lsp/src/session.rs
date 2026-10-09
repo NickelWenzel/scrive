@@ -761,6 +761,27 @@ impl Session {
         output
     }
 
+    /// A fresh `initialize` for a new connection, from the stored parameters. Its reply reopens
+    /// every registered document from its synced text, with versions counting on, and pushes
+    /// the settings last set by `configure`.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn reinitialize(&mut self) -> Output {
+        debug_assert!(
+            matches!(self.state, State::Disconnected),
+            "a new connection follows the loss of the old one"
+        );
+        let request = self.next_request();
+        self.state = State::Initializing {
+            request: request.clone(),
+        };
+        Output {
+            messages: vec![Message::Request(message::Request::new::<
+                lsp_types::request::Initialize,
+            >(request, self.initialize.clone()))],
+            updates: Vec::new(),
+        }
+    }
+
     /// Replaces the settings that `workspace/configuration` answers from. While running, the
     /// server is also told with `workspace/didChangeConfiguration`; before that, the handshake
     /// pushes them.

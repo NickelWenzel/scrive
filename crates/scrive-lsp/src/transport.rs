@@ -3,6 +3,7 @@
 
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod frame;
+mod generation;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod lifecycle;
 pub(crate) mod memory;
@@ -16,6 +17,7 @@ use std::io;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+pub(crate) use generation::Generation;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use lifecycle::{Handshake, Lifecycle};
 
@@ -38,20 +40,42 @@ pub(crate) enum Link {
     Stdio(stdio::Writer),
 }
 
-/// What a bridge reports.
+/// What a bridge reports. Protocol traffic names the connection it came from, so the client can
+/// drop what a dead connection still delivers.
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
-    /// One JSON-RPC message from the server, as received.
-    Message(Arc<[u8]>),
-    /// The connection is over.
+    /// One JSON-RPC message from the server, as received on connection `generation`.
+    Message {
+        generation: Generation,
+        body: Arc<[u8]>,
+    },
+    /// The bridge is done for good.
     Stopped(client::Reason),
     /// Lines the server wrote outside the protocol: one read's stderr lines, or the stdout noise
-    /// between two frames.
+    /// between two frames. Never dropped: a dead server's last words are what a log is for.
     #[cfg(not(target_family = "wasm"))]
     Log(Arc<[log::Entry]>),
-    /// A frame the bridge dropped.
+    /// A frame connection `generation` dropped.
     #[cfg(not(target_family = "wasm"))]
-    Error(client::Error),
+    Error {
+        generation: Generation,
+        error: client::Error,
+    },
+    /// The connection before `generation` ended; `generation` is the one a reconnect creates.
+    #[cfg(not(target_family = "wasm"))]
+    Lost {
+        generation: Generation,
+        reason: client::Reason,
+    },
+    /// An attempt to bring up connection `generation` failed; the next follows after a backoff.
+    #[cfg(not(target_family = "wasm"))]
+    Attempting {
+        generation: Generation,
+        failure: Arc<io::Error>,
+    },
+    /// Connection `generation` is up, and `link` is its outgoing queue.
+    #[cfg(not(target_family = "wasm"))]
+    Reconnected { generation: Generation, link: Link },
 }
 
 /// A bridge's incoming side, polled by [`client::Events`].

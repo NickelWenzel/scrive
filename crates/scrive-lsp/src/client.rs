@@ -5,6 +5,8 @@ pub mod builder;
 pub mod error;
 mod event;
 mod events;
+#[cfg(not(target_family = "wasm"))]
+mod recovery;
 mod status;
 #[cfg(test)]
 mod tests;
@@ -68,21 +70,35 @@ pub struct Client {
     local: futures_channel::mpsc::UnboundedSender<Event>,
     trace: trace::Mode,
     status: Status,
+    /// Losing and regaining the server, which only a worker bridge does.
+    #[cfg(not(target_family = "wasm"))]
+    recovery: recovery::State,
 }
 
 /// A process-unique client identity, so an editor can tell which client it is registered with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Id(u64);
 
-/// What the client holds of its transport, which decides where messages go.
+/// What the client holds of its transport, which decides where messages go and what a
+/// transport event means. Only `Live` and `Shut(Some(_))` send.
 #[derive(Debug)]
 enum Connection {
-    /// The session's messages go to `link`.
-    Live { link: transport::Link },
-    /// `shutdown()` ran or the connection stopped: absorbing. After a worker bridge's
+    /// The session's messages go to `link`, which belongs to connection `generation`.
+    Live {
+        generation: transport::Generation,
+        link: transport::Link,
+    },
+    /// The server was lost and the worker brings up a new one: messages are dropped until it
+    /// is reconnected.
+    #[cfg(not(target_family = "wasm"))]
+    Reconnecting,
+    /// The client chose not to bring the server back, or its `initialize` failed.
+    #[cfg(not(target_family = "wasm"))]
+    Stopped,
+    /// `shutdown()` ran, or a stop ended the stream: absorbing. After a worker bridge's
     /// `shutdown()` the link stays, so server requests during the grace period still get their
     /// `null` answers.
-    Shut(Option<transport::Link>),
+    Shut(Option<(transport::Generation, transport::Link)>),
 }
 
 /// The server request a response answers: its id and method.
@@ -94,21 +110,27 @@ struct Answering {
 /// Dropping the client ends the connection as [`Client::shutdown`] would, without tracing.
 impl Drop for Client {
     fn drop(&mut self) {
-        let Connection::Live { link } = &self.connection else {
-            return;
-        };
-        match &self.control {
-            transport::Control::Memory => {
+        match (&self.connection, &self.control) {
+            (Connection::Live { link, .. }, transport::Control::Memory) => {
                 for message in self.goodbye() {
                     link.send(serialize(&message));
                 }
             }
             #[cfg(not(target_family = "wasm"))]
-            transport::Control::Stdio(control) => {
+            (Connection::Live { generation, .. }, transport::Control::Stdio(control)) => {
                 control.send(transport::Lifecycle::Shutdown {
+                    generation: *generation,
                     handshake: self.handshake(),
                 });
             }
+            #[cfg(not(target_family = "wasm"))]
+            (Connection::Reconnecting | Connection::Stopped, control) => {
+                control.send(transport::Lifecycle::Shutdown {
+                    generation: self.recovery.generation(),
+                    handshake: transport::Handshake::Pending,
+                });
+            }
+            (Connection::Shut(_), _) => {}
         }
     }
 }
@@ -362,30 +384,43 @@ impl Client {
             settled.messages.is_empty(),
             "the session sends no shutdown of its own"
         );
-        if let Connection::Live { .. } = self.connection {
-            match &self.control {
+        match &self.connection {
+            Connection::Live { .. } => match &self.control {
                 transport::Control::Memory => {
                     self.send(goodbye, None);
                     self.stop(Reason::Shutdown);
                 }
                 #[cfg(not(target_family = "wasm"))]
                 transport::Control::Stdio(control) => {
-                    control.send(transport::Lifecycle::Shutdown { handshake });
                     let connection =
                         std::mem::replace(&mut self.connection, Connection::Shut(None));
-                    if let Connection::Live { link } = connection {
-                        self.connection = Connection::Shut(Some(link));
+                    if let Connection::Live { generation, link } = connection {
+                        control.send(transport::Lifecycle::Shutdown {
+                            generation,
+                            handshake,
+                        });
+                        self.connection = Connection::Shut(Some((generation, link)));
                     }
                 }
+            },
+            #[cfg(not(target_family = "wasm"))]
+            Connection::Reconnecting | Connection::Stopped => {
+                self.control.send(transport::Lifecycle::Shutdown {
+                    generation: self.recovery.generation(),
+                    handshake: transport::Handshake::Pending,
+                });
+                self.connection = Connection::Shut(None);
             }
+            Connection::Shut(_) => {}
         }
         documents(settled.updates)
     }
 
     /// Folds one event from this client's [`Events`] in, and returns what the host must act on,
     /// in order: an incoming message's [`Update::Trace`] first, a [`Update::Status`] change last.
-    /// Server requests are answered, and messages the event causes are sent. After the client
-    /// stopped, events change nothing.
+    /// Server requests are answered, and messages the event causes are sent. Traffic from a
+    /// server the client has let go of is dropped; its log lines still arrive. After
+    /// [`shutdown`](Self::shutdown), a server that is lost or comes back changes nothing.
     #[must_use]
     pub fn receive(&mut self, event: Event) -> Vec<Update> {
         let (client, payload) = event.into_parts();
@@ -393,17 +428,37 @@ impl Client {
             client, self.id,
             "an Event goes to the Client whose Events yielded it"
         );
-        if let Status::Stopped(_) = self.status {
-            return Vec::new();
-        }
         match payload {
-            event::Payload::Transport(transport::Event::Message(body)) => self.received(body),
+            event::Payload::Transport(transport::Event::Message { generation, body }) => {
+                if !self.connection.holds(generation) {
+                    return Vec::new();
+                }
+                self.received(body)
+            }
             #[cfg(not(target_family = "wasm"))]
             event::Payload::Transport(transport::Event::Log(entries)) => {
                 entries.iter().cloned().map(Update::Log).collect()
             }
             #[cfg(not(target_family = "wasm"))]
-            event::Payload::Transport(transport::Event::Error(error)) => vec![Update::Error(error)],
+            event::Payload::Transport(transport::Event::Error { generation, error }) => {
+                if !self.connection.holds(generation) {
+                    return Vec::new();
+                }
+                vec![Update::Error(error)]
+            }
+            #[cfg(not(target_family = "wasm"))]
+            event::Payload::Transport(transport::Event::Lost { generation, reason }) => {
+                self.lost(generation, reason)
+            }
+            #[cfg(not(target_family = "wasm"))]
+            event::Payload::Transport(transport::Event::Attempting {
+                generation,
+                failure,
+            }) => self.attempting(generation, failure),
+            #[cfg(not(target_family = "wasm"))]
+            event::Payload::Transport(transport::Event::Reconnected { generation, link }) => {
+                self.reconnected(generation, link)
+            }
             event::Payload::Sent(entry) => vec![Update::Trace(entry)],
             event::Payload::Transport(transport::Event::Stopped(reason))
             | event::Payload::Stopped(reason) => self.stopped(reason),
@@ -417,15 +472,21 @@ impl Client {
         control: transport::Control,
         local: futures_channel::mpsc::UnboundedSender<Event>,
         trace: trace::Mode,
+        #[cfg(not(target_family = "wasm"))] recovery: recovery::State,
     ) -> Self {
         Self {
             id,
             session,
-            connection: Connection::Live { link },
+            connection: Connection::Live {
+                generation: transport::Generation::FIRST,
+                link,
+            },
             control,
             local,
             trace,
             status: Status::Starting,
+            #[cfg(not(target_family = "wasm"))]
+            recovery,
         }
     }
 
@@ -451,9 +512,8 @@ impl Client {
                     .local
                     .unbounded_send(Event::new(self.id, event::Payload::Sent(entry)));
             }
-            match &self.connection {
-                Connection::Live { link } | Connection::Shut(Some(link)) => link.send(body),
-                Connection::Shut(None) => {}
+            if let Some(link) = self.connection.link() {
+                link.send(body);
             }
         }
     }
@@ -531,29 +591,49 @@ impl Client {
             Err(error) => updates.push(Update::Error(error)),
         }
         if initializing && self.session.running() {
+            #[cfg(not(target_family = "wasm"))]
+            self.handshaken();
             self.status = Status::Running;
             updates.push(Update::Status(Status::Running));
         } else if initializing && !self.session.initializing() {
             // No capabilities, so nothing can be synced: the connection is over.
-            #[cfg(not(target_family = "wasm"))]
-            self.control.send(transport::Lifecycle::Shutdown {
-                handshake: transport::Handshake::Pending,
-            });
-            self.stop(Reason::Initialize);
+            match &self.control {
+                transport::Control::Memory => self.stop(Reason::Initialize),
+                #[cfg(not(target_family = "wasm"))]
+                transport::Control::Stdio(_) => updates.extend(self.refused()),
+            }
         }
         updates
     }
 
-    /// The connection is over: settles and clears through `disconnected`, once, then reports it.
+    /// The connection is over for good: settles and clears through `disconnected`, unless a
+    /// loss already did, then reports it. The same stop delivered twice changes nothing.
     fn stopped(&mut self, reason: Reason) -> Vec<Update> {
+        let connected = match self.connection {
+            Connection::Live { .. } | Connection::Shut(Some(_)) => true,
+            // Only memory's own stops let go of a link the session still runs on.
+            Connection::Shut(None) => matches!(self.status, Status::Starting | Status::Running),
+            #[cfg(not(target_family = "wasm"))]
+            Connection::Reconnecting | Connection::Stopped => false,
+        };
+        if !connected && self.status == Status::Stopped(reason.clone()) {
+            return Vec::new();
+        }
         self.connection = Connection::Shut(None);
-        let session::Output {
-            messages,
-            mut updates,
-        } = self.session.disconnected();
-        debug_assert!(messages.is_empty(), "a disconnected session sends nothing");
+        let mut updates = if connected {
+            self.disconnect()
+        } else {
+            Vec::new()
+        };
         self.status = Status::Stopped(reason.clone());
         updates.push(Update::Status(Status::Stopped(reason)));
+        updates
+    }
+
+    /// Settles and clears what the session had of the server.
+    fn disconnect(&mut self) -> Vec<Update> {
+        let session::Output { messages, updates } = self.session.disconnected();
+        debug_assert!(messages.is_empty(), "a disconnected session sends nothing");
         updates
     }
 
@@ -580,6 +660,30 @@ impl Client {
             transport::Handshake::Done
         } else {
             transport::Handshake::Pending
+        }
+    }
+}
+
+impl Connection {
+    /// Whether traffic from connection `generation` is the client's to fold in.
+    fn holds(&self, generation: transport::Generation) -> bool {
+        match self {
+            Connection::Live { generation: held, .. } | Connection::Shut(Some((held, _))) => {
+                *held == generation
+            }
+            #[cfg(not(target_family = "wasm"))]
+            Connection::Reconnecting | Connection::Stopped => false,
+            Connection::Shut(None) => false,
+        }
+    }
+
+    /// Where messages go, if anywhere.
+    fn link(&self) -> Option<&transport::Link> {
+        match self {
+            Connection::Live { link, .. } | Connection::Shut(Some((_, link))) => Some(link),
+            #[cfg(not(target_family = "wasm"))]
+            Connection::Reconnecting | Connection::Stopped => None,
+            Connection::Shut(None) => None,
         }
     }
 }
