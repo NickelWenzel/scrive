@@ -764,7 +764,10 @@ impl Session {
     /// A fresh `initialize` for a new connection, from the stored parameters. Its reply reopens
     /// every registered document from its synced text, with versions counting on, and pushes
     /// the settings last set by `configure`.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub(crate) fn reinitialize(&mut self) -> Output {
         debug_assert!(
             matches!(self.state, State::Disconnected),

@@ -4,7 +4,10 @@ use core::fmt;
 
 use super::{Id, Status};
 use crate::{trace, transport};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 use crate::log;
 
 /// One item of a client's [`Events`](super::Events): hand it to
@@ -43,7 +46,10 @@ impl fmt::Debug for Event {
                 .field("bytes", &entry.json().len()),
             Payload::Transport(transport::Event::Stopped(reason)) => event.field("stopped", reason),
             Payload::Status(status) => event.field("status", status),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Payload::Transport(transport::Event::Log(entries)) => event
                 .field("log", &entries.first().map(log::Entry::source))
                 .field("lines", &entries.len()),
@@ -51,18 +57,27 @@ impl fmt::Debug for Event {
             Payload::Transport(transport::Event::Error { generation, error }) => event
                 .field("generation", generation)
                 .field("error", error),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Payload::Transport(transport::Event::Lost { generation, reason }) => event
                 .field("lost", reason)
                 .field("generation", generation),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Payload::Transport(transport::Event::Attempting {
                 generation,
                 failure,
             }) => event
                 .field("attempt_failed", &failure.kind())
                 .field("generation", generation),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Payload::Transport(transport::Event::Reconnected { generation, .. }) => {
                 event.field("reconnected", generation)
             }
@@ -93,14 +108,18 @@ impl Event {
             | Payload::Status(Status::Starting | Status::Running | Status::Restarting { .. }) => {
                 false
             }
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Payload::Transport(
                 transport::Event::Log(_)
-                | transport::Event::Error { .. }
                 | transport::Event::Lost { .. }
                 | transport::Event::Attempting { .. }
                 | transport::Event::Reconnected { .. },
             ) => false,
+            #[cfg(not(target_family = "wasm"))]
+            Payload::Transport(transport::Event::Error { .. }) => false,
         }
     }
 }

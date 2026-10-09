@@ -1,10 +1,16 @@
 //! Whether a lost server is started again.
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 use std::collections::VecDeque;
 use std::time::Duration;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Instant;
+
+#[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+use wasmtimer::std::Instant;
 
 /// When the client starts a lost server again. A server is never restarted before its first
 /// `initialize` succeeded: a server that cannot start once stops at once.
@@ -22,7 +28,10 @@ pub enum Policy {
 }
 
 /// The losses that count against a policy, oldest first.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 #[derive(Debug)]
 pub(crate) struct Window {
     policy: Policy,
@@ -30,7 +39,10 @@ pub(crate) struct Window {
 }
 
 /// What a [`Window`] rules for one more loss.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Restart,
@@ -48,7 +60,10 @@ impl Default for Policy {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 impl Window {
     pub(crate) fn new(policy: Policy) -> Self {
         Self {

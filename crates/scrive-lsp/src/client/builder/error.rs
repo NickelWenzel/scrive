@@ -1,17 +1,22 @@
 //! Why a bridge could not start.
 
+#[cfg(not(target_family = "wasm"))]
 use std::io;
+#[cfg(not(target_family = "wasm"))]
 use std::net::SocketAddr;
 
 /// Why [`Builder`](super::Builder)'s terminal method could not start the connection.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[cfg(not(target_family = "wasm"))]
     /// The server process could not be started, for example because the program is not found.
     #[error("the language server could not be started: {0}")]
     Spawn(#[source] io::Error),
+    #[cfg(not(target_family = "wasm"))]
     /// A thread the bridge needs, or a WebSocket thread's event poll, could not be created.
     #[error("a language server thread could not be created: {0}")]
     Thread(#[source] io::Error),
+    #[cfg(not(target_family = "wasm"))]
     /// The address [`listen`](super::Builder::listen) was given could not be bound.
     #[error("the client could not listen on {address}: {source}")]
     Bind {
@@ -31,7 +36,7 @@ pub enum Error {
         reason: Url,
     },
     /// The default TLS configuration for `wss://` could not be built.
-    #[cfg(feature = "websocket")]
+    #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
     #[error("TLS configuration: {0}")]
     Tls(#[from] rustls::Error),
 }

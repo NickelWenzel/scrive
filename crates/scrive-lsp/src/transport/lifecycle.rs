@@ -1,7 +1,12 @@
 //! What a bridge's worker learns from the client about the protocol conversation, and the client
 //! half of the LSP shutdown handshake it runs.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+
+#[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+use wasmtimer::std::Instant;
 
 use super::Generation;
 use crate::{client, message, transport};
@@ -146,7 +151,7 @@ fn shutdown() -> std::sync::Arc<[u8]> {
     client::serialize(&message::Message::Request(request))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use serde_json::json;
 

@@ -5,7 +5,10 @@ pub mod builder;
 pub mod error;
 mod event;
 mod events;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 mod recovery;
 mod status;
 #[cfg(test)]
@@ -74,7 +77,10 @@ pub struct Client {
     trace: trace::Mode,
     status: Status,
     /// Losing and regaining the server, which only a worker bridge does.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     recovery: recovery::State,
     /// The address a `listen` client bound.
     #[cfg(not(target_family = "wasm"))]
@@ -96,10 +102,16 @@ enum Connection {
     },
     /// The server was lost and the worker brings up a new one: messages are dropped until it
     /// is reconnected.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     Reconnecting,
     /// The client chose not to bring the server back, or its `initialize` failed.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     Stopped,
     /// `shutdown()` ran, or a stop ended the stream: absorbing. After a worker bridge's
     /// `shutdown()` the link stays, so server requests during the grace period still get their
@@ -141,7 +153,17 @@ impl Drop for Client {
                     handshake: self.handshake(),
                 });
             }
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+            (Connection::Live { generation, .. }, control @ transport::Control::Browser(_)) => {
+                control.send(transport::Lifecycle::Shutdown {
+                    generation: *generation,
+                    handshake: self.handshake(),
+                });
+            }
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             (Connection::Reconnecting | Connection::Stopped, control) => {
                 control.send(transport::Lifecycle::Shutdown {
                     generation: self.recovery.generation(),
@@ -395,7 +417,10 @@ impl Client {
     #[must_use]
     pub fn shutdown(&mut self) -> Vec<update::Document> {
         let goodbye = self.goodbye();
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(any(
+            not(target_family = "wasm"),
+            all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+        ))]
         let handshake = self.handshake();
         let settled = self.session.shutdown();
         debug_assert!(
@@ -409,17 +434,20 @@ impl Client {
                     self.stop(Reason::Shutdown);
                 }
                 #[cfg(not(target_family = "wasm"))]
-                transport::Control::Stdio(handle)
-                | transport::Control::Tcp(handle)
-                | transport::Control::Listen(handle) => {
-                    self.connection.shut(handle, handshake);
+                transport::Control::Stdio(_)
+                | transport::Control::Tcp(_)
+                | transport::Control::Listen(_) => {
+                    self.connection.shut(&self.control, handshake);
                 }
                 #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
-                transport::Control::Websocket(handle) => {
-                    self.connection.shut(handle, handshake);
-                }
+                transport::Control::Websocket(_) => self.connection.shut(&self.control, handshake),
+                #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+                transport::Control::Browser(_) => self.connection.shut(&self.control, handshake),
             },
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Connection::Reconnecting | Connection::Stopped => {
                 self.control.send(transport::Lifecycle::Shutdown {
                     generation: self.recovery.generation(),
@@ -453,6 +481,8 @@ impl Client {
             transport::Control::Stdio(_) | transport::Control::Tcp(_) => Ok(self.restart_worker()),
             #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
             transport::Control::Websocket(_) => Ok(self.restart_worker()),
+            #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+            transport::Control::Browser(_) => Ok(self.restart_worker()),
         }
     }
 
@@ -484,7 +514,10 @@ impl Client {
                 }
                 self.received(body)
             }
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             event::Payload::Transport(transport::Event::Log(entries)) => {
                 entries.iter().cloned().map(Update::Log).collect()
             }
@@ -495,16 +528,25 @@ impl Client {
                 }
                 vec![Update::Error(error)]
             }
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             event::Payload::Transport(transport::Event::Lost { generation, reason }) => {
                 self.lost(generation, reason)
             }
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             event::Payload::Transport(transport::Event::Attempting {
                 generation,
                 failure,
             }) => self.attempting(generation, failure),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             event::Payload::Transport(transport::Event::Reconnected { generation, link }) => {
                 self.reconnected(generation, link)
             }
@@ -524,7 +566,7 @@ impl Client {
         control: transport::Control,
         local: futures_channel::mpsc::UnboundedSender<Event>,
         trace: trace::Mode,
-        #[cfg(not(target_family = "wasm"))] recovery: recovery::State,
+        #[cfg(any(not(target_family = "wasm"), all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")))] recovery: recovery::State,
     ) -> Self {
         Self {
             id,
@@ -537,7 +579,10 @@ impl Client {
             local,
             trace,
             status: Status::Starting,
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             recovery,
             #[cfg(not(target_family = "wasm"))]
             listening_on: None,
@@ -650,7 +695,10 @@ impl Client {
             Err(error) => updates.push(Update::Error(error)),
         }
         if initializing && self.session.running() {
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             self.handshaken();
             self.status = Status::Running;
             updates.push(Update::Status(Status::Running));
@@ -664,6 +712,8 @@ impl Client {
                 | transport::Control::Listen(_) => updates.extend(self.refused()),
                 #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
                 transport::Control::Websocket(_) => updates.extend(self.refused()),
+                #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+                transport::Control::Browser(_) => updates.extend(self.refused()),
             }
         }
         updates
@@ -676,7 +726,10 @@ impl Client {
             Connection::Live { .. } | Connection::Shut(Some(_)) => true,
             // Only memory's own stops let go of a link the session still runs on.
             Connection::Shut(None) => matches!(self.status, Status::Starting | Status::Running),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Connection::Reconnecting | Connection::Stopped => false,
         };
         if !connected && self.status == Status::Stopped(reason.clone()) {
@@ -717,7 +770,10 @@ impl Client {
     }
 
     /// Whether the server answered `initialize`, for the worker's shutdown sequence.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     fn handshake(&self) -> transport::Handshake {
         if self.session.running() {
             transport::Handshake::Done
@@ -730,10 +786,13 @@ impl Client {
 impl Connection {
     /// Hands a live connection to its worker's shutdown sequence. The link stays, so server
     /// requests during the grace period still get their `null` answers.
-    #[cfg(not(target_family = "wasm"))]
-    fn shut(&mut self, handle: &transport::Handle, handshake: transport::Handshake) {
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
+    fn shut(&mut self, control: &transport::Control, handshake: transport::Handshake) {
         if let Connection::Live { generation, link } = std::mem::replace(self, Connection::Shut(None)) {
-            handle.send(transport::Lifecycle::Shutdown {
+            control.send(transport::Lifecycle::Shutdown {
                 generation,
                 handshake,
             });
@@ -747,7 +806,10 @@ impl Connection {
             Connection::Live { generation: held, .. } | Connection::Shut(Some((held, _))) => {
                 *held == generation
             }
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Connection::Reconnecting | Connection::Stopped => false,
             Connection::Shut(None) => false,
         }
@@ -757,7 +819,10 @@ impl Connection {
     fn link(&self) -> Option<&transport::Link> {
         match self {
             Connection::Live { link, .. } | Connection::Shut(Some((_, link))) => Some(link),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Connection::Reconnecting | Connection::Stopped => None,
             Connection::Shut(None) => None,
         }
