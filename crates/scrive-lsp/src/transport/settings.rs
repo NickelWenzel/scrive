@@ -5,6 +5,11 @@ use std::time::Duration;
 /// How much each restart's backoff grows, and where it stops (monaco's reconnecting socket).
 const GROWTH: f64 = 1.3;
 const CAP: Duration = Duration::from_secs(10);
+// The wait after a failed first dial, growing ×1.3 up to `STEP_CAP`. A server started together
+// with its client is often still binding its port; a 1 s first step would add a second to
+// every such start.
+const FIRST_STEP: Duration = Duration::from_millis(50);
+const STEP_CAP: Duration = Duration::from_secs(1);
 
 /// What the builder hands a worker bridge.
 #[derive(Clone, Copy, Debug)]
@@ -14,6 +19,7 @@ pub(crate) struct Settings {
     /// The first delay before a restart.
     pub(crate) backoff: Duration,
     /// Unwritten bytes past which the server counts as unresponsive.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) limit: usize,
     /// How long a connection may take to answer `initialize`; `None` waits forever.
     pub(crate) initialize_timeout: Option<Duration>,
@@ -26,8 +32,13 @@ impl Settings {
     }
 }
 
+/// The wait after `failed` failed first dials, before the next.
+pub(crate) fn step(failed: u32) -> Duration {
+    grow(FIRST_STEP, failed, STEP_CAP)
+}
+
 /// `base`, grown ×1.3 `retry` times, at most `cap`.
-pub(crate) fn grow(base: Duration, retry: u32, cap: Duration) -> Duration {
+fn grow(base: Duration, retry: u32, cap: Duration) -> Duration {
     if base.is_zero() {
         return Duration::ZERO;
     }
@@ -44,6 +55,7 @@ mod tests {
         Settings {
             grace: Duration::ZERO,
             backoff,
+            #[cfg(not(target_family = "wasm"))]
             limit: 0,
             initialize_timeout: None,
         }
@@ -62,5 +74,13 @@ mod tests {
             Duration::ZERO,
             "no backoff stays none"
         );
+    }
+
+    /// The first-dial schedule starts at 50 ms and stops growing at 1 s.
+    #[test]
+    fn the_first_dials_retry_from_fifty_milliseconds_up_to_a_second() {
+        assert_eq!(step(0), FIRST_STEP, "the first step");
+        assert_eq!(step(1), Duration::from_millis(65), "30% more");
+        assert_eq!(step(50), STEP_CAP, "capped");
     }
 }

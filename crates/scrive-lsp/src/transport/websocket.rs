@@ -1,13 +1,22 @@
 //! The WebSocket bridge: one JSON-RPC message per text frame, no `Content-Length`.
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod browser;
+#[cfg(not(target_family = "wasm"))]
 mod native;
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) use browser::{start, Control, Endpoint};
+#[cfg(not(target_family = "wasm"))]
 pub(crate) use native::{Connection, Endpoint, Pending, Queue, Socket};
 
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
+#[cfg(not(target_family = "wasm"))]
 use tungstenite::http::Uri;
 
+#[cfg(not(target_family = "wasm"))]
 use super::{socket, Settings, Started};
 use crate::client::builder;
 
@@ -19,6 +28,7 @@ pub(crate) enum Scheme {
 }
 
 /// The scheme of `uri`: `ws` or `wss`, in any case.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn scheme(uri: &Uri) -> Result<Scheme, builder::error::Url> {
     match uri.scheme_str() {
         Some(scheme) if scheme.eq_ignore_ascii_case("ws") => Ok(Scheme::Plain),
@@ -27,8 +37,25 @@ pub(crate) fn scheme(uri: &Uri) -> Result<Scheme, builder::error::Url> {
     }
 }
 
+/// The scheme of `url`, `ws` or `wss` in any case, read up to its `://`. The browser parses the
+/// rest when it opens the socket.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub(crate) fn scheme(url: &str) -> Result<Scheme, builder::error::Url> {
+    let Some((scheme, _)) = url.split_once("://") else {
+        return Err(builder::error::Url::Unparsable);
+    };
+    if scheme.eq_ignore_ascii_case("ws") {
+        Ok(Scheme::Plain)
+    } else if scheme.eq_ignore_ascii_case("wss") {
+        Ok(Scheme::Secure)
+    } else {
+        Err(builder::error::Url::Scheme)
+    }
+}
+
 /// Starts a worker that dials `endpoint` and carries one connection at a time. The first dials
 /// retry until `budget` has passed.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn start(
     endpoint: Endpoint,
     budget: Duration,
@@ -37,7 +64,7 @@ pub(crate) fn start(
     socket::connect(socket::Endpoint::Websocket(endpoint), budget, settings)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
 

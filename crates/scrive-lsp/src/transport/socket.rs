@@ -10,7 +10,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use super::lifecycle::{self, Handshake, Lifecycle};
-use super::settings::grow;
+use super::settings;
 #[cfg(feature = "websocket")]
 use super::websocket;
 use super::writer::Outgoing;
@@ -18,11 +18,6 @@ use super::{tcp, Feed, Generation, Handle, Link, Notice, Settings, Started, Writ
 use crate::client::builder;
 use crate::{client, transport};
 
-// The wait after a failed first dial, growing ×1.3 up to `STEP_CAP`. A server started together
-// with its client is often still binding its port; a 1 s first step would add a second to
-// every such start.
-const FIRST_STEP: Duration = Duration::from_millis(50);
-const STEP_CAP: Duration = Duration::from_secs(1);
 // How long a pending accept waits on the inbox between polls; it bounds accept latency only,
 // since a notice wakes the wait at once.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
@@ -546,7 +541,7 @@ impl Worker {
         }
         let now = Instant::now();
         if now < dialing.deadline {
-            dialing.at = (now + grow(FIRST_STEP, dialing.failed, STEP_CAP)).min(dialing.deadline);
+            dialing.at = (now + settings::step(dialing.failed)).min(dialing.deadline);
             dialing.failed = dialing.failed.saturating_add(1);
             return State::Dialing(dialing);
         }
@@ -838,21 +833,4 @@ fn spawn(
         control,
         inbound: transport::Inbound::Channel(incoming),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The first-dial schedule starts at 50 ms and stops growing at 1 s.
-    #[test]
-    fn the_first_dials_retry_from_fifty_milliseconds_up_to_a_second() {
-        assert_eq!(grow(FIRST_STEP, 0, STEP_CAP), FIRST_STEP, "the first step");
-        assert_eq!(
-            grow(FIRST_STEP, 1, STEP_CAP),
-            Duration::from_millis(65),
-            "30% more"
-        );
-        assert_eq!(grow(FIRST_STEP, 50, STEP_CAP), STEP_CAP, "capped");
-    }
 }

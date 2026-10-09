@@ -17,7 +17,10 @@ impl Generation {
     pub(crate) const FIRST: Self = Self(0);
 
     /// The connection after this one.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub(crate) fn next(self) -> Self {
         Self(self.0 + 1)
     }

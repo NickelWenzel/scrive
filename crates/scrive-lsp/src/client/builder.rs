@@ -1,38 +1,59 @@
 //! Configures a [`Client`] and connects it through one bridge.
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 pub mod error;
 
 #[cfg(not(target_family = "wasm"))]
 use std::net::{SocketAddr, ToSocketAddrs};
 #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
 use std::sync::Arc;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 use std::time::Duration;
 
 use lsp_types::{ClientInfo, InitializeParams, Uri, WorkspaceFolder};
 use serde_json::Value;
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 pub use error::Error;
 
 use super::{Client, Events, Id};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 use crate::restart;
 use crate::session::{self, Session};
 use crate::{message, trace, transport, uri};
 
 /// How long a server gets to exit after `shutdown` and `exit`, unless the builder says.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 const GRACE: Duration = Duration::from_secs(2);
 /// Unwritten bytes past which a server counts as unresponsive, unless the builder says.
 #[cfg(not(target_family = "wasm"))]
 const BACKLOG: usize = 256 * 1024 * 1024;
 /// The first wait before a lost server is started again, unless the builder says.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 const BACKOFF: Duration = Duration::from_secs(1);
 /// How long the first dials of `connect` retry, unless the builder says.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configures a [`Client`] and connects it through one bridge.
@@ -43,17 +64,32 @@ pub struct Builder {
     initialization_options: Option<Value>,
     configuration: Option<Value>,
     trace: trace::Mode,
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     grace: Option<Duration>,
     #[cfg(not(target_family = "wasm"))]
     backlog: Option<usize>,
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     restart: restart::Policy,
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     backoff: Option<Duration>,
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     initialize_timeout: Option<Duration>,
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     connect_timeout: Option<Duration>,
     #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
     tls: Option<Arc<rustls::ClientConfig>>,
@@ -89,7 +125,10 @@ impl Builder {
 
     /// How long the server gets to answer `shutdown`, and then to exit after `exit`, before it is
     /// killed; also how long its output may stay open after it exits. Defaults to 2 seconds.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub fn shutdown_grace(mut self, grace: Duration) -> Self {
         self.grace = Some(grace);
         self
@@ -108,7 +147,10 @@ impl Builder {
     ///
     /// A server whose own child process still holds its output leaves one reader thread behind
     /// per restart, until that child exits.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub fn restart(mut self, policy: restart::Policy) -> Self {
         self.restart = policy;
         self
@@ -119,7 +161,10 @@ impl Builder {
     /// successful start the client stops with [`Reason::Timeout`](super::Reason::Timeout),
     /// later the [restart policy](Self::restart) decides. A reply that arrives just before the
     /// deadline can still lose the race against it.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub fn initialize_timeout(mut self, timeout: Duration) -> Self {
         self.initialize_timeout = Some(timeout);
         self
@@ -128,18 +173,24 @@ impl Builder {
     /// The first wait before a lost server is started again, growing ×1.3 per attempt up to
     /// 10 s. Defaults to 1 second. For tests.
     #[doc(hidden)]
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub fn backoff(mut self, first: Duration) -> Self {
         self.backoff = Some(first);
         self
     }
 
-    /// How long the first dials of [`connect`](Self::connect) retry a server that refuses or
+    /// How long the first dials of `connect` and `websocket` retry a server that refuses or
     /// can't be reached, counted from the call; then the client stops with
     /// [`Reason::Failed`](super::Reason::Failed), and [`Client::restart`] dials again. Defaults
     /// to 10 seconds. A lost connection is dialed again under the [restart policy](Self::restart)
     /// instead.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
         self
@@ -219,11 +270,12 @@ impl Builder {
     /// JSON-RPC message per text frame, as vscode-ws-jsonrpc frames it. The client sends
     /// `initialize` at once, queued until the connection is up, with `processId` `null`.
     ///
-    /// Dialing and the handshakes happen on a worker thread, so this returns at once; they retry
-    /// until [`connect_timeout`](Self::connect_timeout) as [`connect`](Self::connect) does, and a
-    /// lost connection is dialed again under the [restart policy](Self::restart). `wss://` uses
-    /// rustls with the ring provider and the webpki roots, or the [`tls`](Self::tls)
-    /// configuration. A binary frame is read as text when it is UTF-8; any other arrives as an
+    /// Dialing and the handshakes happen on a worker thread, or in a browser on the page's event
+    /// loop, so this returns at once; they retry until
+    /// [`connect_timeout`](Self::connect_timeout) as `connect` does, and a lost connection is
+    /// dialed again under the [restart policy](Self::restart). Natively `wss://` uses rustls with
+    /// the ring provider and the webpki roots, or the `tls` configuration; a browser uses its own
+    /// TLS, and there is no hung-server guard: the browser buffers what the server doesn't read. A binary frame is read as text when it is UTF-8; any other arrives as an
     /// [`Update::Log`](crate::Update::Log) from [`Source::Socket`](crate::log::Source::Socket)
     /// and is dropped, as does the server's close code. A message over 64 MiB arrives as
     /// [`Error::Oversized`](super::Error::Oversized) and loses the connection. No headers beyond
@@ -233,12 +285,21 @@ impl Builder {
     /// frame, and lets go of the connection after the [grace period](Self::shutdown_grace).
     ///
     /// # Errors
-    /// [`Error::Url`] for a URL that doesn't parse, has no host, or isn't `ws`/`wss`;
-    /// [`Error::Tls`] when the default TLS configuration can't be built; [`Error::Thread`] when
-    /// the worker thread or the first connection's event poll can't be created.
-    #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+    /// [`Error::Url`] for a URL that doesn't parse, has no host, or isn't `ws`/`wss`. Natively
+    /// also `Error::Tls` when the default TLS configuration can't be built, and `Error::Thread`
+    /// when the worker thread or the first connection's event poll can't be created.
+    #[cfg(all(
+        feature = "websocket",
+        any(
+            not(target_family = "wasm"),
+            all(target_arch = "wasm32", target_os = "unknown")
+        )
+    ))]
     pub fn websocket(self, url: &str) -> Result<(Client, Events), Error> {
+        #[cfg(not(target_family = "wasm"))]
         let endpoint = transport::websocket::Endpoint::new(url, self.tls.clone())?;
+        #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+        let endpoint = transport::websocket::Endpoint::new(url)?;
         let budget = self.connect_timeout.unwrap_or(CONNECT_TIMEOUT);
         let started = transport::websocket::start(endpoint, budget, self.settings())?;
         Ok(self.start(started, None))
@@ -283,7 +344,10 @@ impl Builder {
     /// client with [`Reason::Closed`](super::Reason::Closed); nothing restarts it.
     pub fn memory(self, connection: lsp_server::Connection) -> (Client, Events) {
         let trace = self.trace;
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(any(
+            not(target_family = "wasm"),
+            all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+        ))]
         let recovery = super::recovery::State::new(self.restart, None);
         let (session, initialize) = self.session(None);
         let lsp_server::Connection { sender, receiver } = connection;
@@ -299,7 +363,10 @@ impl Builder {
             transport::Control::Memory,
             local,
             trace,
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             recovery,
         );
         client.send(vec![initialize], None);
@@ -307,18 +374,25 @@ impl Builder {
     }
 
     /// What a worker bridge needs of this builder.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     fn settings(&self) -> transport::Settings {
         transport::Settings {
             grace: self.grace.unwrap_or(GRACE),
             backoff: self.backoff.unwrap_or(BACKOFF),
+            #[cfg(not(target_family = "wasm"))]
             limit: self.backlog.unwrap_or(BACKLOG),
             initialize_timeout: self.initialize_timeout,
         }
     }
 
     /// The client on a started worker bridge, with `initialize` sent.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     fn start(self, started: transport::Started, process_id: Option<u32>) -> (Client, Events) {
         let trace = self.trace;
         let recovery = super::recovery::State::new(self.restart, self.initialize_timeout);

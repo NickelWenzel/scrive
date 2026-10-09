@@ -3028,6 +3028,7 @@ dependencies = [
  "futures",
  "futures-channel",
  "futures-core",
+ "js-sys",
  "lsp-server",
  "lsp-types",
  "mio",
@@ -3037,7 +3038,10 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tungstenite",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasmtimer",
+ "web-sys",
  "webpki-roots",
  "windows-sys 0.61.2",
 ]

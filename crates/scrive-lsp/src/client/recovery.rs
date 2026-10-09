@@ -2,12 +2,17 @@
 //! because only it knows whether a handshake ever completed and how many restarts the policy
 //! has left.
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests;
 
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_family = "wasm"))]
+use std::time::Instant;
+
+#[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+use wasmtimer::std::Instant;
 
 use super::{documents, Client, Connection, Error, Reason, Status};
 use crate::transport::{self, Generation, Handshake, Lifecycle};

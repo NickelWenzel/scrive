@@ -4,12 +4,18 @@
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod frame;
 mod generation;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 pub(crate) mod lifecycle;
 pub(crate) mod memory;
 #[cfg(not(target_family = "wasm"))]
 mod reader;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 mod settings;
 #[cfg(not(target_family = "wasm"))]
 mod socket;
@@ -19,14 +25,26 @@ pub(crate) mod stdio;
 pub(crate) mod tap;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) mod tcp;
-#[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+#[cfg(all(
+    feature = "websocket",
+    any(
+        not(target_family = "wasm"),
+        all(target_arch = "wasm32", target_os = "unknown")
+    )
+))]
 pub(crate) mod websocket;
 #[cfg(not(target_family = "wasm"))]
 mod writer;
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 use core::pin::Pin;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 use std::io;
 #[cfg(not(target_family = "wasm"))]
 use std::sync::mpsc;
@@ -36,15 +54,24 @@ use std::thread;
 use std::task::{Context, Poll};
 
 pub(crate) use generation::Generation;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 pub(crate) use lifecycle::{Handshake, Lifecycle};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 pub(crate) use settings::Settings;
 #[cfg(not(target_family = "wasm"))]
 pub(crate) use writer::Writer;
 
 use crate::client;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 use crate::log;
 
 /// The `id` of the `shutdown` request the client's side sends. Session ids are numbers, so its
@@ -66,6 +93,9 @@ pub(crate) enum Link {
         writer: Writer,
         waker: Arc<mio::Waker>,
     },
+    /// A browser WebSocket's queue, which a task drains once the socket is open.
+    #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+    Browser(futures_channel::mpsc::UnboundedSender<Arc<[u8]>>),
 }
 
 /// What a bridge reports. Protocol traffic names the connection it came from, so the client can
@@ -81,7 +111,10 @@ pub(crate) enum Event {
     Stopped(client::Reason),
     /// Lines the server wrote outside the protocol: one read's stderr lines, or the noise between
     /// two frames on stdout or a socket. Never dropped: a dead server's last words are what a log is for.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     Log(Arc<[log::Entry]>),
     /// A frame connection `generation` dropped.
     #[cfg(not(target_family = "wasm"))]
@@ -90,19 +123,28 @@ pub(crate) enum Event {
         error: client::Error,
     },
     /// The connection before `generation` ended; `generation` is the one a reconnect creates.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     Lost {
         generation: Generation,
         reason: client::Reason,
     },
     /// An attempt to bring up connection `generation` failed; the next follows after a backoff.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     Attempting {
         generation: Generation,
         failure: Arc<io::Error>,
     },
     /// Connection `generation` is up, and `link` is its outgoing queue.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     Reconnected { generation: Generation, link: Link },
 }
 
@@ -110,8 +152,11 @@ pub(crate) enum Event {
 pub(crate) enum Inbound {
     /// The memory bridge.
     Memory(memory::Inbox),
-    /// The worker bridges' events, fed by their threads.
-    #[cfg(not(target_family = "wasm"))]
+    /// The worker bridges' events, fed by their threads or, in a browser, their callbacks.
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     Channel(futures_channel::mpsc::UnboundedReceiver<Event>),
 }
 
@@ -132,10 +177,16 @@ pub(crate) enum Control {
     /// The worker of a WebSocket bridge.
     #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
     Websocket(Handle),
+    /// The task of a browser WebSocket bridge.
+    #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+    Browser(websocket::Control),
 }
 
 /// The channel a worker bridge's threads report on.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 pub(crate) type Feed = futures_channel::mpsc::UnboundedSender<Event>;
 
 /// The client's line to a worker bridge's worker.
@@ -171,7 +222,10 @@ pub(crate) enum Pipe {
 }
 
 /// A started worker bridge: what the client keeps, and the stream its traffic arrives on.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(any(
+    not(target_family = "wasm"),
+    all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+))]
 pub(crate) struct Started {
     pub(crate) link: Link,
     pub(crate) control: Control,
@@ -191,21 +245,33 @@ impl Link {
                 // A thread that is gone reports its loss to the worker on its own.
                 let _ = waker.wake();
             }
+            // A closed queue means the socket is gone.
+            #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+            Link::Browser(sender) => {
+                let _ = sender.unbounded_send(body);
+            }
         }
     }
 
     /// Closes the server's input once everything queued before this call is written. Memory's
     /// end closes when its sender drops instead.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub(crate) fn close(&self) {
         match self {
             Link::Memory(_) => {}
+            #[cfg(not(target_family = "wasm"))]
             Link::Stream(writer) => writer.close(),
-            #[cfg(feature = "websocket")]
+            #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
             Link::Websocket { writer, waker } => {
                 writer.close();
                 let _ = waker.wake();
             }
+            // The drain task sends the close frame once it has sent everything queued before.
+            #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+            Link::Browser(sender) => sender.close_channel(),
         }
     }
 }
@@ -215,7 +281,10 @@ impl Inbound {
     pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Event> {
         match self {
             Inbound::Memory(inbox) => inbox.poll_next(cx),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(any(
+                not(target_family = "wasm"),
+                all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+            ))]
             Inbound::Channel(receiver) => {
                 match futures_core::Stream::poll_next(Pin::new(receiver), cx) {
                     Poll::Ready(Some(event)) => Poll::Ready(event),
@@ -233,15 +302,21 @@ impl Inbound {
 
 impl Control {
     /// Tells the worker what the client decided. Memory has no worker, so it ignores it.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub(crate) fn send(&self, lifecycle: Lifecycle) {
         match self {
             Self::Memory => {}
+            #[cfg(not(target_family = "wasm"))]
             Self::Stdio(handle) | Self::Tcp(handle) | Self::Listen(handle) => {
                 handle.send(lifecycle);
             }
-            #[cfg(feature = "websocket")]
+            #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
             Self::Websocket(handle) => handle.send(lifecycle),
+            #[cfg(all(feature = "websocket", target_arch = "wasm32", target_os = "unknown"))]
+            Self::Browser(control) => control.send(lifecycle),
         }
     }
 }

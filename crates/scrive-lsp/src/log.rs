@@ -56,8 +56,12 @@ impl Entry {
         Self::output(Source::Stdout, text)
     }
 
-    /// Text from a socket connection that isn't an LSP message, at `level`.
-    #[cfg(not(target_family = "wasm"))]
+    /// Text from a socket connection that isn't an LSP message, or a note on the connection
+    /// itself, at `level`.
+    #[cfg(any(
+        not(target_family = "wasm"),
+        all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+    ))]
     pub(crate) fn socket(level: lsp_types::MessageType, text: String) -> Self {
         Self {
             source: Source::Socket,
