@@ -58,7 +58,13 @@ jobs:
       - name: Build for wasm32-unknown-unknown
         run: cargo build --workspace --all-targets --all-features --target wasm32-unknown-unknown
 
-      # The memory bridge's browser poll compiles only for this target; lint it.
+      # scrive-lsp with only its WebSocket feature: the workspace build above
+      # unifies features across crates, which can hide a missing target gate.
+      - name: Build scrive-lsp's browser WebSocket transport alone
+        run: cargo build -p scrive-lsp --no-default-features --features websocket --target wasm32-unknown-unknown
+
+      # The browser-only code (the memory poll, the WebSocket wrapper) compiles
+      # only for this target; lint it there.
       - name: Clippy scrive-lsp for wasm32-unknown-unknown (no warnings)
         run: cargo clippy -p scrive-lsp --all-features --target wasm32-unknown-unknown -- -D warnings
 
@@ -122,17 +128,21 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-      # The headless crates must never pull a GUI crate into their normal
-      # dependency graph. `cargo tree` failing is itself a failure.
-      - name: Headless crates depend on no GUI crate
+      # The headless crates must never pull a GUI crate or an async runtime into
+      # their normal dependency graph, on any target and with any features.
+      # `cargo tree` failing is itself a failure. `$features` stays unquoted so
+      # an empty value drops out of the command line.
+      - name: Headless crates depend on no GUI crate or runtime
         shell: bash
         run: |
           for c in scrive-core scrive-lsp; do
-            out=$(cargo tree -p "$c" -e normal --prefix none) || exit 1
-            if grep -qE '^(iced|winit|wgpu)' <<<"$out"; then
-              echo "$c depends on a GUI crate"
-              exit 1
-            fi
+            for features in "" "--all-features"; do
+              out=$(cargo tree -p "$c" $features --target all -e normal --prefix none) || exit 1
+              if grep -qE '^(iced|winit|wgpu|tokio)' <<<"$out"; then
+                echo "$c ${features:-(default features)} depends on a GUI crate or tokio"
+                exit 1
+              fi
+            done
           done
 
       # A tree-sitter-only consumer must be able to drop syntect entirely.
