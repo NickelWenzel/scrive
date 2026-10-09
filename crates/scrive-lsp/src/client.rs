@@ -134,6 +134,13 @@ impl Drop for Client {
                     handshake: self.handshake(),
                 });
             }
+            #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+            (Connection::Live { generation, .. }, transport::Control::Websocket(handle)) => {
+                handle.send(transport::Lifecycle::Shutdown {
+                    generation: *generation,
+                    handshake: self.handshake(),
+                });
+            }
             #[cfg(not(target_family = "wasm"))]
             (Connection::Reconnecting | Connection::Stopped, control) => {
                 control.send(transport::Lifecycle::Shutdown {
@@ -405,15 +412,11 @@ impl Client {
                 transport::Control::Stdio(handle)
                 | transport::Control::Tcp(handle)
                 | transport::Control::Listen(handle) => {
-                    let connection =
-                        std::mem::replace(&mut self.connection, Connection::Shut(None));
-                    if let Connection::Live { generation, link } = connection {
-                        handle.send(transport::Lifecycle::Shutdown {
-                            generation,
-                            handshake,
-                        });
-                        self.connection = Connection::Shut(Some((generation, link)));
-                    }
+                    self.connection.shut(handle, handshake);
+                }
+                #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+                transport::Control::Websocket(handle) => {
+                    self.connection.shut(handle, handshake);
                 }
             },
             #[cfg(not(target_family = "wasm"))]
@@ -448,6 +451,8 @@ impl Client {
             transport::Control::Memory => Err(Error::Unrestartable),
             #[cfg(not(target_family = "wasm"))]
             transport::Control::Stdio(_) | transport::Control::Tcp(_) => Ok(self.restart_worker()),
+            #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+            transport::Control::Websocket(_) => Ok(self.restart_worker()),
         }
     }
 
@@ -657,6 +662,8 @@ impl Client {
                 transport::Control::Stdio(_)
                 | transport::Control::Tcp(_)
                 | transport::Control::Listen(_) => updates.extend(self.refused()),
+                #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+                transport::Control::Websocket(_) => updates.extend(self.refused()),
             }
         }
         updates
@@ -721,6 +728,19 @@ impl Client {
 }
 
 impl Connection {
+    /// Hands a live connection to its worker's shutdown sequence. The link stays, so server
+    /// requests during the grace period still get their `null` answers.
+    #[cfg(not(target_family = "wasm"))]
+    fn shut(&mut self, handle: &transport::Handle, handshake: transport::Handshake) {
+        if let Connection::Live { generation, link } = std::mem::replace(self, Connection::Shut(None)) {
+            handle.send(transport::Lifecycle::Shutdown {
+                generation,
+                handshake,
+            });
+            *self = Connection::Shut(Some((generation, link)));
+        }
+    }
+
     /// Whether traffic from connection `generation` is the client's to fold in.
     fn holds(&self, generation: transport::Generation) -> bool {
         match self {

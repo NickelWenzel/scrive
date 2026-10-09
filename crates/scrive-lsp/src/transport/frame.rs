@@ -8,7 +8,7 @@ const HEADER_LIMIT: usize = 8 * 1024;
 /// The most of one noise line kept. The rest of the line, up to its `\n`, is dropped.
 pub(crate) const LINE_LIMIT: usize = 64 * 1024;
 /// Bodies up to this length are decoded.
-const BODY_LIMIT: u64 = 64 * 1024 * 1024;
+pub(crate) const BODY_LIMIT: u64 = 64 * 1024 * 1024;
 /// Bodies up to this length are streamed through and dropped. A longer length is garbage.
 const SKIP_LIMIT: u64 = 1024 * 1024 * 1024;
 

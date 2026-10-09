@@ -5,6 +5,8 @@ pub mod error;
 
 #[cfg(not(target_family = "wasm"))]
 use std::net::{SocketAddr, ToSocketAddrs};
+#[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+use std::sync::Arc;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
@@ -53,6 +55,8 @@ pub struct Builder {
     initialize_timeout: Option<Duration>,
     #[cfg(not(target_family = "wasm"))]
     connect_timeout: Option<Duration>,
+    #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+    tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Builder {
@@ -141,6 +145,15 @@ impl Builder {
         self
     }
 
+    /// The TLS configuration [`websocket`](Self::websocket) dials `wss://` with, for example one
+    /// that trusts a self-signed certificate. Ignored for `ws://`. Without it, `wss://` trusts the
+    /// webpki roots.
+    #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+    pub fn tls(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        self.tls = Some(config);
+        self
+    }
+
     /// Starts `command` as the language server, and talks to it over its stdin and stdout. The
     /// client sends `initialize` at once, with this process's id as `processId`.
     ///
@@ -199,6 +212,35 @@ impl Builder {
     ) -> Result<(Client, Events), Error> {
         let budget = self.connect_timeout.unwrap_or(CONNECT_TIMEOUT);
         let started = transport::tcp::connect(address, budget, self.settings())?;
+        Ok(self.start(started, None))
+    }
+
+    /// Connects to a language server behind a WebSocket at `url`, `ws://` or `wss://`, with one
+    /// JSON-RPC message per text frame, as vscode-ws-jsonrpc frames it. The client sends
+    /// `initialize` at once, queued until the connection is up, with `processId` `null`.
+    ///
+    /// Dialing and the handshakes happen on a worker thread, so this returns at once; they retry
+    /// until [`connect_timeout`](Self::connect_timeout) as [`connect`](Self::connect) does, and a
+    /// lost connection is dialed again under the [restart policy](Self::restart). `wss://` uses
+    /// rustls with the ring provider and the webpki roots, or the [`tls`](Self::tls)
+    /// configuration. A binary frame is read as text when it is UTF-8; any other arrives as an
+    /// [`Update::Log`](crate::Update::Log) from [`Source::Socket`](crate::log::Source::Socket)
+    /// and is dropped, as does the server's close code. A message over 64 MiB arrives as
+    /// [`Error::Oversized`](super::Error::Oversized) and loses the connection. No headers beyond
+    /// the handshake's are sent, and no pings; the server's pings are answered.
+    ///
+    /// [`Client::shutdown`], or dropping the client, sends `shutdown` and `exit`, then the close
+    /// frame, and lets go of the connection after the [grace period](Self::shutdown_grace).
+    ///
+    /// # Errors
+    /// [`Error::Url`] for a URL that doesn't parse, has no host, or isn't `ws`/`wss`;
+    /// [`Error::Tls`] when the default TLS configuration can't be built; [`Error::Thread`] when
+    /// the worker thread or the first connection's event poll can't be created.
+    #[cfg(all(feature = "websocket", not(target_family = "wasm")))]
+    pub fn websocket(self, url: &str) -> Result<(Client, Events), Error> {
+        let endpoint = transport::websocket::Endpoint::new(url, self.tls.clone())?;
+        let budget = self.connect_timeout.unwrap_or(CONNECT_TIMEOUT);
+        let started = transport::websocket::start(endpoint, budget, self.settings())?;
         Ok(self.start(started, None))
     }
 

@@ -110,15 +110,29 @@ impl Outgoing {
                 break;
             };
             let written = sink.write_all(&frame::encode(&body));
-            self.backlog
-                .unwritten
-                .fetch_sub(body.len(), Ordering::Relaxed);
+            self.written(body.len());
             if written.is_err() {
                 let _ = self.notices.send(Notice::WriteFailed(self.generation));
                 return;
             }
         }
         close(sink);
+    }
+
+    /// The next queued item without waiting, or `None` while the queue is empty. Once every
+    /// [`Writer`] is gone the queue ends as a close does.
+    #[cfg(feature = "websocket")]
+    pub(crate) fn next(&self) -> Option<Item> {
+        match self.items.try_recv() {
+            Ok(item) => Some(item),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Item::Close),
+        }
+    }
+
+    /// Gives back `length` bytes of a body that left the queue, to the guard's count.
+    pub(crate) fn written(&self, length: usize) {
+        self.backlog.unwritten.fetch_sub(length, Ordering::Relaxed);
     }
 
     /// What was queued since the last call, without writing it.
