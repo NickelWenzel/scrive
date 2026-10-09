@@ -143,7 +143,10 @@ host and this crate agree on one version of each. The crate needs Rust 1.85 or n
   of every open document, so bind `127.0.0.1`. No TCP keepalive is set: a peer that vanishes
   without closing the connection goes unnoticed while nothing is sent. A server built on
   lsp-server writes each message in two writes without `TCP_NODELAY`, so its replies wait for
-  delayed ACKs.
+  delayed ACKs. On Windows, the reader thread of a lost connection stays parked until the peer
+  closes its end, so restarting a server that is still alive but stuck leaves one idle thread
+  per restart until that server goes away. The client never acts on anything it reads after the
+  loss.
 - **WebSocket** sends one bare JSON-RPC message per text frame, as vscode-ws-jsonrpc frames it.
   Natively it runs tungstenite on one I/O thread per connection; `wss://` uses rustls with the
   ring provider and the webpki roots, and `Builder::tls` takes a custom `rustls::ClientConfig`,

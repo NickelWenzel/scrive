@@ -754,7 +754,9 @@ impl Connection {
     /// Releases the connection's threads, which are never joined, and lets go.
     fn end(self) {
         match self.socket {
-            // Both ways, which wakes the reader blocked on it.
+            // Both ways, which wakes the reader blocked on it on Unix. Winsock leaves a `recv`
+            // blocked on the reader's handle parked until the peer closes; whatever it reads
+            // then carries an old generation and is dropped.
             Socket::Tcp(stream) => {
                 let _ = stream.shutdown(Shutdown::Both);
             }
