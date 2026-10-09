@@ -55,7 +55,8 @@
 //! |---------|---------|---------|------|
 //! | `syntect` | on | `scrive_core::SyntaxDef` (`.sublime-syntax`) | documents of 2 MiB or more tokenize on worker threads, natively |
 //! | `tree-sitter` | off | `scrive_core::TreeSitterDef` (grammar crate + highlights query) | the parse runs on the UI thread, a budgeted slice per frame |
-//! | `lsp` | off | | `scrive_iced::lsp`, the language-server bridge |
+//! | `lsp` | off | | `scrive_iced::lsp`, the language-server client |
+//! | `lsp-websocket` | off | | `lsp`, plus the client's WebSocket transport |
 //!
 //! ```no_run
 //! # #[cfg(feature = "syntect")]
@@ -101,7 +102,7 @@ pub use code_editor::{CodeEditor, Event};
 pub use editor::{default_autoscroll_margin, Action, Editor, Wake, SCROLLBAR_WIDTH};
 pub use metrics::Metrics;
 
-/// The Language Server Protocol bridge, re-exported so a host names one crate:
+/// The Language Server Protocol client, re-exported so a host names one crate:
 /// `scrive_iced::lsp::Client`, `scrive_iced::lsp::client::Events`, `scrive_iced::lsp::update`.
 /// Needs the `lsp` feature.
 #[cfg(feature = "lsp")]

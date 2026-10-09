@@ -4,8 +4,8 @@
 //! [`sync_lsp`](CodeEditor::sync_lsp) after every [`update`](CodeEditor::update),
 //! [`apply_lsp`](CodeEditor::apply_lsp) for each `Update::Document` the client returns, and
 //! [`save_lsp`](CodeEditor::save_lsp) after writing the document to disk. The client sends what
-//! each call produces; all but `open_lsp` return a jump into another document for the host to
-//! route.
+//! each call produces. `sync_lsp`, `save_lsp`, `apply_lsp` and [`jump`](CodeEditor::jump) return
+//! a jump into another document for the host to route.
 
 use iced::time::Duration;
 use scrive_core::DiagnosticsOutcome;

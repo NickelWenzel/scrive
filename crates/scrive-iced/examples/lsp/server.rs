@@ -1,7 +1,9 @@
 //! A scripted language server for the `lsp` example.
 //!
-//! It speaks raw JSON-RPC values on the server end of an in-process `lsp_server::Connection`,
-//! and answers in `step()`, which the app calls after every update. Canned: `initialize`, completion, signature help, and hover (on `greet`).
+//! It speaks raw JSON-RPC values on the server end of an `lsp_server::Connection::memory()`
+//! pair. `step()` answers every message waiting on the connection and returns without blocking,
+//! so the app calls it on the UI thread after every update, natively and in the browser.
+//! Canned: `initialize`, completion, signature help, and hover (on `greet`).
 //! Computed from the text the client sent: diagnostics (trailing whitespace), definition
 //! (`fn <word>(` in any document), rename (whole-word, every document), formatting (strip
 //! trailing whitespace), and inlay hints: a type hint after `let x = f(…)` for a function some
