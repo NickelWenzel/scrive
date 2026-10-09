@@ -340,17 +340,16 @@ impl Client {
     /// When the server cannot be asked (it is not running, has no completion provider, or did not
     /// register the trigger the text before the caret ends with) the request is declined with an
     /// empty [`update::Change::Completions`] under its ticket, so the editor stops waiting. A
-    /// request from a revision other than `snapshot`'s or the last synced one, or for a document
-    /// that is not registered, gets nothing: the editor has moved on.
+    /// request for a document that is not registered gets nothing, and so does one from a
+    /// revision other than `snapshot`'s or the last synced one while the server runs: the editor
+    /// has moved on. Otherwise a request at or past the synced revision is declined.
     pub fn complete(&mut self, snapshot: &Snapshot, request: &CompletionRequest) -> Output {
         let doc_id = snapshot.doc_id();
         let ticket = request.ticket();
         let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
             return Output::default();
         };
-        if ticket.revision() != snapshot.revision()
-            || snapshot.revision() != tracked.synced.revision()
-        {
+        if !self.answerable(tracked, ticket, snapshot) {
             return Output::default();
         }
         let decline = || Output::answer(doc_id, ticket, update::Change::Completions(Vec::new()));
@@ -411,18 +410,17 @@ impl Client {
     /// request in another call, or outside any call, supersedes the document's previous one.
     ///
     /// When the server is not running or has no signature provider, the request is declined with
-    /// [`update::Change::Signature`]`(None)` under its ticket. A request from a revision other
-    /// than `snapshot`'s or the last synced one, or for a document that is not registered, gets
-    /// nothing.
+    /// [`update::Change::Signature`]`(None)` under its ticket. A request for a document that is
+    /// not registered gets nothing, and so does one from a revision other than `snapshot`'s or
+    /// the last synced one while the server runs; otherwise a request at or past the synced
+    /// revision is declined.
     pub fn signature_help(&mut self, snapshot: &Snapshot, request: &SignatureRequest) -> Output {
         let doc_id = snapshot.doc_id();
         let ticket = request.ticket();
         let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
             return Output::default();
         };
-        if ticket.revision() != snapshot.revision()
-            || snapshot.revision() != tracked.synced.revision()
-        {
+        if !self.answerable(tracked, ticket, snapshot) {
             return Output::default();
         }
         if !matches!(&self.state, State::Running(server) if server.signature) {
@@ -454,18 +452,17 @@ impl Client {
     /// the document's previous hover request.
     ///
     /// When the server is not running or has no hover provider, the request is declined with
-    /// [`update::Change::Hover`]`(None)` under its ticket. A request from a revision other than
-    /// `snapshot`'s or the last synced one, or for a document that is not registered, gets
-    /// nothing.
+    /// [`update::Change::Hover`]`(None)` under its ticket. A request for a document that is not
+    /// registered gets nothing, and so does one from a revision other than `snapshot`'s or the
+    /// last synced one while the server runs; otherwise a request at or past the synced revision
+    /// is declined.
     pub fn hover(&mut self, snapshot: &Snapshot, request: &HoverRequest) -> Output {
         let doc_id = snapshot.doc_id();
         let ticket = request.ticket;
         let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
             return Output::default();
         };
-        if ticket.revision() != snapshot.revision()
-            || snapshot.revision() != tracked.synced.revision()
-        {
+        if !self.answerable(tracked, ticket, snapshot) {
             return Output::default();
         }
         if !matches!(&self.state, State::Running(server) if server.hover) {
@@ -482,18 +479,17 @@ impl Client {
     /// [`update::Change::Definition`] under the request's ticket.
     ///
     /// When the server is not running or has no definition provider, the request is declined
-    /// with [`update::Change::Definition`]`(None)` under its ticket. A request from a revision
-    /// other than `snapshot`'s or the last synced one, or for a document that is not registered,
-    /// gets nothing.
+    /// with [`update::Change::Definition`]`(None)` under its ticket. A request for a document
+    /// that is not registered gets nothing, and so does one from a revision other than
+    /// `snapshot`'s or the last synced one while the server runs; otherwise a request at or past
+    /// the synced revision is declined.
     pub fn definition(&mut self, snapshot: &Snapshot, request: &DefinitionRequest) -> Output {
         let doc_id = snapshot.doc_id();
         let ticket = request.ticket;
         let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
             return Output::default();
         };
-        if ticket.revision() != snapshot.revision()
-            || snapshot.revision() != tracked.synced.revision()
-        {
+        if !self.answerable(tracked, ticket, snapshot) {
             return Output::default();
         }
         if !matches!(&self.state, State::Running(server) if server.definition) {
@@ -569,18 +565,17 @@ impl Client {
     /// cancelled.
     ///
     /// When the server is not running or has no inlay hint provider, the request is declined
-    /// with an empty [`update::Change::Inlays`] under its ticket. A request from a revision other
-    /// than `snapshot`'s or the last synced one, or for a document that is not registered, gets
-    /// nothing.
+    /// with an empty [`update::Change::Inlays`] under its ticket. A request for a document that
+    /// is not registered gets nothing, and so does one from a revision other than `snapshot`'s
+    /// or the last synced one while the server runs; otherwise a request at or past the synced
+    /// revision is declined.
     pub fn inlays(&mut self, snapshot: &Snapshot, request: &intel::inlay::Request) -> Output {
         let doc_id = snapshot.doc_id();
         let ticket = request.ticket();
         let Some(tracked) = self.tracked.iter().find(|t| t.doc_id == doc_id) else {
             return Output::default();
         };
-        if ticket.revision() != snapshot.revision()
-            || snapshot.revision() != tracked.synced.revision()
-        {
+        if !self.answerable(tracked, ticket, snapshot) {
             return Output::default();
         }
         if !matches!(&self.state, State::Running(server) if server.inlay.is_some()) {
@@ -675,8 +670,8 @@ impl Client {
     /// take no changes are sent nothing. Either way the snapshot becomes the one server
     /// positions are converted against.
     ///
-    /// A snapshot no newer than the synced one, a document that is not registered, and any call
-    /// after [`shutdown`](Self::shutdown) send nothing.
+    /// A snapshot no newer than the synced one and a document that is not registered send
+    /// nothing. While the server is not running, the snapshot is stored and nothing is sent.
     pub fn sync(&mut self, snapshot: &Snapshot, changes: document::Changes) -> Output {
         let Self {
             state,
@@ -693,11 +688,12 @@ impl Client {
         }
         let server = match state {
             State::Running(server) => server,
-            State::Initializing { .. } => {
+            // Nothing goes out, but the text is kept: requests decline against it, and the next
+            // `didOpen` carries it.
+            State::Initializing { .. } | State::ShuttingDown { .. } | State::Exited => {
                 tracked.synced = snapshot.clone();
                 return Output::default();
             }
-            State::ShuttingDown { .. } | State::Exited => return Output::default(),
         };
         let content_changes = if !server.open_close || tracked.version.is_none() {
             None
@@ -801,7 +797,7 @@ impl Client {
     /// # Errors
     /// [`Error::Decode`] for a payload that does not decode (a `publishDiagnostics`, or the
     /// `initialize` result), and [`Error::Server`] when `initialize` fails. A failed or
-    /// undecodable `initialize` leaves the client exited, with its registered documents dropped.
+    /// undecodable `initialize` leaves the client exited, with its registered documents kept.
     pub fn receive(&mut self, message: Message) -> Result<Output, Error> {
         match message {
             Message::Request(request) => Ok(self.answer(request)),
@@ -979,9 +975,9 @@ impl Client {
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                // Without known capabilities nothing can be synced, so the connection is over.
+                // Without known capabilities nothing can be synced, so the connection is over;
+                // the documents stay registered, declining every request.
                 self.state = State::Exited;
-                self.tracked.clear();
                 return Err(error);
             }
         };
@@ -1015,6 +1011,20 @@ impl Client {
             output.updates.extend(self.refreshes());
         }
         Ok(output)
+    }
+
+    /// Whether a request under `ticket` at `snapshot` gets an answer. Its ticket must be from
+    /// `snapshot`. While running, `snapshot` must be the synced text, which the request's
+    /// positions convert against. Otherwise nothing is sent, so any text at or past the synced
+    /// one is answered with the request's decline, and the editor's slot doesn't hang.
+    fn answerable(&self, tracked: &Tracked, ticket: Ticket, snapshot: &Snapshot) -> bool {
+        ticket.revision() == snapshot.revision()
+            && match self.state {
+                State::Running(_) => snapshot.revision() == tracked.synced.revision(),
+                State::Initializing { .. } | State::ShuttingDown { .. } | State::Exited => {
+                    snapshot.revision() >= tracked.synced.revision()
+                }
+            }
     }
 
     /// Whether the server is running and wants `didOpen`/`didClose`.
