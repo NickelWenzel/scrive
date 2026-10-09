@@ -150,24 +150,8 @@ impl Builder {
     /// bridge needs cannot be created.
     #[cfg(not(target_family = "wasm"))]
     pub fn stdio(self, command: std::process::Command) -> Result<(Client, Events), Error> {
-        let settings = transport::stdio::Settings {
-            grace: self.grace.unwrap_or(GRACE),
-            backoff: self.backoff.unwrap_or(BACKOFF),
-            limit: self.backlog.unwrap_or(BACKLOG),
-            initialize_timeout: self.initialize_timeout,
-        };
-        let trace = self.trace;
-        let recovery = super::recovery::State::new(self.restart, self.initialize_timeout);
-        let started = transport::stdio::spawn(command, settings)?;
-        let (session, initialize) = self.session(Some(std::process::id()));
-        let (local, queued) = futures_channel::mpsc::unbounded();
-        let id = Id::next();
-        let events = Events::new(id, queued, transport::Inbound::Channel(started.events));
-        let link = transport::Link::Stdio(started.writer);
-        let control = transport::Control::Stdio(started.control);
-        let mut client = Client::new(id, session, link, control, local, trace, recovery);
-        client.send(vec![initialize], None);
-        Ok((client, events))
+        let started = transport::stdio::spawn(command, self.settings())?;
+        Ok(self.start(started, Some(std::process::id())))
     }
 
     /// A client on the client end of an in-process pair from
@@ -202,6 +186,36 @@ impl Builder {
             #[cfg(not(target_family = "wasm"))]
             recovery,
         );
+        client.send(vec![initialize], None);
+        (client, events)
+    }
+
+    /// What a worker bridge needs of this builder.
+    #[cfg(not(target_family = "wasm"))]
+    fn settings(&self) -> transport::Settings {
+        transport::Settings {
+            grace: self.grace.unwrap_or(GRACE),
+            backoff: self.backoff.unwrap_or(BACKOFF),
+            limit: self.backlog.unwrap_or(BACKLOG),
+            initialize_timeout: self.initialize_timeout,
+        }
+    }
+
+    /// The client on a started worker bridge, with `initialize` sent.
+    #[cfg(not(target_family = "wasm"))]
+    fn start(self, started: transport::Started, process_id: Option<u32>) -> (Client, Events) {
+        let trace = self.trace;
+        let recovery = super::recovery::State::new(self.restart, self.initialize_timeout);
+        let (session, initialize) = self.session(process_id);
+        let (local, queued) = futures_channel::mpsc::unbounded();
+        let id = Id::next();
+        let transport::Started {
+            link,
+            control,
+            inbound,
+        } = started;
+        let events = Events::new(id, queued, inbound);
+        let mut client = Client::new(id, session, link, control, local, trace, recovery);
         client.send(vec![initialize], None);
         (client, events)
     }
