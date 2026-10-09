@@ -12,6 +12,8 @@ mod reader;
 #[cfg(not(target_family = "wasm"))]
 mod settings;
 #[cfg(not(target_family = "wasm"))]
+mod socket;
+#[cfg(not(target_family = "wasm"))]
 pub(crate) mod stdio;
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) mod tap;
