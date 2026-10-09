@@ -956,11 +956,12 @@ fn client_calls_decline_after_shutdown() {
     );
 }
 
-/// A server that fails `initialize` cannot be synced, so the error surfaces and the documents
-/// waiting for their `didOpen` are dropped.
+/// A server that fails `initialize` cannot be synced, so the error surfaces; the documents stay
+/// registered, and their requests decline.
 #[test]
-fn failed_initialize_is_a_server_error_and_drops_deferred_opens() {
-    let mut doc = document("a");
+fn failed_initialize_is_a_server_error_and_keeps_the_documents() {
+    let mut tickets = Counter::new();
+    let mut doc = document("let value = 1;");
     let (mut client, _) = Client::builder().build();
     let _ = client
         .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
@@ -972,7 +973,7 @@ fn failed_initialize_is_a_server_error_and_drops_deferred_opens() {
         matches!(&failed, Err(Error::Server { doc_id: None, method, .. }) if method == "initialize"),
         "a failed initialize is a server error, got {failed:?}",
     );
-    doc.edit(vec![EditOp::insert(1, "b")]).expect("edits");
+    doc.edit(vec![EditOp::insert(14, " ")]).expect("edits");
     assert!(
         client
             .sync(&doc.snapshot(), doc.drain_changes())
@@ -980,9 +981,93 @@ fn failed_initialize_is_a_server_error_and_drops_deferred_opens() {
             .is_empty(),
         "nothing syncs after a failed initialize",
     );
-    assert!(
-        client.close(doc.doc_id()).messages.is_empty(),
-        "the deferred document is gone",
+    let request = hover_request(&mut tickets, &doc);
+    let (stamp, card) = hovered(&client.hover(&doc.snapshot(), &request));
+    assert_eq!(
+        stamp,
+        update::Stamp::Ticket(request.ticket),
+        "a hover at the new revision answers under its ticket",
+    );
+    assert!(card.is_none(), "a hover at the new revision declines");
+    assert_eq!(client.tracked.len(), 1, "the document is still registered");
+}
+
+/// After `shutdown()` an edit is still synced locally, and every request with an awaited editor
+/// slot declines with its empty answer; rename and format send nothing.
+#[test]
+fn requests_decline_with_their_empty_answers_after_shutdown() {
+    let mut tickets = Counter::new();
+    let mut doc = document("let value = 1;");
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    let _ = client.shutdown();
+    doc.edit(vec![EditOp::insert(14, " ")]).expect("edits");
+    let synced = client.sync(&doc.snapshot(), doc.drain_changes());
+    assert!(synced.messages.is_empty(), "sync sends nothing after shutdown");
+    let snapshot = doc.snapshot();
+
+    let request = request(&mut tickets, &doc, 4..9, CompletionTrigger::Manual, Start::Fresh);
+    let (stamp, items) = answered(&client.complete(&snapshot, &request));
+    assert_eq!(stamp, update::Stamp::Ticket(request.ticket()), "completion answers its ticket");
+    assert!(items.is_empty(), "completion declines");
+    let request = signature_request(&mut tickets, &doc, 5, None);
+    let (stamp, info) = signature(only(&client.signature_help(&snapshot, &request)));
+    assert_eq!(stamp, update::Stamp::Ticket(request.ticket()), "signature answers its ticket");
+    assert!(info.is_none(), "signature help declines");
+    let request = hover_request(&mut tickets, &doc);
+    let (stamp, card) = hovered(&client.hover(&snapshot, &request));
+    assert_eq!(stamp, update::Stamp::Ticket(request.ticket), "hover answers its ticket");
+    assert!(card.is_none(), "hover declines");
+    let request = DefinitionRequest::new(tickets.issue(doc.revision()), 5);
+    assert_eq!(
+        definition(only(&client.definition(&snapshot, &request))),
+        (update::Stamp::Ticket(request.ticket), None),
+        "definition declines",
+    );
+    let request = inlay_request(&mut tickets, &doc);
+    let (stamp, hints) = inlays(only(&client.inlays(&snapshot, &request)));
+    assert_eq!(stamp, update::Stamp::Ticket(request.ticket()), "inlays answer their ticket");
+    assert!(hints.is_some_and(|hints| hints.is_empty()), "inlays decline");
+    let request = RenameRequest::new(tickets.issue(doc.revision()), 5, "other");
+    assert_silent(&client.rename(&snapshot, &request), "rename sends nothing");
+    let request = FormatRequest::new(tickets.issue(doc.revision()), 4);
+    assert_silent(&client.format(&snapshot, &request), "format sends nothing");
+    assert_eq!(
+        client.tracked[0].synced.revision(),
+        doc.revision(),
+        "the edit is the synced text",
+    );
+}
+
+/// Before the handshake and after shutdown, `sync` keeps the snapshot it is handed.
+#[test]
+fn sync_before_initialize_and_after_shutdown_stores_the_snapshot() {
+    let mut doc = document("a");
+    let (mut client, _) = Client::builder().build();
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    doc.edit(vec![EditOp::insert(1, "b")]).expect("edits");
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+    assert_eq!(
+        client.tracked[0].synced.revision(),
+        doc.revision(),
+        "sync before initialize stores the snapshot",
+    );
+
+    let (mut client, _) = running(Client::builder(), incremental());
+    let _ = client
+        .open(&doc.snapshot(), &uri("file:///a.rs"), "rust")
+        .expect("opens");
+    let _ = client.shutdown();
+    doc.edit(vec![EditOp::insert(2, "c")]).expect("edits");
+    let _ = client.sync(&doc.snapshot(), doc.drain_changes());
+    assert_eq!(
+        client.tracked[0].synced.revision(),
+        doc.revision(),
+        "sync after shutdown stores the snapshot",
     );
 }
 
