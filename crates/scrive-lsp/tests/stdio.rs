@@ -14,6 +14,7 @@ fn main() {
 
 #[cfg(not(target_family = "wasm"))]
 mod native {
+    use std::path::PathBuf;
     use std::process::Command;
     use std::sync::mpsc;
     use std::thread;
@@ -23,10 +24,12 @@ mod native {
     use scrive_core::intel::ticket::Counter;
     use scrive_core::{Diagnostic, Document, HoverInfo, HoverRequest};
     use scrive_lsp::client::{self, Client, Reason, Status};
-    use scrive_lsp::{log, update, Update};
+    use scrive_lsp::{log, trace, update, Update};
 
     /// The variable that turns this binary into a fake server, naming its mode.
     pub const FAKE: &str = "SCRIVE_LSP_FAKE_SERVER";
+    /// The prefix of the knobs the `conversation` mode reads.
+    pub const KNOB: &str = "SCRIVE_LSP_FAKE_";
     const GRACE: Duration = Duration::from_millis(100);
     /// Room for the first spawn under Windows Defender.
     const PATIENCE: Duration = Duration::from_secs(30);
@@ -38,6 +41,37 @@ mod native {
     struct Harness {
         client: Client,
         events: mpsc::Receiver<client::Event>,
+        log: Log,
+    }
+
+    /// The fake server's log file: one line per `spawn <n>`, `recv <method>` and `exit <code>`.
+    struct Log(PathBuf);
+
+    impl Log {
+        /// The lines so far.
+        fn lines(&self) -> Vec<String> {
+            std::fs::read_to_string(&self.0)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// The lines once `done` holds for them. Panics after `PATIENCE`.
+        fn until(&self, done: impl Fn(&[String]) -> bool) -> Vec<String> {
+            let deadline = Instant::now() + PATIENCE;
+            loop {
+                let lines = self.lines();
+                if done(&lines) {
+                    return lines;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the log never got there: {lines:#?}"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     /// A notification no server knows, big enough to fill a pipe quickly.
@@ -49,10 +83,25 @@ mod native {
     }
 
     impl Harness {
-        fn start(mode: &str, configure: impl FnOnce(client::Builder) -> client::Builder) -> Self {
+        /// A client on the fake server `mode`, with the `conversation` knobs in `env` (named
+        /// without their prefix). The server logs to a file of this test's own.
+        fn start(
+            mode: &str,
+            env: &[(&str, &str)],
+            configure: impl FnOnce(client::Builder) -> client::Builder,
+        ) -> Self {
+            let name = thread::current().name().unwrap_or("test").to_owned();
+            let log = std::env::temp_dir().join(format!(
+                "scrive-lsp-stdio-{name}-{}.log",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&log);
             let mut command =
                 Command::new(std::env::current_exe().expect("the test binary has a path"));
-            command.env(FAKE, mode);
+            command.env(FAKE, mode).env(format!("{KNOB}LOG"), &log);
+            for (knob, value) in env {
+                command.env(format!("{KNOB}{knob}"), value);
+            }
             let (client, events) = configure(Client::builder().shutdown_grace(GRACE))
                 .stdio(command)
                 .expect("the fake server starts");
@@ -66,6 +115,7 @@ mod native {
             Self {
                 client,
                 events: receiver,
+                log: Log(log),
             }
         }
 
@@ -154,6 +204,26 @@ mod native {
             (
                 "dropping_the_client_shuts_the_server_down",
                 dropping_the_client_shuts_the_server_down,
+            ),
+            (
+                "shutdown_finishes_inside_the_grace_period",
+                shutdown_finishes_inside_the_grace_period,
+            ),
+            (
+                "a_server_that_ignores_shutdown_is_killed_after_two_grace_periods",
+                a_server_that_ignores_shutdown_is_killed_after_two_grace_periods,
+            ),
+            (
+                "a_server_that_hangs_on_exit_is_killed_after_the_grace",
+                a_server_that_hangs_on_exit_is_killed_after_the_grace,
+            ),
+            (
+                "shutdown_while_initializing_skips_the_shutdown_request",
+                shutdown_while_initializing_skips_the_shutdown_request,
+            ),
+            (
+                "dropping_the_client_runs_the_shutdown_sequence",
+                dropping_the_client_runs_the_shutdown_sequence,
             ),
         ];
         #[cfg(windows)]
@@ -247,7 +317,7 @@ mod native {
     /// sync, diagnostics, a hover, its stdout banner and stderr line as logs, and an orderly
     /// shutdown that ends the stream.
     fn a_conversation_runs_over_stdio() {
-        let mut harness = Harness::start("conversation", |builder| builder);
+        let mut harness = Harness::start("conversation", &[], |builder| builder);
         let mut updates = harness.until(running);
         let doc = harness.open();
         updates.extend(harness.until(published_fake));
@@ -287,7 +357,7 @@ mod native {
     /// A server that exits mid-request settles the request empty, clears its diagnostics, and
     /// stops the client with its exit code after its last stderr line.
     fn a_crash_stops_the_client_and_settles_its_requests() {
-        let mut harness = Harness::start("crash-on-hover", |builder| builder);
+        let mut harness = Harness::start("crash-on-hover", &[], |builder| builder);
         harness.until(running);
         let doc = harness.open();
         harness.until(published_fake);
@@ -323,7 +393,7 @@ mod native {
     /// A server that stays alive after `exit` is killed once the grace period passes, and the
     /// stop still reads as the shutdown.
     fn a_server_that_ignores_exit_is_killed_after_the_grace_period() {
-        let mut harness = Harness::start("ignore-exit", |builder| builder);
+        let mut harness = Harness::start("ignore-exit", &[], |builder| builder);
         harness.until(running);
         let asked = Instant::now();
         assert!(
@@ -347,7 +417,7 @@ mod native {
     /// A server that closes its stdout but keeps running is killed and reaped, and the stop
     /// shows the kill.
     fn a_live_server_whose_stdout_closes_is_killed_and_reaped() {
-        let mut harness = Harness::start("close-stdout", |builder| builder);
+        let mut harness = Harness::start("close-stdout", &[], |builder| builder);
         let end = harness.to_end();
         #[cfg(unix)]
         let killed = Reason::Exited {
@@ -369,7 +439,7 @@ mod native {
     /// A server that stops reading its stdin is killed once the unwritten messages pass the
     /// limit.
     fn the_hung_server_guard_stops_a_server_that_stops_reading() {
-        let mut harness = Harness::start("deaf", |builder| builder.backlog_limit(16 * 1024));
+        let mut harness = Harness::start("deaf", &[], |builder| builder.backlog_limit(16 * 1024));
         harness.until(running);
         for _ in 0..4096 {
             harness.client.notify::<Blob>("x".repeat(4096));
@@ -384,9 +454,9 @@ mod native {
 
     /// Dropping a client neither panics nor blocks, and ends its event stream.
     fn dropping_the_client_shuts_the_server_down() {
-        let mut harness = Harness::start("conversation", |builder| builder);
+        let mut harness = Harness::start("conversation", &[], |builder| builder);
         harness.until(running);
-        let Harness { client, events } = harness;
+        let Harness { client, events, .. } = harness;
         drop(client);
         let deadline = Instant::now() + 2 * GRACE + PATIENCE;
         loop {
@@ -399,10 +469,167 @@ mod native {
         }
     }
 
+    /// Whether `lines` holds each of `expected`, in that order, with anything in between.
+    fn in_order(lines: &[String], expected: &[&str]) -> bool {
+        let mut lines = lines.iter();
+        expected
+            .iter()
+            .all(|expected| lines.any(|line| line == expected))
+    }
+
+    fn exited(line: &str) -> bool {
+        line.starts_with("exit ")
+    }
+
+    /// A well-behaved server answers `shutdown`, gets `exit` and leaves well inside the grace
+    /// period. The reply goes to the worker: no update and no trace carries the reserved id.
+    fn shutdown_finishes_inside_the_grace_period() {
+        let grace = Duration::from_secs(2);
+        let mut harness = Harness::start("conversation", &[], |builder| {
+            builder
+                .shutdown_grace(grace)
+                .trace(trace::Mode::Messages)
+        });
+        let mut updates = harness.until(running);
+        let asked = Instant::now();
+        assert!(
+            harness.client.shutdown().is_empty(),
+            "nothing was in flight"
+        );
+        let end = harness.to_end();
+        let elapsed = asked.elapsed();
+        assert_eq!(
+            end.last().and_then(stopped),
+            Some(&Reason::Shutdown),
+            "the stop is the shutdown: {end:#?}"
+        );
+        assert!(elapsed < grace, "no deadline ran out: {elapsed:?}");
+        let lines = harness.log.lines();
+        assert!(
+            in_order(&lines, &["recv shutdown", "recv exit"]),
+            "shutdown, then exit: {lines:#?}"
+        );
+        assert!(
+            lines.last().is_some_and(|line| line == "exit 0" || line == "exit 1"),
+            "the server exited by itself: {lines:#?}"
+        );
+        updates.extend(end);
+        assert!(
+            !updates.iter().any(|update| matches!(update, Update::Trace(entry)
+                if entry.direction() == trace::Direction::Incoming
+                    && String::from_utf8_lossy(entry.json()).contains("scrive-lsp/shutdown"))),
+            "the reply is not traced: {updates:#?}"
+        );
+    }
+
+    /// A server that never answers `shutdown` gets `exit` after one grace period, and is killed
+    /// after the second.
+    fn a_server_that_ignores_shutdown_is_killed_after_two_grace_periods() {
+        let grace = Duration::from_millis(200);
+        let mut harness = Harness::start("conversation", &[("IGNORE_SHUTDOWN", "1")], |builder| {
+            builder.shutdown_grace(grace)
+        });
+        harness.until(running);
+        let asked = Instant::now();
+        let _ = harness.client.shutdown();
+        let end = harness.to_end();
+        let elapsed = asked.elapsed();
+        assert_eq!(
+            end.last().and_then(stopped),
+            Some(&Reason::Shutdown),
+            "the stop is the shutdown: {end:#?}"
+        );
+        assert!(elapsed >= 2 * grace, "both grace periods ran: {elapsed:?}");
+        assert!(
+            elapsed < 2 * grace + Duration::from_secs(2),
+            "then it was killed: {elapsed:?}"
+        );
+        let lines = harness.log.lines();
+        assert!(
+            lines.iter().any(|line| line == "recv shutdown"),
+            "the request arrived: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| exited(line)),
+            "the server never exited: {lines:#?}"
+        );
+    }
+
+    /// A server that answers `shutdown` but stays after `exit` is killed after one grace period.
+    fn a_server_that_hangs_on_exit_is_killed_after_the_grace() {
+        let grace = Duration::from_millis(200);
+        let mut harness = Harness::start("conversation", &[("HANG_ON_EXIT", "1")], |builder| {
+            builder.shutdown_grace(grace)
+        });
+        harness.until(running);
+        let asked = Instant::now();
+        let _ = harness.client.shutdown();
+        let end = harness.to_end();
+        let elapsed = asked.elapsed();
+        assert_eq!(
+            end.last().and_then(stopped),
+            Some(&Reason::Shutdown),
+            "the stop is the shutdown: {end:#?}"
+        );
+        assert!(elapsed >= grace, "the exit grace ran: {elapsed:?}");
+        let lines = harness.log.lines();
+        assert!(
+            in_order(&lines, &["recv shutdown", "recv exit"]),
+            "shutdown, then exit: {lines:#?}"
+        );
+    }
+
+    /// A server that hasn't answered `initialize` gets `exit` without `shutdown`.
+    fn shutdown_while_initializing_skips_the_shutdown_request() {
+        let mut harness = Harness::start("conversation", &[("SILENT_FROM", "0")], |builder| {
+            builder.shutdown_grace(Duration::from_millis(200))
+        });
+        harness.log.until(|lines| lines.iter().any(|line| line == "recv initialize"));
+        let _ = harness.client.shutdown();
+        let end = harness.to_end();
+        assert_eq!(
+            end.last().and_then(stopped),
+            Some(&Reason::Shutdown),
+            "the stop is the shutdown: {end:#?}"
+        );
+        let lines = harness.log.lines();
+        assert!(
+            !lines.iter().any(|line| line == "recv shutdown"),
+            "no shutdown request: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| line == "recv exit"),
+            "only exit: {lines:#?}"
+        );
+    }
+
+    /// Dropping a running client runs the whole sequence on the worker, which the server's log
+    /// shows; nobody is left to receive a stop.
+    fn dropping_the_client_runs_the_shutdown_sequence() {
+        let mut harness = Harness::start("conversation", &[], |builder| builder);
+        harness.until(running);
+        let Harness {
+            client,
+            events,
+            log,
+        } = harness;
+        drop(client);
+        drop(events);
+        let lines = log.until(|lines| lines.iter().any(|line| exited(line)));
+        assert!(
+            in_order(&lines, &["recv shutdown", "recv exit"]),
+            "shutdown, then exit, then the exit: {lines:#?}"
+        );
+        assert!(
+            lines.last().is_some_and(|line| exited(line)),
+            "the server exited last: {lines:#?}"
+        );
+    }
+
     /// A console program the server starts opens no console window either.
     #[cfg(windows)]
     fn a_console_grandchild_opens_no_window() {
-        let mut harness = Harness::start("console-parent", |builder| builder);
+        let mut harness = Harness::start("console-parent", &[], |builder| builder);
         let updates = harness.until(|update| {
             matches!(update, Update::Log(entry)
                 if entry.source() == log::Source::Stderr
@@ -427,11 +654,15 @@ mod native {
 
     /// The fake servers, one per mode.
     pub mod fake {
+        use std::fs::OpenOptions;
         use std::io::{self, Write};
+        use std::path::PathBuf;
         use std::thread;
 
         use scrive_lsp::lsp_server::{Connection, Message, Notification, Response};
         use serde_json::{json, Value};
+
+        use super::KNOB;
 
         /// How a conversation goes.
         #[derive(Clone, Copy, PartialEq, Eq)]
@@ -443,6 +674,69 @@ mod native {
             /// Runs a console program before serving.
             #[cfg(windows)]
             ConsoleParent,
+        }
+
+        /// The `conversation` knobs, read from `SCRIVE_LSP_FAKE_*`.
+        struct Knobs {
+            log: Log,
+            /// On `shutdown`, sleep until killed.
+            ignore_shutdown: bool,
+            /// On `exit` or stdin EOF, sleep until killed.
+            hang_on_exit: bool,
+            /// Spawns from this one on never answer `initialize`.
+            silent_from: Option<usize>,
+        }
+
+        /// The log file the harness reads, if it set one.
+        struct Log(Option<PathBuf>);
+
+        impl Knobs {
+            fn read() -> Self {
+                let knob = |name: &str| std::env::var(format!("{KNOB}{name}")).ok();
+                let number = |name: &str| {
+                    knob(name).map(|value| value.parse().expect("the knob is a number"))
+                };
+                Self {
+                    log: Log(knob("LOG").map(PathBuf::from)),
+                    ignore_shutdown: knob("IGNORE_SHUTDOWN").is_some(),
+                    hang_on_exit: knob("HANG_ON_EXIT").is_some(),
+                    silent_from: number("SILENT_FROM"),
+                }
+            }
+        }
+
+        impl Log {
+            /// Appends `line` in one write, so lines from several processes never interleave.
+            fn line(&self, line: &str) {
+                let Some(path) = &self.0 else {
+                    return;
+                };
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes()))
+                    .expect("the log is writable");
+            }
+
+            /// How many spawns logged before this one. Spawns never overlap: the client kills
+            /// and reaps a server before it starts the next.
+            fn spawns(&self) -> usize {
+                let Some(path) = &self.0 else {
+                    return 0;
+                };
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter(|line| line.starts_with("spawn "))
+                    .count()
+            }
+
+            /// Logs the exit, then exits.
+            fn exit(&self, code: i32) -> ! {
+                self.line(&format!("exit {code}"));
+                std::process::exit(code)
+            }
         }
 
         /// Serves as the fake server `mode` names, and exits.
@@ -461,52 +755,62 @@ mod native {
             }
         }
 
-        /// An lsp-server server with hover and full sync that publishes one `fake` diagnostic
-        /// per opened document and answers hovers with the client's `processId`.
+        /// A server with hover and full sync that publishes one `fake` diagnostic per opened
+        /// document and answers hovers with the client's `processId`. It reads and writes on
+        /// this one thread, so every reply is written before it exits.
         fn conversation(script: Script) {
-            // lsp-server's writer holds stdout's lock for its whole life, so the banner goes
-            // out before the connection exists.
-            let mut stdout = io::stdout();
+            let knobs = Knobs::read();
+            let spawn = knobs.log.spawns();
+            knobs.log.line(&format!("spawn {spawn}"));
+            let silent = knobs.silent_from.is_some_and(|from| spawn >= from);
+            let mut stdout = io::stdout().lock();
             stdout
                 .write_all(b"fake server banner\n")
                 .and_then(|()| stdout.flush())
                 .expect("stdout is open");
-            let (connection, io_threads) = Connection::stdio();
             eprintln!("fake server ready");
-            let params = connection
-                .initialize(json!({ "hoverProvider": true, "textDocumentSync": 1 }))
-                .expect("the client initializes");
-            let pid = params["processId"].clone();
-            #[cfg(windows)]
-            if script == Script::ConsoleParent {
-                let report = std::process::Command::new(
-                    std::env::current_exe().expect("the test binary has a path"),
-                )
-                .env(super::FAKE, "console-report")
-                .status()
-                .expect("the console program runs");
-                assert!(report.success(), "the console program reports");
-            }
-            for message in &connection.receiver {
+            let mut stdin = io::stdin().lock();
+            let mut pid = Value::Null;
+            let mut shut = false;
+            while let Ok(Some(message)) = Message::read(&mut stdin) {
+                knobs.log.line(&format!("recv {}", received(&message)));
                 match message {
                     Message::Request(request) => {
-                        // A message other than `exit` after `shutdown` is an error there.
-                        let shut = connection
-                            .handle_shutdown(&request)
-                            .unwrap_or_else(|_| std::process::exit(1));
-                        if shut {
-                            break;
-                        }
-                        let result = if request.method == "textDocument/hover" {
-                            if script == Script::CrashOnHover {
-                                eprintln!("crashing");
-                                std::process::exit(3);
+                        let result = match request.method.as_str() {
+                            "initialize" if silent => continue,
+                            "initialize" => {
+                                pid = request.params["processId"].clone();
+                                #[cfg(windows)]
+                                if script == Script::ConsoleParent {
+                                    console_parent();
+                                }
+                                json!({ "capabilities": {
+                                    "hoverProvider": true,
+                                    "textDocumentSync": 1,
+                                } })
                             }
-                            json!({ "contents": { "kind": "markdown", "value": format!("pid {pid}") } })
-                        } else {
-                            Value::Null
+                            "shutdown" if knobs.ignore_shutdown => park(),
+                            "shutdown" => {
+                                shut = true;
+                                Value::Null
+                            }
+                            "textDocument/hover" if script == Script::CrashOnHover => {
+                                eprintln!("crashing");
+                                knobs.log.exit(3)
+                            }
+                            "textDocument/hover" => {
+                                let value = format!("pid {pid}");
+                                json!({ "contents": { "kind": "markdown", "value": value } })
+                            }
+                            _ => Value::Null,
                         };
-                        send(&connection, Response::new_ok(request.id, result).into());
+                        write(&mut stdout, Response::new_ok(request.id, result).into());
+                    }
+                    Message::Notification(notification) if notification.method == "exit" => {
+                        if knobs.hang_on_exit {
+                            park()
+                        }
+                        knobs.log.exit(if shut { 0 } else { 1 })
                     }
                     Message::Notification(notification)
                         if notification.method == "textDocument/didOpen" =>
@@ -525,13 +829,43 @@ mod native {
                             }],
                         });
                         let publish = "textDocument/publishDiagnostics".to_owned();
-                        send(&connection, Notification::new(publish, params).into());
+                        write(&mut stdout, Notification::new(publish, params).into());
                     }
                     Message::Notification(_) | Message::Response(_) => {}
                 }
             }
-            drop(connection);
-            let _ = io_threads.join();
+            if knobs.hang_on_exit {
+                park()
+            }
+            knobs.log.exit(1)
+        }
+
+        /// Runs a console program and waits for it.
+        #[cfg(windows)]
+        fn console_parent() {
+            let report = std::process::Command::new(
+                std::env::current_exe().expect("the test binary has a path"),
+            )
+            .env(super::FAKE, "console-report")
+            .status()
+            .expect("the console program runs");
+            assert!(report.success(), "the console program reports");
+        }
+
+        /// How the log names a message: its method, or `reply <id>`.
+        fn received(message: &Message) -> String {
+            match message {
+                Message::Request(request) => request.method.clone(),
+                Message::Notification(notification) => notification.method.clone(),
+                Message::Response(response) => format!("reply {}", response.id),
+            }
+        }
+
+        fn write(stdout: &mut impl Write, message: Message) {
+            message
+                .write(stdout)
+                .and_then(|()| stdout.flush())
+                .expect("stdout is open");
         }
 
         /// Answers every request with `null`, `shutdown` included, and stays alive after

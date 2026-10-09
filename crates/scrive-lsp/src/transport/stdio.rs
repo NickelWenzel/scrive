@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use super::frame;
 use super::lifecycle::{self, Handshake, Lifecycle};
+use super::Link;
 use crate::client::builder;
 use crate::{client, log, transport};
 
@@ -35,13 +36,23 @@ pub(crate) struct Started {
 }
 
 /// One connection's outgoing queue. Bodies go to the writer thread, which frames and writes them
-/// in order. Clones share the queue; the server's stdin closes once every clone is gone.
+/// in order. Clones share the queue; the server's stdin closes on [`Writer::close`], or once every
+/// clone is gone.
 #[derive(Clone, Debug)]
 pub(crate) struct Writer {
-    queue: mpsc::Sender<Arc<[u8]>>,
+    queue: mpsc::Sender<Item>,
     backlog: Arc<Backlog>,
     /// Where the guard reports its trip.
     commands: mpsc::Sender<Command>,
+}
+
+/// One entry of a connection's outgoing queue.
+#[derive(Debug)]
+enum Item {
+    /// A serialized message, framed by the writer thread.
+    Body(Arc<[u8]>),
+    /// Close the server's stdin; nothing after it is written.
+    Close,
 }
 
 /// Bytes queued for the server but not yet written, and the hung-server guard on them.
@@ -66,6 +77,8 @@ enum Command {
     Ended(Pipe),
     /// The backlog passed its limit.
     Unresponsive,
+    /// The stdout reader saw the reply to the shutdown request.
+    Replied,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -81,7 +94,9 @@ struct Supervisor {
     commands: Option<mpsc::Receiver<Command>>,
     events: Feed,
     /// Its own handle on the queue, so `shutdown` and `exit` queue behind the client's messages.
-    writer: Option<Writer>,
+    link: Option<Link>,
+    /// Tells the stdout reader to look for the shutdown reply.
+    closing: Arc<AtomicBool>,
     grace: Duration,
 }
 
@@ -92,8 +107,10 @@ struct Watch {
     exit: Option<Exit>,
     stdout: bool,
     stderr: bool,
-    /// When the shutdown grace period ends; set by `Lifecycle::Shutdown`.
-    shutdown: Option<Instant>,
+    /// Set by `Lifecycle::Shutdown`.
+    shut: bool,
+    /// The shutdown handshake, while the process lives.
+    sequence: Option<lifecycle::Sequence>,
     unresponsive: bool,
     /// When the readers' grace period ends; set once the process is reaped.
     drained: Option<Instant>,
@@ -137,7 +154,7 @@ impl Writer {
         // Counted before the send and given back after the write, so the count never goes
         // below zero.
         let unwritten = self.backlog.unwritten.fetch_add(length, Ordering::Relaxed) + length;
-        if self.queue.send(body).is_err() {
+        if self.queue.send(Item::Body(body)).is_err() {
             self.backlog.unwritten.fetch_sub(length, Ordering::Relaxed);
             return;
         }
@@ -146,6 +163,11 @@ impl Writer {
         if unwritten > self.backlog.limit && !self.backlog.tripped.swap(true, Ordering::Relaxed) {
             let _ = self.commands.send(Command::Unresponsive);
         }
+    }
+
+    /// Queues the close of the server's stdin behind everything queued so far.
+    pub(crate) fn close(&self) {
+        let _ = self.queue.send(Item::Close);
     }
 }
 
@@ -175,17 +197,22 @@ impl Supervisor {
                 Some(Command::Lifecycle(Lifecycle::Shutdown { handshake })) => {
                     self.shut_down(handshake, &mut watch);
                 }
+                Some(Command::Replied) => {
+                    if let (Some(sequence), Some(link)) = (&mut watch.sequence, &self.link) {
+                        sequence.replied(link, self.grace, Instant::now());
+                    }
+                }
                 Some(Command::Ended(Pipe::Stdout)) => {
                     watch.stdout = true;
                     // A live server whose stdout closed can't answer any more. During a shutdown
-                    // the grace deadline decides instead, so a server finishing its exit isn't
-                    // cut short.
-                    if watch.exit.is_none() && watch.shutdown.is_none() {
+                    // the sequence's deadlines decide instead, so a server finishing its exit
+                    // isn't cut short.
+                    if watch.exit.is_none() && !watch.shut {
                         watch.exit = Some(self.reap());
                     }
                 }
                 Some(Command::Ended(Pipe::Stderr)) => watch.stderr = true,
-                Some(Command::Unresponsive) if watch.exit.is_none() => {
+                Some(Command::Unresponsive) if watch.exit.is_none() && !watch.shut => {
                     watch.unresponsive = true;
                     watch.exit = Some(self.kill());
                 }
@@ -195,15 +222,13 @@ impl Supervisor {
             if watch.exit.is_none() {
                 watch.exit = match self.child.try_wait() {
                     Ok(Some(status)) => Some(Exit::from(status)),
-                    Ok(None) if watch.shutdown.is_some_and(|deadline| now >= deadline) => {
-                        Some(self.kill())
-                    }
-                    Ok(None) => None,
+                    Ok(None) => self.expire(&mut watch, now),
                     Err(_) => Some(Exit::UNKNOWN),
                 };
             }
             if let Some(exit) = watch.exit {
-                self.writer = None;
+                watch.sequence = None;
+                self.link = None;
                 // Everything a reader sent before its EOF is ahead of this `Stopped`, so no late
                 // frame or stderr line follows it.
                 let drained = *watch.drained.get_or_insert(now + self.grace);
@@ -233,20 +258,35 @@ impl Supervisor {
         }
     }
 
-    /// Queues `shutdown` (after a handshake) and `exit` behind the client's messages, and starts
-    /// the grace period: on the command, since a writer blocked on a full pipe never closes
-    /// stdin.
+    /// Starts the shutdown handshake behind the client's messages. Its deadlines run from the
+    /// command, since a writer blocked on a full pipe never closes stdin.
     fn shut_down(&mut self, handshake: Handshake, watch: &mut Watch) {
-        if watch.shutdown.is_some() {
+        if watch.shut {
             return;
         }
-        watch.shutdown = Some(Instant::now() + self.grace);
-        if let Some(writer) = self.writer.take() {
-            match handshake {
-                Handshake::Done => writer.send(lifecycle::shutdown()),
-                Handshake::Pending => {}
-            }
-            writer.send(lifecycle::exit());
+        watch.shut = true;
+        if let Some(link) = &self.link {
+            self.closing.store(true, Ordering::Relaxed);
+            watch.sequence = Some(lifecycle::Sequence::begin(
+                link,
+                handshake,
+                self.grace,
+                Instant::now(),
+            ));
+        }
+    }
+
+    /// Moves the shutdown sequence on once its deadline passed, and kills when it says so.
+    fn expire(&mut self, watch: &mut Watch, now: Instant) -> Option<Exit> {
+        let (Some(sequence), Some(link)) = (&mut watch.sequence, &self.link) else {
+            return None;
+        };
+        if now < sequence.until() {
+            return None;
+        }
+        match sequence.expired(link, self.grace, now) {
+            lifecycle::Next::Wait => None,
+            lifecycle::Next::Kill => Some(self.kill()),
         }
     }
 
@@ -268,12 +308,12 @@ impl Supervisor {
 impl Watch {
     /// Whether a deadline is running, so the supervisor polls at `POLL`.
     fn armed(&self) -> bool {
-        self.shutdown.is_some() || self.exit.is_some()
+        self.shut || self.exit.is_some()
     }
 
     /// A shutdown the client asked for wins, even if the process then had to be killed.
     fn reason(&self, exit: Exit) -> client::Reason {
-        if self.shutdown.is_some() {
+        if self.shut {
             client::Reason::Shutdown
         } else if self.unresponsive {
             client::Reason::Unresponsive
@@ -338,6 +378,38 @@ impl Lines {
     }
 }
 
+/// A stdio link whose queue a test reads instead of a writer thread.
+#[cfg(test)]
+pub(crate) struct Tap(mpsc::Receiver<Item>);
+
+#[cfg(test)]
+impl Tap {
+    /// The link, and the tap on its queue. Its guard never trips.
+    pub(crate) fn link() -> (Link, Self) {
+        let (queue, outgoing) = mpsc::channel();
+        let (commands, _) = mpsc::channel();
+        let writer = Writer {
+            queue,
+            backlog: Arc::new(Backlog::new(usize::MAX)),
+            commands,
+        };
+        (Link::Stdio(writer), Self(outgoing))
+    }
+
+    /// What was queued since the last call: each body as JSON, `None` for the close.
+    pub(crate) fn items(&self) -> Vec<Option<serde_json::Value>> {
+        self.0
+            .try_iter()
+            .map(|item| match item {
+                Item::Body(body) => {
+                    Some(serde_json::from_slice(&body).expect("queued bodies are JSON"))
+                }
+                Item::Close => None,
+            })
+            .collect()
+    }
+}
+
 /// Starts `command` with piped stdio and the four threads that serve it.
 pub(crate) fn spawn(
     command: &mut process::Command,
@@ -362,6 +434,7 @@ pub(crate) fn spawn(
     let (commands, received) = mpsc::channel();
     let (events, incoming) = futures_channel::mpsc::unbounded();
     let backlog = Arc::new(Backlog::new(limit));
+    let closing = Arc::new(AtomicBool::new(false));
     let writer = Writer {
         queue,
         backlog: Arc::clone(&backlog),
@@ -370,14 +443,19 @@ pub(crate) fn spawn(
     let (handoff, slot) = mpsc::sync_channel(1);
 
     let supervisor = {
-        let (events, writer) = (events.clone(), writer.clone());
+        let (events, link, closing) = (
+            events.clone(),
+            Link::Stdio(writer.clone()),
+            Arc::clone(&closing),
+        );
         move || {
             if let Ok(child) = slot.recv() {
                 let supervisor = Supervisor {
                     child,
                     commands: Some(received),
                     events,
-                    writer: Some(writer),
+                    link: Some(link),
+                    closing,
                     grace,
                 };
                 supervisor.run();
@@ -386,7 +464,7 @@ pub(crate) fn spawn(
     };
     let reader = {
         let (events, commands) = (events.clone(), commands.clone());
-        move || read(stdout, &events, &commands)
+        move || read(stdout, &events, &commands, &closing)
     };
     let stderr_reader = {
         let commands = commands.clone();
@@ -422,10 +500,13 @@ fn start(role: &str, body: impl FnOnce() + Send + 'static) -> io::Result<()> {
         .map(drop)
 }
 
-/// Frames and writes every queued body until every `Writer` is gone, then closes stdin by
-/// dropping it. A write error means the server died; its stdout EOF reports that.
-fn write(mut stdin: ChildStdin, outgoing: &mpsc::Receiver<Arc<[u8]>>, backlog: &Backlog) {
-    for body in outgoing {
+/// Frames and writes every queued body until the close, or until every `Writer` is gone, then
+/// closes stdin by dropping it. A write error means the server died; its stdout EOF reports that.
+fn write(mut stdin: ChildStdin, outgoing: &mpsc::Receiver<Item>, backlog: &Backlog) {
+    for item in outgoing {
+        let Item::Body(body) = item else {
+            return;
+        };
         let written = stdin.write_all(&frame::encode(&body));
         backlog.unwritten.fetch_sub(body.len(), Ordering::Relaxed);
         if written.is_err() {
@@ -435,8 +516,14 @@ fn write(mut stdin: ChildStdin, outgoing: &mpsc::Receiver<Arc<[u8]>>, backlog: &
 }
 
 /// Decodes stdout until EOF, then tells the supervisor. It reads on after `Events` is dropped,
-/// so the server never blocks on a full pipe.
-fn read(mut stdout: impl Read, events: &Feed, commands: &mpsc::Sender<Command>) {
+/// so the server never blocks on a full pipe. Once `closing` is set, the reply to the shutdown
+/// request goes to the supervisor instead of the client.
+fn read(
+    mut stdout: impl Read,
+    events: &Feed,
+    commands: &mpsc::Sender<Command>,
+    closing: &AtomicBool,
+) {
     let mut decoder = frame::Decoder::default();
     let mut chunk = vec![0; CHUNK];
     loop {
@@ -446,7 +533,7 @@ fn read(mut stdout: impl Read, events: &Feed, commands: &mpsc::Sender<Command>) 
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        if !deliver(decoder.push(&chunk[..read]), events) {
+        if !deliver(decoder.push(&chunk[..read]), events, commands, closing) {
             break;
         }
     }
@@ -458,12 +545,23 @@ fn read(mut stdout: impl Read, events: &Feed, commands: &mpsc::Sender<Command>) 
 
 /// Forwards one read's items in order, consecutive noise lines as one log batch. `false` once
 /// the stream is corrupt.
-fn deliver(items: Vec<frame::Item>, events: &Feed) -> bool {
+fn deliver(
+    items: Vec<frame::Item>,
+    events: &Feed,
+    commands: &mpsc::Sender<Command>,
+    closing: &AtomicBool,
+) -> bool {
     let mut noise = Vec::new();
     for item in items {
         let (event, corrupt) = match item {
             frame::Item::Noise(text) => {
                 noise.push(log::Entry::stdout(text));
+                continue;
+            }
+            frame::Item::Body(body)
+                if closing.load(Ordering::Relaxed) && lifecycle::is_shutdown_reply(&body) =>
+            {
+                let _ = commands.send(Command::Replied);
                 continue;
             }
             frame::Item::Body(body) => (transport::Event::Message(Arc::from(body)), false),
@@ -555,7 +653,7 @@ mod tests {
         stdout.extend(frame::encode(b"{\"b\":2}"));
         let (events, incoming) = futures_channel::mpsc::unbounded();
         let (commands, received) = mpsc::channel();
-        read(stdout.as_slice(), &events, &commands);
+        read(stdout.as_slice(), &events, &commands, &AtomicBool::new(false));
         let events = sent(incoming);
         assert_eq!(events.len(), 4, "four events: {events:?}");
         assert_eq!(texts(&events[0]), Some(vec!["banner"]), "the banner");
@@ -581,6 +679,23 @@ mod tests {
         );
     }
 
+    /// While closing, the reply to the shutdown request goes to the supervisor, not the client;
+    /// before that it is an ordinary message.
+    #[test]
+    fn the_reader_swallows_the_shutdown_reply_only_while_closing() {
+        let reply = frame::encode(br#"{"id":"scrive-lsp/shutdown","result":null}"#);
+        for (closing, forwarded) in [(false, 1), (true, 0)] {
+            let (events, incoming) = futures_channel::mpsc::unbounded();
+            let (commands, received) = mpsc::channel();
+            read(reply.as_slice(), &events, &commands, &AtomicBool::new(closing));
+            assert_eq!(sent(incoming).len(), forwarded, "closing: {closing}");
+            let replied = received
+                .try_iter()
+                .any(|command| matches!(command, Command::Replied));
+            assert_eq!(replied, closing, "the supervisor hears of it while closing");
+        }
+    }
+
     /// A length above 1 GiB is reported and ends the reading; a frame after it is not
     /// forwarded.
     #[test]
@@ -589,7 +704,7 @@ mod tests {
         stdout.extend(frame::encode(b"{}"));
         let (events, incoming) = futures_channel::mpsc::unbounded();
         let (commands, received) = mpsc::channel();
-        read(stdout.as_slice(), &events, &commands);
+        read(stdout.as_slice(), &events, &commands, &AtomicBool::new(false));
         let events = sent(incoming);
         assert!(
             matches!(
@@ -655,7 +770,7 @@ mod tests {
     }
 
     /// A writer whose queue nobody drains, with room for `limit` bytes.
-    fn stalled(limit: usize) -> (Writer, mpsc::Receiver<Arc<[u8]>>, mpsc::Receiver<Command>) {
+    fn stalled(limit: usize) -> (Writer, mpsc::Receiver<Item>, mpsc::Receiver<Command>) {
         let (queue, outgoing) = mpsc::channel();
         let (commands, received) = mpsc::channel();
         let writer = Writer {

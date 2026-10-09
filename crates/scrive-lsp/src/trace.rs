@@ -3,7 +3,8 @@
 use core::fmt;
 use std::sync::Arc;
 
-/// Whether the client records traffic as [`Update::Trace`](crate::Update::Trace).
+/// Whether the client records traffic as [`Update::Trace`](crate::Update::Trace). A server
+/// process's shutdown handshake (`shutdown`, its reply, and `exit`) is not traced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Mode {
     /// No traces.
