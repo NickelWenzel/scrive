@@ -319,6 +319,8 @@ impl Supervisor {
         match pipe {
             Pipe::Stdout => readers.stdout = true,
             Pipe::Stderr => readers.stderr = true,
+            // A process has no socket.
+            Pipe::Socket => {}
         }
         if pipe == Pipe::Stdout {
             self.lose(generation, Cause::Gone, now);

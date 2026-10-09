@@ -9,6 +9,9 @@ pub enum Source {
     Stderr,
     /// A line the server process wrote to its stdout between protocol messages.
     Stdout,
+    /// A socket connection: text between frames that isn't an LSP message, and the
+    /// connection's own notes, such as a WebSocket close code.
+    Socket,
 }
 
 /// One line a server logged or asked to show.
@@ -51,6 +54,17 @@ impl Entry {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn stdout(text: String) -> Self {
         Self::output(Source::Stdout, text)
+    }
+
+    /// Text from a socket connection that isn't an LSP message, at `level`.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn socket(level: lsp_types::MessageType, text: String) -> Self {
+        Self {
+            source: Source::Socket,
+            level,
+            shown: false,
+            text,
+        }
     }
 
     #[cfg(not(target_family = "wasm"))]

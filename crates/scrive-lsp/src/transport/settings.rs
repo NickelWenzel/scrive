@@ -27,7 +27,7 @@ impl Settings {
 }
 
 /// `base`, grown ×1.3 `retry` times, at most `cap`.
-fn grow(base: Duration, retry: u32, cap: Duration) -> Duration {
+pub(crate) fn grow(base: Duration, retry: u32, cap: Duration) -> Duration {
     if base.is_zero() {
         return Duration::ZERO;
     }

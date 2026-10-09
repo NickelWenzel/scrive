@@ -16,6 +16,8 @@ pub(crate) mod stdio;
 #[cfg(all(test, not(target_family = "wasm")))]
 pub(crate) mod tap;
 #[cfg(not(target_family = "wasm"))]
+pub(crate) mod tcp;
+#[cfg(not(target_family = "wasm"))]
 mod writer;
 
 #[cfg(not(target_family = "wasm"))]
@@ -67,8 +69,8 @@ pub(crate) enum Event {
     },
     /// The bridge is done for good.
     Stopped(client::Reason),
-    /// Lines the server wrote outside the protocol: one read's stderr lines, or the stdout noise
-    /// between two frames. Never dropped: a dead server's last words are what a log is for.
+    /// Lines the server wrote outside the protocol: one read's stderr lines, or the noise between
+    /// two frames on stdout or a socket. Never dropped: a dead server's last words are what a log is for.
     #[cfg(not(target_family = "wasm"))]
     Log(Arc<[log::Entry]>),
     /// A frame connection `generation` dropped.
@@ -111,6 +113,9 @@ pub(crate) enum Control {
     /// The stdio bridge's supervisor.
     #[cfg(not(target_family = "wasm"))]
     Stdio(Handle),
+    /// The worker of a TCP bridge that dials its server.
+    #[cfg(not(target_family = "wasm"))]
+    Tcp(Handle),
 }
 
 /// The channel a worker bridge's threads report on.
@@ -146,6 +151,7 @@ pub(crate) enum Notice {
 pub(crate) enum Pipe {
     Stdout,
     Stderr,
+    Socket,
 }
 
 /// A started worker bridge: what the client keeps, and the stream its traffic arrives on.
@@ -204,7 +210,7 @@ impl Control {
     pub(crate) fn send(&self, lifecycle: Lifecycle) {
         match self {
             Self::Memory => {}
-            Self::Stdio(handle) => handle.send(lifecycle),
+            Self::Stdio(handle) | Self::Tcp(handle) => handle.send(lifecycle),
         }
     }
 }
@@ -224,6 +230,7 @@ impl Pipe {
         match self {
             Pipe::Stdout => log::Entry::stdout(text),
             Pipe::Stderr => log::Entry::stderr(text),
+            Pipe::Socket => log::Entry::socket(lsp_types::MessageType::LOG, text),
         }
     }
 }

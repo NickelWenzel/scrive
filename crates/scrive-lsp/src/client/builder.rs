@@ -4,6 +4,8 @@
 pub mod error;
 
 #[cfg(not(target_family = "wasm"))]
+use std::net::ToSocketAddrs;
+#[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
 
 use lsp_types::{ClientInfo, InitializeParams, Uri, WorkspaceFolder};
@@ -27,6 +29,9 @@ const BACKLOG: usize = 256 * 1024 * 1024;
 /// The first wait before a lost server is started again, unless the builder says.
 #[cfg(not(target_family = "wasm"))]
 const BACKOFF: Duration = Duration::from_secs(1);
+/// How long the first dials of `connect` retry, unless the builder says.
+#[cfg(not(target_family = "wasm"))]
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configures a [`Client`] and connects it through one bridge.
 #[must_use]
@@ -46,6 +51,8 @@ pub struct Builder {
     backoff: Option<Duration>,
     #[cfg(not(target_family = "wasm"))]
     initialize_timeout: Option<Duration>,
+    #[cfg(not(target_family = "wasm"))]
+    connect_timeout: Option<Duration>,
 }
 
 impl Builder {
@@ -123,6 +130,17 @@ impl Builder {
         self
     }
 
+    /// How long the first dials of [`connect`](Self::connect) retry a server that refuses or
+    /// can't be reached, counted from the call; then the client stops with
+    /// [`Reason::Failed`](super::Reason::Failed), and [`Client::restart`] dials again. Defaults
+    /// to 10 seconds. A lost connection is dialed again under the [restart policy](Self::restart)
+    /// instead.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
     /// Starts `command` as the language server, and talks to it over its stdin and stdout. The
     /// client sends `initialize` at once, with this process's id as `processId`.
     ///
@@ -152,6 +170,36 @@ impl Builder {
     pub fn stdio(self, command: std::process::Command) -> Result<(Client, Events), Error> {
         let started = transport::stdio::spawn(command, self.settings())?;
         Ok(self.start(started, Some(std::process::id())))
+    }
+
+    /// Connects to a language server listening on `address`: the client side of
+    /// `lsp_server::Connection::listen`. The client sends `initialize` at once, queued until the
+    /// connection is up, with `processId` `null`, since the server may run on another machine.
+    ///
+    /// Resolving and dialing happen on a worker thread, so this returns at once. Each dial tries
+    /// every address `address` resolves to, for at most 5 seconds each; a server that is still
+    /// starting up is dialed again until [`connect_timeout`](Self::connect_timeout). Text on the
+    /// socket between messages arrives as an [`Update::Log`](crate::Update::Log) from
+    /// [`Source::Socket`](crate::log::Source::Socket). A connection the server closes, or a
+    /// server that stops reading, is lost, and the [restart policy](Self::restart) decides
+    /// whether it is dialed again, as [`Status::Restarting`](super::Status::Restarting); a
+    /// server that never completed `initialize` is not. [`Client::shutdown`], or dropping the
+    /// client, runs the LSP shutdown handshake and closes the connection after the
+    /// [grace period](Self::shutdown_grace).
+    ///
+    /// The connection sets no TCP keepalive, so a server whose machine vanishes without closing
+    /// it goes unnoticed while nothing is sent; [`Client::restart`] dials again.
+    ///
+    /// # Errors
+    /// [`Error::Thread`] when the worker thread cannot be created.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn connect(
+        self,
+        address: impl ToSocketAddrs + Send + 'static,
+    ) -> Result<(Client, Events), Error> {
+        let budget = self.connect_timeout.unwrap_or(CONNECT_TIMEOUT);
+        let started = transport::tcp::connect(address, budget, self.settings())?;
+        Ok(self.start(started, None))
     }
 
     /// A client on the client end of an in-process pair from
