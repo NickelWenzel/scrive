@@ -720,8 +720,9 @@ impl Client {
         updates
     }
 
-    /// The connection is over for good: settles and clears through `disconnected`, unless a
-    /// loss already did, then reports it. The same stop delivered twice changes nothing.
+    /// The connection is over for good: reports an `initialize` deadline that ran out, settles
+    /// and clears through `disconnected` unless a loss already did, then reports the stop. The
+    /// same stop delivered twice changes nothing.
     fn stopped(&mut self, reason: Reason) -> Vec<Update> {
         let connected = match self.connection {
             Connection::Live { .. } | Connection::Shut(Some(_)) => true,
@@ -737,11 +738,16 @@ impl Client {
             return Vec::new();
         }
         self.connection = Connection::Shut(None);
-        let mut updates = if connected {
-            self.disconnect()
-        } else {
-            Vec::new()
-        };
+        let mut updates = Vec::new();
+        // A listen worker stops at its `initialize` deadline instead of reporting a loss.
+        #[cfg(any(
+            not(target_family = "wasm"),
+            all(feature = "websocket", target_arch = "wasm32", target_os = "unknown")
+        ))]
+        updates.extend(self.recovery.timed_out(&reason));
+        if connected {
+            updates.extend(self.disconnect());
+        }
         self.status = Status::Stopped(reason.clone());
         updates.push(Update::Status(Status::Stopped(reason)));
         updates
