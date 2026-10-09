@@ -70,7 +70,10 @@ impl Inbox {
     /// The next message, or the disconnect, without waiting.
     fn try_next(&self) -> Option<transport::Event> {
         match self.receiver.try_recv() {
-            Ok(message) => Some(transport::Event::Message(encode(&message))),
+            Ok(message) => Some(transport::Event::Message {
+                generation: transport::Generation::FIRST,
+                body: encode(&message),
+            }),
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 Some(transport::Event::Stopped(client::Reason::Closed))
             }
@@ -138,7 +141,7 @@ mod tests {
 
     /// The `n` param of a notification the inbox handed over.
     fn number(event: &transport::Event) -> u64 {
-        let transport::Event::Message(body) = event else {
+        let transport::Event::Message { body, .. } = event else {
             panic!("expected a message, got {event:?}")
         };
         let value: serde_json::Value = serde_json::from_slice(body).expect("the body is JSON");

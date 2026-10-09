@@ -1,8 +1,9 @@
 //! The stdio bridge: a language server as a child process, talked to over its stdin and stdout.
-//! Four named threads serve it: a writer, a stdout reader, a stderr reader, and a supervisor
-//! that owns the process.
+//! A supervisor thread owns the process and starts it again when the client says so; each
+//! process gets a writer, a stdout reader and a stderr reader of its own.
 
 use std::io::{self, Read, Write};
+use std::ops::ControlFlow;
 use std::process::{self, Child, ChildStdin, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -11,14 +12,17 @@ use std::time::{Duration, Instant};
 
 use super::frame;
 use super::lifecycle::{self, Handshake, Lifecycle};
-use super::Link;
+use super::{Generation, Link};
 use crate::client::builder;
 use crate::{client, log, transport};
 
-/// How long the supervisor waits for a command before checking the process again.
+/// How long the supervisor waits for a notice before checking a live process again.
 const IDLE: Duration = Duration::from_secs(1);
-/// How often it checks while a grace period runs.
+/// How often it checks while the shutdown sequence runs.
 const POLL: Duration = Duration::from_millis(50);
+/// How much each respawn's backoff grows, and where it stops (monaco's reconnecting socket).
+const GROWTH: f64 = 1.3;
+const CAP: Duration = Duration::from_secs(10);
 /// Bytes per read from the server's stdout and stderr.
 const CHUNK: usize = 64 * 1024;
 /// Win32's `CREATE_NO_WINDOW` process creation flag.
@@ -35,6 +39,17 @@ pub(crate) struct Started {
     pub(crate) events: futures_channel::mpsc::UnboundedReceiver<transport::Event>,
 }
 
+/// What the builder hands the supervisor.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Settings {
+    /// How long each step of the shutdown sequence, and a dead process's output, may take.
+    pub(crate) grace: Duration,
+    /// The first delay before a respawn.
+    pub(crate) backoff: Duration,
+    /// Unwritten bytes past which the server counts as unresponsive.
+    pub(crate) limit: usize,
+}
+
 /// One connection's outgoing queue. Bodies go to the writer thread, which frames and writes them
 /// in order. Clones share the queue; the server's stdin closes on [`Writer::close`], or once every
 /// clone is gone.
@@ -43,7 +58,8 @@ pub(crate) struct Writer {
     queue: mpsc::Sender<Item>,
     backlog: Arc<Backlog>,
     /// Where the guard reports its trip.
-    commands: mpsc::Sender<Command>,
+    notices: mpsc::Sender<Notice>,
+    generation: Generation,
 }
 
 /// One entry of a connection's outgoing queue.
@@ -66,54 +82,111 @@ struct Backlog {
 /// The client's line to the supervisor.
 #[derive(Debug)]
 pub(crate) struct Control {
-    commands: mpsc::Sender<Command>,
+    notices: mpsc::Sender<Notice>,
 }
 
-/// What the supervisor is told.
+/// What the supervisor is told: by the client, and by the threads of one connection.
 #[derive(Debug)]
-enum Command {
-    Lifecycle(Lifecycle),
-    /// A reader reached EOF, or stopped reading.
-    Ended(Pipe),
-    /// The backlog passed its limit.
-    Unresponsive,
-    /// The stdout reader saw the reply to the shutdown request.
-    Replied,
+enum Notice {
+    /// From the client.
+    Control(Lifecycle),
+    /// A reader of connection `generation` reached EOF or stopped reading.
+    Ended { generation: Generation, pipe: Pipe },
+    /// The writer of connection `generation` could not write.
+    WriteFailed(Generation),
+    /// The hung-server guard of connection `generation` tripped.
+    Backlog(Generation),
+    /// The stdout reader of connection `generation` saw the reply to the shutdown request.
+    Replied(Generation),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Pipe {
     Stdout,
     Stderr,
 }
 
-/// Owns the server process: reaps it, kills it, and reports how it stopped.
+/// Owns the server process across its generations: reaps it, kills it, starts it again, and
+/// reports each loss for the client to decide on.
 struct Supervisor {
-    child: Child,
-    /// `None` once every sender is gone; the supervisor then sleeps between checks.
-    commands: Option<mpsc::Receiver<Command>>,
+    command: process::Command,
+    /// The connection the supervisor is on. It runs ahead of the client by at most one, after
+    /// a loss, and then waits for the client's answer.
+    generation: Generation,
+    state: State,
+    /// Spawns since the last handshake; indexes the backoff.
+    retry: u32,
+    settings: Settings,
     events: Feed,
-    /// Its own handle on the queue, so `shutdown` and `exit` queue behind the client's messages.
-    link: Option<Link>,
-    /// Tells the stdout reader to look for the shutdown reply.
-    closing: Arc<AtomicBool>,
-    grace: Duration,
+    notices: mpsc::Receiver<Notice>,
+    /// Handed to the threads of each new connection.
+    sender: mpsc::Sender<Notice>,
 }
 
-/// What the supervisor has seen.
-#[derive(Debug, Default)]
-struct Watch {
-    /// Set once the process is reaped.
-    exit: Option<Exit>,
+enum State {
+    /// The process of the current generation runs.
+    Live(Process),
+    /// The process is gone (reaped); its readers get until `until` to reach EOF before the loss
+    /// is reported.
+    Draining {
+        readers: Readers,
+        reason: client::Reason,
+        until: Instant,
+    },
+    /// The loss is reported; waiting for the client's `Reconnect` or `Stop`.
+    Waiting,
+    /// Respawning at `until`.
+    Backoff { until: Instant },
+    /// The client chose not to reconnect.
+    Idle,
+    /// Running the shutdown sequence on `process`.
+    Closing {
+        process: Process,
+        sequence: lifecycle::Sequence,
+        ending: Ending,
+    },
+}
+
+/// Where a finished shutdown sequence leads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ending {
+    /// `Stopped(Shutdown)`, and the supervisor is done.
+    Stopped,
+    /// Waiting for the client, after it chose to stop a live connection.
+    Idle,
+}
+
+/// One server process, its outgoing queue, and what its readers reported.
+struct Process {
+    child: Child,
+    /// The supervisor's own handle on the queue, so `shutdown` and `exit` queue behind the
+    /// client's messages.
+    link: Link,
+    readers: Readers,
+}
+
+/// Which of one connection's readers reached EOF.
+struct Readers {
+    generation: Generation,
     stdout: bool,
     stderr: bool,
-    /// Set by `Lifecycle::Shutdown`.
-    shut: bool,
-    /// The shutdown handshake, while the process lives.
-    sequence: Option<lifecycle::Sequence>,
-    unresponsive: bool,
-    /// When the readers' grace period ends; set once the process is reaped.
-    drained: Option<Instant>,
+    /// Tells the stdout reader to look for the shutdown reply.
+    closing: Arc<AtomicBool>,
+}
+
+/// A started process whose readers wait for the go-ahead, so nothing it says reaches the
+/// client before the connection is announced.
+struct Spawned {
+    child: Child,
+    writer: Writer,
+    readers: Readers,
+    gates: [mpsc::Sender<()>; 2],
+}
+
+/// Why a process could not be started with the threads that serve it.
+enum Failure {
+    Spawn(io::Error),
+    Thread(io::Error),
 }
 
 /// How the process ended.
@@ -121,6 +194,15 @@ struct Watch {
 struct Exit {
     code: Option<i32>,
     signal: Option<i32>,
+}
+
+/// What ended a live connection.
+#[derive(Clone, Copy, Debug)]
+enum Cause {
+    /// Its process exited, its stdout closed, or a write failed.
+    Gone,
+    /// It stopped reading its input.
+    Unresponsive,
 }
 
 /// Splits stderr into lines across reads.
@@ -161,7 +243,7 @@ impl Writer {
         // Checked here, on the sending thread: the writer thread is the one stuck in
         // `write_all` when the server stops reading.
         if unwritten > self.backlog.limit && !self.backlog.tripped.swap(true, Ordering::Relaxed) {
-            let _ = self.commands.send(Command::Unresponsive);
+            let _ = self.notices.send(Notice::Backlog(self.generation));
         }
     }
 
@@ -184,145 +266,337 @@ impl Backlog {
 impl Control {
     /// Tells the supervisor what the client decided. Ignored once the supervisor has stopped.
     pub(crate) fn send(&self, lifecycle: Lifecycle) {
-        let _ = self.commands.send(Command::Lifecycle(lifecycle));
+        let _ = self.notices.send(Notice::Control(lifecycle));
     }
 }
 
 impl Supervisor {
     fn run(mut self) {
-        let mut watch = Watch::default();
         loop {
-            let timeout = if watch.armed() { POLL } else { IDLE };
-            match self.next(timeout) {
-                Some(Command::Lifecycle(Lifecycle::Shutdown { handshake })) => {
-                    self.shut_down(handshake, &mut watch);
-                }
-                Some(Command::Replied) => {
-                    if let (Some(sequence), Some(link)) = (&mut watch.sequence, &self.link) {
-                        sequence.replied(link, self.grace, Instant::now());
-                    }
-                }
-                Some(Command::Ended(Pipe::Stdout)) => {
-                    watch.stdout = true;
-                    // A live server whose stdout closed can't answer any more. During a shutdown
-                    // the sequence's deadlines decide instead, so a server finishing its exit
-                    // isn't cut short.
-                    if watch.exit.is_none() && !watch.shut {
-                        watch.exit = Some(self.reap());
-                    }
-                }
-                Some(Command::Ended(Pipe::Stderr)) => watch.stderr = true,
-                Some(Command::Unresponsive) if watch.exit.is_none() && !watch.shut => {
-                    watch.unresponsive = true;
-                    watch.exit = Some(self.kill());
-                }
-                Some(Command::Unresponsive) | None => {}
-            }
-            let now = Instant::now();
-            if watch.exit.is_none() {
-                watch.exit = match self.child.try_wait() {
-                    Ok(Some(status)) => Some(Exit::from(status)),
-                    Ok(None) => self.expire(&mut watch, now),
-                    Err(_) => Some(Exit::UNKNOWN),
-                };
-            }
-            if let Some(exit) = watch.exit {
-                watch.sequence = None;
-                self.link = None;
-                // Everything a reader sent before its EOF is ahead of this `Stopped`, so no late
-                // frame or stderr line follows it.
-                let drained = *watch.drained.get_or_insert(now + self.grace);
-                if (watch.stdout && watch.stderr) || now >= drained {
-                    let _ = self
-                        .events
-                        .unbounded_send(transport::Event::Stopped(watch.reason(exit)));
+            if let Some(notice) = self.next() {
+                if self.notice(notice, Instant::now()).is_break() {
                     return;
                 }
             }
-        }
-    }
-
-    /// The next command, or `None` once `timeout` passes.
-    fn next(&mut self, timeout: Duration) -> Option<Command> {
-        let Some(commands) = &self.commands else {
-            thread::sleep(timeout);
-            return None;
-        };
-        match commands.recv_timeout(timeout) {
-            Ok(command) => Some(command),
-            Err(mpsc::RecvTimeoutError::Timeout) => None,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                self.commands = None;
-                None
+            if self.tick(Instant::now()).is_break() {
+                return;
             }
         }
     }
 
-    /// Starts the shutdown handshake behind the client's messages. Its deadlines run from the
-    /// command, since a writer blocked on a full pipe never closes stdin.
-    fn shut_down(&mut self, handshake: Handshake, watch: &mut Watch) {
-        if watch.shut {
+    /// The next notice, or `None` once the current state's wait is over.
+    fn next(&self) -> Option<Notice> {
+        let now = Instant::now();
+        let wait = match &self.state {
+            // A live process usually announces its end through its stdout reader; the timeout
+            // catches one whose pipes a grandchild holds open.
+            State::Live(_) => Some(IDLE),
+            State::Closing { sequence, .. } => {
+                Some(POLL.min(sequence.until().saturating_duration_since(now)))
+            }
+            State::Draining { until, .. } | State::Backoff { until } => {
+                Some(until.saturating_duration_since(now))
+            }
+            State::Waiting | State::Idle => None,
+        };
+        let received = match wait {
+            Some(wait) => match self.notices.recv_timeout(wait) {
+                Ok(notice) => Ok(notice),
+                Err(mpsc::RecvTimeoutError::Timeout) => return None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+            },
+            None => self.notices.recv(),
+        };
+        Some(received.expect("the supervisor holds a sender of its own inbox"))
+    }
+
+    fn notice(&mut self, notice: Notice, now: Instant) -> ControlFlow<()> {
+        match notice {
+            Notice::Control(lifecycle) => return self.control(lifecycle, now),
+            Notice::Ended { generation, pipe } => self.ended(generation, pipe, now),
+            Notice::WriteFailed(generation) => self.lose(generation, Cause::Gone, now),
+            Notice::Backlog(generation) => self.lose(generation, Cause::Unresponsive, now),
+            Notice::Replied(generation) => {
+                if let State::Closing {
+                    process, sequence, ..
+                } = &mut self.state
+                {
+                    if process.readers.generation == generation {
+                        sequence.replied(&process.link, self.settings.grace, now);
+                    }
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Acts on what the client decided, if it still applies to the current generation.
+    fn control(&mut self, lifecycle: Lifecycle, now: Instant) -> ControlFlow<()> {
+        let state = std::mem::replace(&mut self.state, State::Idle);
+        self.state = match (lifecycle, state) {
+            (
+                Lifecycle::Shutdown {
+                    generation,
+                    handshake,
+                },
+                State::Live(process),
+            ) => {
+                let handshake = if generation == self.generation {
+                    handshake
+                } else {
+                    Handshake::Pending
+                };
+                self.close(process, handshake, Ending::Stopped, now)
+            }
+            (
+                Lifecycle::Shutdown { .. },
+                State::Closing {
+                    process, sequence, ..
+                },
+            ) => State::Closing {
+                process,
+                sequence,
+                ending: Ending::Stopped,
+            },
+            // Nothing runs, or nothing that needs a goodbye: a pending respawn never happens.
+            (
+                Lifecycle::Shutdown { .. },
+                State::Draining { .. } | State::Waiting | State::Backoff { .. } | State::Idle,
+            ) => {
+                self.report(transport::Event::Stopped(client::Reason::Shutdown));
+                return ControlFlow::Break(());
+            }
+            (Lifecycle::Handshaken(generation), State::Live(process))
+                if generation == self.generation =>
+            {
+                self.retry = 0;
+                State::Live(process)
+            }
+            (Lifecycle::Reconnect(generation), State::Waiting) if generation == self.generation => {
+                State::Backoff {
+                    until: now + delay(self.settings.backoff, self.retry),
+                }
+            }
+            // A live connection is closed without `shutdown`, as a failed `initialize` needs.
+            (Lifecycle::Stop(generation), State::Live(process)) if generation == self.generation => {
+                self.generation = generation.next();
+                self.close(process, Handshake::Pending, Ending::Idle, now)
+            }
+            (
+                Lifecycle::Stop(generation),
+                State::Draining { .. } | State::Waiting | State::Backoff { .. } | State::Idle,
+            ) if generation == self.generation => {
+                self.generation = generation.next();
+                State::Idle
+            }
+            (
+                Lifecycle::Handshaken(_) | Lifecycle::Reconnect(_) | Lifecycle::Stop(_),
+                state,
+            ) => state,
+        };
+        ControlFlow::Continue(())
+    }
+
+    /// A reader of connection `generation` reached EOF. A live server whose stdout closed can't
+    /// answer any more.
+    fn ended(&mut self, generation: Generation, pipe: Pipe, now: Instant) {
+        let readers = match &mut self.state {
+            State::Live(process) => &mut process.readers,
+            State::Draining { readers, .. } => readers,
+            State::Waiting | State::Backoff { .. } | State::Idle | State::Closing { .. } => return,
+        };
+        if readers.generation != generation {
             return;
         }
-        watch.shut = true;
-        if let Some(link) = &self.link {
-            self.closing.store(true, Ordering::Relaxed);
-            watch.sequence = Some(lifecycle::Sequence::begin(
-                link,
-                handshake,
-                self.grace,
-                Instant::now(),
-            ));
+        match pipe {
+            Pipe::Stdout => readers.stdout = true,
+            Pipe::Stderr => readers.stderr = true,
+        }
+        if pipe == Pipe::Stdout {
+            self.lose(generation, Cause::Gone, now);
         }
     }
 
-    /// Moves the shutdown sequence on once its deadline passed, and kills when it says so.
-    fn expire(&mut self, watch: &mut Watch, now: Instant) -> Option<Exit> {
-        let (Some(sequence), Some(link)) = (&mut watch.sequence, &self.link) else {
-            return None;
+    /// Connection `generation` ended while live: kill and reap its process.
+    fn lose(&mut self, generation: Generation, cause: Cause, now: Instant) {
+        let state = std::mem::replace(&mut self.state, State::Idle);
+        self.state = match state {
+            State::Live(process) if process.readers.generation == generation => {
+                self.drain(process, cause, now)
+            }
+            state => state,
         };
-        if now < sequence.until() {
-            return None;
-        }
-        match sequence.expired(link, self.grace, now) {
-            lifecycle::Next::Wait => None,
-            lifecycle::Next::Kill => Some(self.kill()),
+    }
+
+    /// What time alone moves on: a process that exited, a drain or a backoff that ran out, a
+    /// shutdown step whose deadline passed.
+    fn tick(&mut self, now: Instant) -> ControlFlow<()> {
+        let state = std::mem::replace(&mut self.state, State::Idle);
+        self.state = match state {
+            State::Live(mut process) => match process.child.try_wait() {
+                Ok(None) => State::Live(process),
+                Ok(Some(_)) | Err(_) => self.drain(process, Cause::Gone, now),
+            },
+            // Everything a reader sent before its EOF is ahead of the loss, so the crash text
+            // comes first and no late reply lands after the session let go of its requests.
+            State::Draining {
+                readers,
+                reason,
+                until,
+            } => {
+                if (readers.stdout && readers.stderr) || now >= until {
+                    self.generation = self.generation.next();
+                    self.report(transport::Event::Lost {
+                        generation: self.generation,
+                        reason,
+                    });
+                    State::Waiting
+                } else {
+                    State::Draining {
+                        readers,
+                        reason,
+                        until,
+                    }
+                }
+            }
+            State::Backoff { until } if now >= until => self.connect(),
+            State::Closing {
+                mut process,
+                mut sequence,
+                ending,
+            } => {
+                let over = match process.child.try_wait() {
+                    Ok(Some(_)) | Err(_) => true,
+                    Ok(None) if now >= sequence.until() => {
+                        sequence.expired(&process.link, self.settings.grace, now)
+                            == lifecycle::Next::Kill
+                    }
+                    Ok(None) => false,
+                };
+                if !over {
+                    State::Closing {
+                        process,
+                        sequence,
+                        ending,
+                    }
+                } else {
+                    // Whatever the exit status, even after a kill, this is the shutdown.
+                    let _ = process.end();
+                    match ending {
+                        Ending::Stopped => {
+                            self.report(transport::Event::Stopped(client::Reason::Shutdown));
+                            return ControlFlow::Break(());
+                        }
+                        Ending::Idle => State::Idle,
+                    }
+                }
+            }
+            state @ (State::Backoff { .. } | State::Waiting | State::Idle) => state,
+        };
+        ControlFlow::Continue(())
+    }
+
+    /// Starts the shutdown sequence on `process`, behind everything the client queued.
+    fn close(&self, process: Process, handshake: Handshake, ending: Ending, now: Instant) -> State {
+        process.readers.closing.store(true, Ordering::Relaxed);
+        let sequence =
+            lifecycle::Sequence::begin(&process.link, handshake, self.settings.grace, now);
+        State::Closing {
+            process,
+            sequence,
+            ending,
         }
     }
 
-    /// Reaps a process that may already be exiting, killing it if it isn't.
-    fn reap(&mut self) -> Exit {
-        match self.child.try_wait() {
-            Ok(Some(status)) => Exit::from(status),
-            Ok(None) | Err(_) => self.kill(),
+    /// Kills and reaps `process`, and lets its readers drain for one grace period.
+    fn drain(&self, mut process: Process, cause: Cause, now: Instant) -> State {
+        let exit = process.end();
+        let reason = match cause {
+            Cause::Gone => client::Reason::Exited {
+                code: exit.code,
+                signal: exit.signal,
+            },
+            Cause::Unresponsive => client::Reason::Unresponsive,
+        };
+        State::Draining {
+            readers: process.readers,
+            reason,
+            until: now + self.settings.grace,
         }
     }
 
-    /// Kills and reaps, so no zombie is left.
-    fn kill(&mut self) -> Exit {
+    /// Starts the process of the current generation. The connection is announced before its
+    /// readers start, so the client holds it before anything it sends arrives.
+    fn connect(&mut self) -> State {
+        let delay = delay(self.settings.backoff, self.retry);
+        self.retry = self.retry.saturating_add(1);
+        match launch(
+            &mut self.command,
+            self.generation,
+            &self.settings,
+            &self.events,
+            &self.sender,
+        ) {
+            Ok(spawned) => {
+                self.report(transport::Event::Reconnected {
+                    generation: self.generation,
+                    link: Link::Stdio(spawned.writer.clone()),
+                });
+                State::Live(spawned.start())
+            }
+            Err(Failure::Spawn(error) | Failure::Thread(error)) => {
+                self.report(transport::Event::Attempting {
+                    generation: self.generation,
+                    failure: Arc::new(error),
+                });
+                State::Backoff {
+                    until: Instant::now() + delay,
+                }
+            }
+        }
+    }
+
+    fn report(&self, event: transport::Event) {
+        // `Events` was dropped: nobody is left to tell.
+        let _ = self.events.unbounded_send(event);
+    }
+}
+
+impl Process {
+    /// Reaps the process, killing it first if it still runs, so no zombie is left and two
+    /// servers never run at once.
+    fn end(&mut self) -> Exit {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return Exit::from(status);
+        }
         let _ = self.child.kill();
         self.child.wait().map_or(Exit::UNKNOWN, Exit::from)
     }
 }
 
-impl Watch {
-    /// Whether a deadline is running, so the supervisor polls at `POLL`.
-    fn armed(&self) -> bool {
-        self.shut || self.exit.is_some()
+impl Spawned {
+    /// Lets the readers start, and hands the process over.
+    fn start(self) -> Process {
+        let Self {
+            child,
+            writer,
+            readers,
+            gates,
+        } = self;
+        for gate in gates {
+            let _ = gate.send(());
+        }
+        Process {
+            child,
+            link: Link::Stdio(writer),
+            readers,
+        }
     }
 
-    /// A shutdown the client asked for wins, even if the process then had to be killed.
-    fn reason(&self, exit: Exit) -> client::Reason {
-        if self.shut {
-            client::Reason::Shutdown
-        } else if self.unresponsive {
-            client::Reason::Unresponsive
-        } else {
-            client::Reason::Exited {
-                code: exit.code,
-                signal: exit.signal,
-            }
-        }
+    /// Kills and reaps the process; its readers never start.
+    fn abandon(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -378,43 +652,12 @@ impl Lines {
     }
 }
 
-/// A stdio link whose queue a test reads instead of a writer thread.
-#[cfg(test)]
-pub(crate) struct Tap(mpsc::Receiver<Item>);
 
-#[cfg(test)]
-impl Tap {
-    /// The link, and the tap on its queue. Its guard never trips.
-    pub(crate) fn link() -> (Link, Self) {
-        let (queue, outgoing) = mpsc::channel();
-        let (commands, _) = mpsc::channel();
-        let writer = Writer {
-            queue,
-            backlog: Arc::new(Backlog::new(usize::MAX)),
-            commands,
-        };
-        (Link::Stdio(writer), Self(outgoing))
-    }
-
-    /// What was queued since the last call: each body as JSON, `None` for the close.
-    pub(crate) fn items(&self) -> Vec<Option<serde_json::Value>> {
-        self.0
-            .try_iter()
-            .map(|item| match item {
-                Item::Body(body) => {
-                    Some(serde_json::from_slice(&body).expect("queued bodies are JSON"))
-                }
-                Item::Close => None,
-            })
-            .collect()
-    }
-}
-
-/// Starts `command` with piped stdio and the four threads that serve it.
+/// Starts `command` with piped stdio, the threads that serve it, and the supervisor that owns
+/// it from then on.
 pub(crate) fn spawn(
-    command: &mut process::Command,
-    grace: Duration,
-    limit: usize,
+    mut command: process::Command,
+    settings: Settings,
 ) -> Result<Started, builder::Error> {
     command
         .stdin(Stdio::piped())
@@ -425,84 +668,145 @@ pub(crate) fn spawn(
         use std::os::windows::process::CommandExt;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = command.spawn().map_err(builder::Error::Spawn)?;
+    let (sender, notices) = mpsc::channel();
+    let (events, incoming) = futures_channel::mpsc::unbounded();
+    let generation = Generation::FIRST;
+    let spawned =
+        launch(&mut command, generation, &settings, &events, &sender).map_err(|failure| {
+            match failure {
+                Failure::Spawn(error) => builder::Error::Spawn(error),
+                Failure::Thread(error) => builder::Error::Thread(error),
+            }
+        })?;
+    let writer = spawned.writer.clone();
+    let control = Control {
+        notices: sender.clone(),
+    };
+    let (handoff, slot) = mpsc::sync_channel(1);
+    let supervisor = move || {
+        if let Ok((command, spawned)) = slot.recv() {
+            let supervisor = Supervisor {
+                command,
+                generation,
+                state: State::Live(Spawned::start(spawned)),
+                retry: 1,
+                settings,
+                events,
+                notices,
+                sender,
+            };
+            supervisor.run();
+        }
+    };
+    // The supervisor gets its process only once its thread runs, so a failed start leaves the
+    // process here to be killed.
+    if let Err(error) = start("scrive-lsp supervisor".to_owned(), supervisor) {
+        spawned.abandon();
+        return Err(builder::Error::Thread(error));
+    }
+    handoff
+        .send((command, spawned))
+        .expect("the supervisor waits for its process before anything else");
+    Ok(Started {
+        writer,
+        control,
+        events: incoming,
+    })
+}
+
+/// Starts `command` as connection `generation`, with its writer and its readers, which wait for
+/// [`Spawned::start`].
+fn launch(
+    command: &mut process::Command,
+    generation: Generation,
+    settings: &Settings,
+    events: &Feed,
+    notices: &mpsc::Sender<Notice>,
+) -> Result<Spawned, Failure> {
+    let mut child = command.spawn().map_err(Failure::Spawn)?;
     let stdin = child.stdin.take().expect("stdin is piped");
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
 
     let (queue, outgoing) = mpsc::channel();
-    let (commands, received) = mpsc::channel();
-    let (events, incoming) = futures_channel::mpsc::unbounded();
-    let backlog = Arc::new(Backlog::new(limit));
-    let closing = Arc::new(AtomicBool::new(false));
+    let backlog = Arc::new(Backlog::new(settings.limit));
     let writer = Writer {
         queue,
         backlog: Arc::clone(&backlog),
-        commands: commands.clone(),
+        notices: notices.clone(),
+        generation,
     };
-    let (handoff, slot) = mpsc::sync_channel(1);
+    let closing = Arc::new(AtomicBool::new(false));
+    let (stdout_gate, stdout_opened) = mpsc::channel();
+    let (stderr_gate, stderr_opened) = mpsc::channel::<()>();
 
-    let supervisor = {
-        let (events, link, closing) = (
-            events.clone(),
-            Link::Stdio(writer.clone()),
-            Arc::clone(&closing),
-        );
+    let writing = {
+        let notices = notices.clone();
+        move || write(stdin, &outgoing, &backlog, &notices, generation)
+    };
+    let reading = {
+        let (events, notices, closing) = (events.clone(), notices.clone(), Arc::clone(&closing));
         move || {
-            if let Ok(child) = slot.recv() {
-                let supervisor = Supervisor {
-                    child,
-                    commands: Some(received),
-                    events,
-                    link: Some(link),
-                    closing,
-                    grace,
-                };
-                supervisor.run();
+            if stdout_opened.recv().is_ok() {
+                read(stdout, &events, &notices, generation, &closing);
             }
         }
     };
-    let reader = {
-        let (events, commands) = (events.clone(), commands.clone());
-        move || read(stdout, &events, &commands, &closing)
+    let draining = {
+        let (events, notices) = (events.clone(), notices.clone());
+        move || {
+            if stderr_opened.recv().is_ok() {
+                drain(stderr, &events, &notices, generation);
+            }
+        }
     };
-    let stderr_reader = {
-        let commands = commands.clone();
-        move || drain(stderr, &events, &commands)
-    };
-    // The supervisor starts first and gets its child only once every thread runs, so a failed
-    // spawn leaves the child here to be killed.
-    let started = start("supervisor", supervisor)
-        .and_then(|()| start("writer", move || write(stdin, &outgoing, &backlog)))
-        .and_then(|()| start("reader", reader))
-        .and_then(|()| start("stderr", stderr_reader));
+    let name = |role: &str| format!("scrive-lsp {role} #{generation}");
+    let started = start(name("writer"), writing)
+        .and_then(|()| start(name("reader"), reading))
+        .and_then(|()| start(name("stderr"), draining));
     if let Err(error) = started {
-        // The threads already running end on their own: the supervisor's hand-off closes, and
-        // the readers see EOF once the process is gone.
+        // The threads already running end on their own: the writer's queue closes with
+        // `writer`, and the readers' gates close unopened.
         let _ = child.kill();
         let _ = child.wait();
-        return Err(builder::Error::Thread(error));
+        return Err(Failure::Thread(error));
     }
-    handoff
-        .send(child)
-        .expect("the supervisor waits for its child before anything else");
-    Ok(Started {
+    Ok(Spawned {
+        child,
         writer,
-        control: Control { commands },
-        events: incoming,
+        readers: Readers {
+            generation,
+            stdout: false,
+            stderr: false,
+            closing,
+        },
+        gates: [stdout_gate, stderr_gate],
     })
 }
 
-fn start(role: &str, body: impl FnOnce() + Send + 'static) -> io::Result<()> {
-    thread::Builder::new()
-        .name(format!("scrive-lsp {role}"))
-        .spawn(body)
-        .map(drop)
+fn start(name: String, body: impl FnOnce() + Send + 'static) -> io::Result<()> {
+    thread::Builder::new().name(name).spawn(body).map(drop)
+}
+
+/// The wait before respawn number `retry`: `base`, growing ×1.3 per retry up to 10 s.
+fn delay(base: Duration, retry: u32) -> Duration {
+    if base.is_zero() {
+        return Duration::ZERO;
+    }
+    let exponent = i32::try_from(retry).unwrap_or(i32::MAX);
+    Duration::try_from_secs_f64(base.as_secs_f64() * GROWTH.powi(exponent))
+        .map_or(CAP, |delay| delay.min(CAP))
 }
 
 /// Frames and writes every queued body until the close, or until every `Writer` is gone, then
-/// closes stdin by dropping it. A write error means the server died; its stdout EOF reports that.
-fn write(mut stdin: ChildStdin, outgoing: &mpsc::Receiver<Item>, backlog: &Backlog) {
+/// closes stdin by dropping it.
+fn write(
+    mut stdin: ChildStdin,
+    outgoing: &mpsc::Receiver<Item>,
+    backlog: &Backlog,
+    notices: &mpsc::Sender<Notice>,
+    generation: Generation,
+) {
     for item in outgoing {
         let Item::Body(body) = item else {
             return;
@@ -510,6 +814,7 @@ fn write(mut stdin: ChildStdin, outgoing: &mpsc::Receiver<Item>, backlog: &Backl
         let written = stdin.write_all(&frame::encode(&body));
         backlog.unwritten.fetch_sub(body.len(), Ordering::Relaxed);
         if written.is_err() {
+            let _ = notices.send(Notice::WriteFailed(generation));
             return;
         }
     }
@@ -521,11 +826,18 @@ fn write(mut stdin: ChildStdin, outgoing: &mpsc::Receiver<Item>, backlog: &Backl
 fn read(
     mut stdout: impl Read,
     events: &Feed,
-    commands: &mpsc::Sender<Command>,
+    notices: &mpsc::Sender<Notice>,
+    generation: Generation,
     closing: &AtomicBool,
 ) {
     let mut decoder = frame::Decoder::default();
     let mut chunk = vec![0; CHUNK];
+    let sink = Sink {
+        events,
+        notices,
+        generation,
+        closing,
+    };
     loop {
         let read = match stdout.read(&mut chunk) {
             Ok(0) => break,
@@ -533,53 +845,72 @@ fn read(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
-        if !deliver(decoder.push(&chunk[..read]), events, commands, closing) {
+        if !sink.deliver(decoder.push(&chunk[..read])) {
             break;
         }
     }
     if let Some(line) = decoder.finish() {
         let _ = events.unbounded_send(transport::Event::Log(Arc::from([log::Entry::stdout(line)])));
     }
-    let _ = commands.send(Command::Ended(Pipe::Stdout));
+    let _ = notices.send(Notice::Ended {
+        generation,
+        pipe: Pipe::Stdout,
+    });
 }
 
-/// Forwards one read's items in order, consecutive noise lines as one log batch. `false` once
-/// the stream is corrupt.
-fn deliver(
-    items: Vec<frame::Item>,
-    events: &Feed,
-    commands: &mpsc::Sender<Command>,
-    closing: &AtomicBool,
-) -> bool {
-    let mut noise = Vec::new();
-    for item in items {
-        let (event, corrupt) = match item {
-            frame::Item::Noise(text) => {
-                noise.push(log::Entry::stdout(text));
-                continue;
+/// Where the stdout reader of one connection sends what it decodes.
+struct Sink<'a> {
+    events: &'a Feed,
+    notices: &'a mpsc::Sender<Notice>,
+    generation: Generation,
+    closing: &'a AtomicBool,
+}
+
+impl Sink<'_> {
+    /// Forwards one read's items in order, consecutive noise lines as one log batch. `false`
+    /// once the stream is corrupt.
+    fn deliver(&self, items: Vec<frame::Item>) -> bool {
+        let generation = self.generation;
+        let mut noise = Vec::new();
+        for item in items {
+            let (event, corrupt) = match item {
+                frame::Item::Noise(text) => {
+                    noise.push(log::Entry::stdout(text));
+                    continue;
+                }
+                frame::Item::Body(body)
+                    if self.closing.load(Ordering::Relaxed)
+                        && lifecycle::is_shutdown_reply(&body) =>
+                {
+                    let _ = self.notices.send(Notice::Replied(generation));
+                    continue;
+                }
+                frame::Item::Body(body) => (
+                    transport::Event::Message {
+                        generation,
+                        body: Arc::from(body),
+                    },
+                    false,
+                ),
+                frame::Item::Skipped { length } => (self.oversized(length), false),
+                frame::Item::Corrupt { length } => (self.oversized(length), true),
+            };
+            flush(&mut noise, self.events);
+            let _ = self.events.unbounded_send(event);
+            if corrupt {
+                return false;
             }
-            frame::Item::Body(body)
-                if closing.load(Ordering::Relaxed) && lifecycle::is_shutdown_reply(&body) =>
-            {
-                let _ = commands.send(Command::Replied);
-                continue;
-            }
-            frame::Item::Body(body) => (transport::Event::Message(Arc::from(body)), false),
-            frame::Item::Skipped { length } => (oversized(length), false),
-            frame::Item::Corrupt { length } => (oversized(length), true),
-        };
-        flush(&mut noise, events);
-        let _ = events.unbounded_send(event);
-        if corrupt {
-            return false;
+        }
+        flush(&mut noise, self.events);
+        true
+    }
+
+    fn oversized(&self, length: u64) -> transport::Event {
+        transport::Event::Error {
+            generation: self.generation,
+            error: client::Error::Oversized { length },
         }
     }
-    flush(&mut noise, events);
-    true
-}
-
-fn oversized(length: u64) -> transport::Event {
-    transport::Event::Error(client::Error::Oversized { length })
 }
 
 /// Sends the batched noise lines as one log event, if there are any.
@@ -591,7 +922,12 @@ fn flush(noise: &mut Vec<log::Entry>, events: &Feed) {
 
 /// Reads stderr until EOF, one log event per read with one entry per line, then tells the
 /// supervisor.
-fn drain(mut stderr: impl Read, events: &Feed, commands: &mpsc::Sender<Command>) {
+fn drain(
+    mut stderr: impl Read,
+    events: &Feed,
+    notices: &mpsc::Sender<Notice>,
+    generation: Generation,
+) {
     let mut lines = Lines::default();
     let mut chunk = vec![0; CHUNK];
     loop {
@@ -603,7 +939,10 @@ fn drain(mut stderr: impl Read, events: &Feed, commands: &mpsc::Sender<Command>)
         }
     }
     send_lines(lines.finish().into_iter().collect(), events);
-    let _ = commands.send(Command::Ended(Pipe::Stderr));
+    let _ = notices.send(Notice::Ended {
+        generation,
+        pipe: Pipe::Stderr,
+    });
 }
 
 fn send_lines(lines: Vec<String>, events: &Feed) {
@@ -612,6 +951,71 @@ fn send_lines(lines: Vec<String>, events: &Feed) {
     }
     let entries: Arc<[log::Entry]> = lines.into_iter().map(log::Entry::stderr).collect();
     let _ = events.unbounded_send(transport::Event::Log(entries));
+}
+
+/// Stand-ins for a writer thread and a supervisor, for tests that read what the client sends.
+#[cfg(test)]
+pub(crate) mod tap {
+    use std::sync::{mpsc, Arc};
+
+    use super::{Backlog, Control, Item, Notice, Writer};
+    use crate::transport::{Generation, Lifecycle, Link};
+
+    /// A stdio link's queue, read by the test instead of a writer thread.
+    pub(crate) struct Queue(mpsc::Receiver<Item>);
+
+    /// A supervisor's inbox, read by the test.
+    pub(crate) struct Inbox(mpsc::Receiver<Notice>);
+
+    impl Queue {
+        /// A link of connection `generation`, and the tap on its queue. Its guard never trips.
+        pub(crate) fn link(generation: Generation) -> (Link, Self) {
+            let (queue, outgoing) = mpsc::channel();
+            let (notices, _) = mpsc::channel();
+            let writer = Writer {
+                queue,
+                backlog: Arc::new(Backlog::new(usize::MAX)),
+                notices,
+                generation,
+            };
+            (Link::Stdio(writer), Self(outgoing))
+        }
+
+        /// What was queued since the last call: each body as JSON, `None` for the close.
+        pub(crate) fn items(&self) -> Vec<Option<serde_json::Value>> {
+            self.0
+                .try_iter()
+                .map(|item| match item {
+                    Item::Body(body) => {
+                        Some(serde_json::from_slice(&body).expect("queued bodies are JSON"))
+                    }
+                    Item::Close => None,
+                })
+                .collect()
+        }
+    }
+
+    impl Inbox {
+        /// A control line to nobody but the test.
+        pub(crate) fn control() -> (Control, Self) {
+            let (notices, inbox) = mpsc::channel();
+            (Control { notices }, Self(inbox))
+        }
+
+        /// What the client told the supervisor since the last call.
+        pub(crate) fn lifecycles(&self) -> Vec<Lifecycle> {
+            self.0
+                .try_iter()
+                .filter_map(|notice| match notice {
+                    Notice::Control(lifecycle) => Some(lifecycle),
+                    Notice::Ended { .. }
+                    | Notice::WriteFailed(_)
+                    | Notice::Backlog(_)
+                    | Notice::Replied(_) => None,
+                })
+                .collect()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -638,7 +1042,7 @@ mod tests {
     }
 
     fn body(event: &transport::Event) -> Option<&[u8]> {
-        let transport::Event::Message(body) = event else {
+        let transport::Event::Message { body, .. } = event else {
             return None;
         };
         Some(body)
@@ -652,8 +1056,14 @@ mod tests {
         stdout.extend(b"a\nb\n");
         stdout.extend(frame::encode(b"{\"b\":2}"));
         let (events, incoming) = futures_channel::mpsc::unbounded();
-        let (commands, received) = mpsc::channel();
-        read(stdout.as_slice(), &events, &commands, &AtomicBool::new(false));
+        let (notices, received) = mpsc::channel();
+        read(
+            stdout.as_slice(),
+            &events,
+            &notices,
+            Generation::FIRST,
+            &AtomicBool::new(false),
+        );
         let events = sent(incoming);
         assert_eq!(events.len(), 4, "four events: {events:?}");
         assert_eq!(texts(&events[0]), Some(vec!["banner"]), "the banner");
@@ -669,7 +1079,13 @@ mod tests {
             "the second frame"
         );
         assert!(
-            matches!(received.try_recv(), Ok(Command::Ended(Pipe::Stdout))),
+            matches!(
+                received.try_recv(),
+                Ok(Notice::Ended {
+                    pipe: Pipe::Stdout,
+                    ..
+                })
+            ),
             "the supervisor hears of the EOF"
         );
         assert!(
@@ -686,12 +1102,18 @@ mod tests {
         let reply = frame::encode(br#"{"id":"scrive-lsp/shutdown","result":null}"#);
         for (closing, forwarded) in [(false, 1), (true, 0)] {
             let (events, incoming) = futures_channel::mpsc::unbounded();
-            let (commands, received) = mpsc::channel();
-            read(reply.as_slice(), &events, &commands, &AtomicBool::new(closing));
+            let (notices, received) = mpsc::channel();
+            read(
+                reply.as_slice(),
+                &events,
+                &notices,
+                Generation::FIRST,
+                &AtomicBool::new(closing),
+            );
             assert_eq!(sent(incoming).len(), forwarded, "closing: {closing}");
             let replied = received
                 .try_iter()
-                .any(|command| matches!(command, Command::Replied));
+                .any(|notice| matches!(notice, Notice::Replied(_)));
             assert_eq!(replied, closing, "the supervisor hears of it while closing");
         }
     }
@@ -703,20 +1125,35 @@ mod tests {
         let mut stdout = b"Content-Length: 2000000000\r\n\r\n".to_vec();
         stdout.extend(frame::encode(b"{}"));
         let (events, incoming) = futures_channel::mpsc::unbounded();
-        let (commands, received) = mpsc::channel();
-        read(stdout.as_slice(), &events, &commands, &AtomicBool::new(false));
+        let (notices, received) = mpsc::channel();
+        read(
+            stdout.as_slice(),
+            &events,
+            &notices,
+            Generation::FIRST,
+            &AtomicBool::new(false),
+        );
         let events = sent(incoming);
         assert!(
             matches!(
                 events.as_slice(),
-                [transport::Event::Error(client::Error::Oversized {
-                    length: 2_000_000_000
-                })]
+                [transport::Event::Error {
+                    error: client::Error::Oversized {
+                        length: 2_000_000_000
+                    },
+                    ..
+                }]
             ),
             "only the error: {events:?}"
         );
         assert!(
-            matches!(received.try_recv(), Ok(Command::Ended(Pipe::Stdout))),
+            matches!(
+                received.try_recv(),
+                Ok(Notice::Ended {
+                    pipe: Pipe::Stdout,
+                    ..
+                })
+            ),
             "the supervisor hears of the end"
         );
     }
@@ -770,13 +1207,14 @@ mod tests {
     }
 
     /// A writer whose queue nobody drains, with room for `limit` bytes.
-    fn stalled(limit: usize) -> (Writer, mpsc::Receiver<Item>, mpsc::Receiver<Command>) {
+    fn stalled(limit: usize) -> (Writer, mpsc::Receiver<Item>, mpsc::Receiver<Notice>) {
         let (queue, outgoing) = mpsc::channel();
-        let (commands, received) = mpsc::channel();
+        let (notices, received) = mpsc::channel();
         let writer = Writer {
             queue,
             backlog: Arc::new(Backlog::new(limit)),
-            commands,
+            notices,
+            generation: Generation::FIRST,
         };
         (writer, outgoing, received)
     }
@@ -792,7 +1230,7 @@ mod tests {
         );
         writer.send(Arc::from(&b"123456"[..]));
         assert!(
-            matches!(received.try_recv(), Ok(Command::Unresponsive)),
+            matches!(received.try_recv(), Ok(Notice::Backlog(Generation::FIRST))),
             "past the limit the guard trips"
         );
         writer.send(Arc::from(&b"123456"[..]));
@@ -802,6 +1240,17 @@ mod tests {
             2,
             "the send after the trip is dropped"
         );
+    }
+
+    /// The backoff starts at its base, grows by 30% per retry and stops at 10 s.
+    #[test]
+    fn backoff_grows_by_thirty_percent_up_to_ten_seconds() {
+        let second = Duration::from_secs(1);
+        assert_eq!(delay(second, 0), second, "the base");
+        assert_eq!(delay(second, 1), Duration::from_millis(1300), "30% more");
+        assert_eq!(delay(second, 100), CAP, "capped");
+        assert_eq!(delay(second, u32::MAX), CAP, "still capped");
+        assert_eq!(delay(Duration::ZERO, 7), Duration::ZERO, "no backoff stays none");
     }
 
     /// A send that finds the writer gone takes its bytes back, so a dead writer never trips the

@@ -19,6 +19,7 @@
 //! - formatting → [`Client::format`]
 //! - inlay hints → [`Client::inlays`]; tooltips, label jumps and inserts → [`Client::interact`]
 //! - what the client hands back → [`Update`] ([`update`]), [`client::Status`], [`log`], [`trace`]
+//! - when a lost server starts again → [`restart`]
 //! - URI identity and file paths → [`uri`]
 //!
 //! Payloads are [`lsp_types`], and the in-process bridge takes an [`lsp_server`] connection;
@@ -37,6 +38,7 @@ mod inlay;
 pub mod log;
 mod markdown;
 mod message;
+pub mod restart;
 mod session;
 mod signature;
 mod snippet;
