@@ -660,6 +660,44 @@ fn listen_stops_closed_when_its_server_disconnects() {
     );
 }
 
+/// A server that dials in and never answers `initialize` stops the listen client at the deadline,
+/// and the timeout error comes right before the stop, as on the other bridges.
+#[test]
+fn listen_reports_an_initialize_timeout_before_it_stops() {
+    let timeout = Duration::from_millis(300);
+    let mut harness = Harness::new(
+        builder()
+            .initialize_timeout(timeout)
+            .listen(loopback())
+            .expect("the port binds"),
+    );
+    let address = harness.client.listening_on().expect("a listen client");
+    let mut peer = Peer::new(TcpStream::connect(address).expect("the client listens"));
+    assert!(
+        matches!(peer.read(), Some(Message::Request(request)) if request.method == "initialize"),
+        "the client opens with initialize"
+    );
+    let end = harness.to_end();
+    let [.., error, status] = end.as_slice() else {
+        panic!("an error and a stop: {end:#?}");
+    };
+    assert!(
+        matches!(error, Update::Error(client::Error::Timeout { after }) if *after == timeout),
+        "the timeout error comes right before the stop: {end:#?}"
+    );
+    assert_eq!(
+        stopped(status),
+        Some(&Reason::Timeout),
+        "the stop is last and says timeout: {end:#?}"
+    );
+    assert_eq!(
+        statuses(&end),
+        [Status::Stopped(Reason::Timeout)],
+        "one stop: {end:#?}"
+    );
+    drop(peer);
+}
+
 /// A listener no server dialed closes on shutdown and on drop, and its port is free again.
 #[test]
 fn listen_releases_its_port_when_shut_down_before_any_dial() {

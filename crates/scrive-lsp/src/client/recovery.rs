@@ -55,6 +55,16 @@ impl State {
     pub(super) fn generation(&self) -> Generation {
         self.generation
     }
+
+    /// The error that reports `reason`, when it is an `initialize` deadline that ran out.
+    pub(super) fn timed_out(&self, reason: &Reason) -> Option<Update> {
+        (*reason == Reason::Timeout).then(|| {
+            let after = self
+                .initialize_timeout
+                .expect("only an armed deadline runs out");
+            Update::Error(Error::Timeout { after })
+        })
+    }
 }
 
 impl Client {
@@ -88,13 +98,7 @@ impl Client {
         let live = matches!(self.connection, Connection::Live { .. });
         self.connection = Connection::Reconnecting;
         let mut updates = Vec::new();
-        if reason == Reason::Timeout {
-            let after = self
-                .recovery
-                .initialize_timeout
-                .expect("only an armed deadline runs out");
-            updates.push(Update::Error(Error::Timeout { after }));
-        }
+        updates.extend(self.recovery.timed_out(&reason));
         if live {
             updates.extend(self.disconnect());
         }
