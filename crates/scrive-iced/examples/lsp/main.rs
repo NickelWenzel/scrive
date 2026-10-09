@@ -4,10 +4,10 @@
 //! cargo run -p scrive-iced --features lsp --example lsp
 //! ```
 //!
-//! The server (`server.rs`) runs in-process, so there's no transport to set up. It answers
-//! `initialize`, completion, signature help and hover with canned JSON, and computes
-//! diagnostics (trailing whitespace), goto definition, rename, formatting and inlay hints from
-//! the text the client sent it. The right-hand panel shows the traffic. Try:
+//! The server (`server.rs`) runs in-process on the memory bridge, so there's no process to
+//! start. It answers `initialize`, completion, signature help and hover with canned JSON, and
+//! computes diagnostics (trailing whitespace), goto definition, rename, formatting and inlay
+//! hints from the text the client sent it. The right-hand panel shows the client's traces. Try:
 //!
 //! - F12 on `greet` in main.rs: the util.rs tab opens with the definition selected;
 //! - F2 on `greet`, type a new name, Enter: both files change;
@@ -19,8 +19,9 @@
 //! - hovering a hint: its tooltip, resolved by the server;
 //! - Ctrl+I (Cmd+I on macOS): hints off and on.
 //!
-//! The wiring is the one a real host uses: sync after every editor update, route each
-//! `Update::Document` to the tab that owns it, and hand a cross-file jump to the target tab.
+//! The wiring is the one a real host uses: run the client's event stream, sync after every editor
+//! update, route each `Update::Document` to the tab that owns it, and hand a cross-file jump to
+//! the target tab.
 
 // On Windows, a release build is a GUI app with no console window.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -66,12 +67,14 @@ struct Tab {
     editor: CodeEditor,
 }
 
-/// The application: two tabs on one language-server client, and the wire to the server.
+/// The application: two tabs on one language-server client, the in-process server, and the
+/// traffic log.
 struct App {
     client: lsp::Client,
     tabs: Vec<Tab>,
     active: tab::Id,
-    transport: Transport,
+    server: server::Scripted,
+    traffic: Traffic,
     /// Whether inlay hints show; Ctrl+I flips it for every tab.
     hints: bool,
 }
@@ -80,28 +83,29 @@ struct App {
 enum Message {
     /// A message from one tab's editor.
     Editor(tab::Id, Event),
-    /// A JSON-RPC message from the server.
-    Lsp(lsp::Message),
-    /// Take the server's next queued reply off the wire.
-    Deliver,
+    /// An event from the client's stream.
+    Lsp(lsp::client::Event),
     /// A tab button was pressed.
     Select(tab::Id),
     /// Ctrl+I: turn inlay hints off or on.
     ToggleHints,
 }
 
-/// The app-owned transport: here, a scripted server in the same process, plus a log of
-/// everything that crossed it. A real host would hold a child process's pipes or a socket.
+/// The traffic panel's lines: the client's traces, and notes on what the app did.
 #[derive(Default)]
-struct Transport {
-    server: server::Scripted,
-    traffic: VecDeque<String>,
+struct Traffic {
+    lines: VecDeque<String>,
 }
 
 impl App {
-    fn new() -> (Self, Task<Message>) {
-        let (mut client, initialize) = lsp::Client::builder().root(uri(ROOT)).build();
-        let mut outgoing = vec![initialize];
+    /// The app and its client's event stream, before anything runs it. Tests drain the stream
+    /// themselves.
+    fn boot() -> (Self, lsp::client::Events) {
+        let (near, far) = lsp::lsp_server::Connection::memory();
+        let (mut client, events) = lsp::Client::builder()
+            .root(uri(ROOT))
+            .trace(lsp::trace::Mode::Messages)
+            .memory(near);
         let mut tabs = Vec::new();
         for (index, (title, path, source)) in [
             ("main.rs", MAIN_URI, MAIN_RS),
@@ -116,62 +120,56 @@ impl App {
                 .inlay_hints(true);
             // Before the handshake completes, this only records the text. The didOpen goes
             // out with `initialized`.
-            outgoing.extend(
-                editor
-                    .open_lsp(&mut client, &uri(path), "rust")
-                    .expect("the demo's URIs are distinct"),
-            );
+            editor
+                .open_lsp(&mut client, &uri(path), "rust")
+                .expect("the demo's URIs are distinct");
             tabs.push(Tab {
                 id: tab::Id(index),
                 title,
                 editor,
             });
         }
-        let mut transport = Transport::default();
-        let task = transport.send(outgoing);
-        (
-            Self {
-                client,
-                tabs,
-                active: tab::Id(0),
-                transport,
-                hints: true,
-            },
-            task,
-        )
+        let mut server = server::Scripted::new(far);
+        server.step();
+        let app = Self {
+            client,
+            tabs,
+            active: tab::Id(0),
+            server,
+            traffic: Traffic::default(),
+            hints: true,
+        };
+        (app, events)
     }
 
-    /// `now` is the instant iced stamps on the message (`iced::application::timed`).
+    fn new() -> (Self, Task<Message>) {
+        let (app, events) = Self::boot();
+        (app, Task::run(events, Message::Lsp))
+    }
+
+    /// `now` is the instant iced stamps on the message (`iced::application::timed`). The
+    /// server answers whatever the update sent before it returns.
     fn update(&mut self, message: Message, now: Instant) -> Task<Message> {
         let Self {
             client,
             tabs,
             active,
-            transport,
+            server,
+            traffic,
             hints,
         } = self;
-        match message {
+        let task = match message {
             Message::Editor(id, event) => {
                 let Some(tab) = tabs.iter_mut().find(|tab| tab.id == id) else {
                     return Task::none();
                 };
                 let task = tab.editor.update(event, now).map(Message::Editor.with(id));
                 let synced = tab.editor.sync_lsp(client);
-                let mut outgoing = synced.messages;
-                outgoing.extend(follow(tabs, active, client, transport, synced.jump));
-                Task::batch([task, transport.send(outgoing)])
+                follow(tabs, active, client, traffic, synced.jump);
+                task
             }
-            Message::Lsp(message) => {
-                let output = match client.receive(message) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        transport.note(format!("error: {error}"));
-                        // The replies queued behind this one still need a delivery.
-                        return transport.send(Vec::new());
-                    }
-                };
-                let mut outgoing = output.messages;
-                for update in output.updates {
+            Message::Lsp(event) => {
+                for update in client.receive(event) {
                     match update {
                         lsp::Update::Document(document) => {
                             let Some(tab) = tabs
@@ -181,27 +179,26 @@ impl App {
                                 continue;
                             };
                             let applied = tab.editor.apply_lsp(client, document);
-                            outgoing.extend(applied.messages);
                             if let Some(refusal) = applied.refused {
-                                transport.note(format!("refused: {refusal}"));
+                                traffic.note(format!("refused: {refusal}"));
                             }
-                            outgoing.extend(follow(tabs, active, client, transport, applied.jump));
+                            follow(tabs, active, client, traffic, applied.jump);
                         }
                         // A host with files writes `edits.apply(&disk_text)` back to disk.
                         lsp::Update::FileEdits(edits) => {
-                            transport.note(format!("edits for unopened {}", edits.uri().as_str()));
+                            traffic.note(format!("edits for unopened {}", edits.uri().as_str()));
                         }
                         lsp::Update::Notification(notification) => {
-                            transport.note(format!("{notification:?}"))
+                            traffic.note(format!("{notification:?}"));
                         }
+                        lsp::Update::Trace(entry) => traffic.trace(&entry),
+                        lsp::Update::Log(entry) => traffic.note(format!("log: {}", entry.text())),
+                        lsp::Update::Error(error) => traffic.note(format!("error: {error}")),
+                        lsp::Update::Status(status) => traffic.note(format!("status: {status:?}")),
                     }
                 }
-                transport.send(outgoing)
+                Task::none()
             }
-            Message::Deliver => match transport.next() {
-                Some(message) => self.update(Message::Lsp(message), now),
-                None => Task::none(),
-            },
             Message::Select(id) => {
                 *active = id;
                 Task::none()
@@ -212,10 +209,12 @@ impl App {
                 for tab in tabs.iter_mut() {
                     tab.editor.set_inlay_hints(*hints);
                 }
-                transport.note(format!("inlay hints {}", if *hints { "on" } else { "off" }));
+                traffic.note(format!("inlay hints {}", if *hints { "on" } else { "off" }));
                 Task::none()
             }
-        }
+        };
+        server.step();
+        task
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -226,7 +225,7 @@ impl App {
         };
         let body = row![
             container(editor).width(FillPortion(3)).height(Fill),
-            traffic(&self.transport.traffic)
+            traffic(&self.traffic.lines)
         ]
         .spacing(8);
         column![tabs, body].spacing(8).padding(8).into()
@@ -249,35 +248,19 @@ impl App {
     }
 }
 
-impl Transport {
-    /// Hand `outgoing` to the server, logging each message. If replies are queued, schedule the
-    /// next delivery.
-    fn send(&mut self, outgoing: Vec<lsp::Message>) -> Task<Message> {
-        for message in &outgoing {
-            self.log("→", message);
-            self.server.receive(message);
-        }
-        if self.server.is_idle() {
-            Task::none()
-        } else {
-            Task::done(Message::Deliver)
-        }
-    }
-
-    /// The server's next reply, logged.
-    fn next(&mut self) -> Option<lsp::Message> {
-        let message = self.server.next()?;
-        self.log("←", &message);
-        Some(message)
-    }
-
+impl Traffic {
     /// A line of commentary: refusals, errors, and what a disk-backed host would do.
     fn note(&mut self, note: String) {
         self.push(format!("· {note}"));
     }
 
-    fn log(&mut self, arrow: &str, message: &lsp::Message) {
-        let wire = serde_json::to_value(message).expect("envelopes serialize");
+    /// A traced message as one line: `→ method #id`, `← method`, `← response #id`.
+    fn trace(&mut self, entry: &lsp::trace::Entry) {
+        let arrow = match entry.direction() {
+            lsp::trace::Direction::Outgoing => "→",
+            lsp::trace::Direction::Incoming => "←",
+        };
+        let wire: Value = serde_json::from_slice(entry.json()).unwrap_or(Value::Null);
         let what = match (wire.get("method").and_then(Value::as_str), wire.get("id")) {
             (Some(method), Some(id)) => format!("{method} #{id}"),
             (Some(method), None) => method.to_owned(),
@@ -288,25 +271,24 @@ impl Transport {
     }
 
     fn push(&mut self, line: String) {
-        if self.traffic.len() == TRAFFIC_LINES {
-            self.traffic.pop_front();
+        if self.lines.len() == TRAFFIC_LINES {
+            self.lines.pop_front();
         }
-        self.traffic.push_back(line);
+        self.lines.push_back(line);
     }
 }
 
 /// Route `jump` to the tab whose document holds it, and so on for any jump that tab's sync
-/// returns. Returns the messages to send. A host with files would read an unopened one, open a
+/// returns. A host with files would read an unopened one, open a
 /// tab, `open_lsp` it, then `select(unopened.span(&text))`; every demo file is open, and wasm
 /// has no disk, so it is only noted.
 fn follow(
     tabs: &mut [Tab],
     active: &mut tab::Id,
     client: &mut lsp::Client,
-    transport: &mut Transport,
+    traffic: &mut Traffic,
     mut jump: Option<lsp::update::Jump>,
-) -> Vec<lsp::Message> {
-    let mut outgoing = Vec::new();
+) {
     while let Some(next) = jump.take() {
         match next {
             lsp::update::Jump::Open(open) => {
@@ -318,19 +300,17 @@ fn follow(
                 };
                 match target.editor.jump(client, open) {
                     Ok(applied) => {
-                        outgoing.extend(applied.messages);
                         jump = applied.jump;
                         *active = target.id;
                     }
-                    Err(refusal) => transport.note(format!("jump refused: {refusal}")),
+                    Err(refusal) => traffic.note(format!("jump refused: {refusal}")),
                 }
             }
             lsp::update::Jump::Unopened(unopened) => {
-                transport.note(format!("definition in unopened {}", unopened.uri().as_str()));
+                traffic.note(format!("definition in unopened {}", unopened.uri().as_str()));
             }
         }
     }
-    outgoing
 }
 
 fn tab_button(tab: &Tab, active: tab::Id) -> Element<'_, Message> {
@@ -407,25 +387,35 @@ mod tests {
     const MAIN: tab::Id = tab::Id(0);
     const UTIL: tab::Id = tab::Id(1);
 
-    /// Deliver every queued server message, as the runtime would by running the Deliver tasks.
-    fn settle(app: &mut App) {
+    use iced::futures::{FutureExt, StreamExt};
+
+    /// Step the server and drain the client's stream, as the runtime would, until both are idle.
+    fn settle(app: &mut App, events: &mut lsp::client::Events) {
         let now = Instant::now();
-        while !app.transport.server.is_idle() {
-            let _ = app.update(Message::Deliver, now);
+        loop {
+            let stepped = app.server.step();
+            let mut drained = false;
+            while let Some(Some(event)) = events.next().now_or_never() {
+                drained = true;
+                let _ = app.update(Message::Lsp(event), now);
+            }
+            if !stepped && !drained {
+                break;
+            }
         }
     }
 
     /// The app after its handshake: both documents open, their first diagnostics landed.
-    fn booted() -> App {
-        let (mut app, _boot) = App::new();
-        settle(&mut app);
-        app
+    fn booted() -> (App, lsp::client::Events) {
+        let (mut app, mut events) = App::boot();
+        settle(&mut app, &mut events);
+        (app, events)
     }
 
     /// Feed `event` to tab `id`, then let the conversation finish.
-    fn press(app: &mut App, id: tab::Id, event: Event) {
+    fn press(app: &mut App, events: &mut lsp::client::Events, id: tab::Id, event: Event) {
         let _ = app.update(Message::Editor(id, event), Instant::now());
-        settle(app);
+        settle(app, events);
     }
 
     fn editor(app: &App, id: tab::Id) -> &CodeEditor {
@@ -448,7 +438,7 @@ mod tests {
     /// The server's first publish reaches both editors: main.rs has two padded lines, util.rs one.
     #[test]
     fn diagnostics_land_in_both_documents() {
-        let app = booted();
+        let (app, _events) = booted();
         assert_eq!(
             diagnostics(&app, MAIN),
             2,
@@ -465,10 +455,10 @@ mod tests {
     /// name selected. This is the cross-document path, `apply_lsp` → `Jump::Open` → `jump`.
     #[test]
     fn f12_switches_tabs_and_selects_the_definition() {
-        let mut app = booted();
+        let (mut app, mut events) = booted();
         let call = MAIN_RS.find("greet").expect("main.rs calls greet") as u32;
-        press(&mut app, MAIN, Event::Editor(Action::PlaceCaret(call + 1)));
-        press(&mut app, MAIN, Event::Editor(Action::GotoDefinition));
+        press(&mut app, &mut events, MAIN, Event::Editor(Action::PlaceCaret(call + 1)));
+        press(&mut app, &mut events, MAIN, Event::Editor(Action::GotoDefinition));
         assert_eq!(app.active, UTIL, "the definition's tab is active");
         let name = (UTIL_RS.find("fn greet").expect("util.rs defines greet") + "fn ".len()) as u32;
         assert_eq!(
@@ -482,12 +472,12 @@ mod tests {
     /// whose copy of each file matches the editor's.
     #[test]
     fn rename_changes_both_documents_and_the_server_sees_both_did_changes() {
-        let mut app = booted();
+        let (mut app, mut events) = booted();
         let call = MAIN_RS.find("greet").expect("main.rs calls greet") as u32;
-        press(&mut app, MAIN, Event::Editor(Action::PlaceCaret(call + 1)));
-        press(&mut app, MAIN, Event::Editor(Action::Rename));
-        press(&mut app, MAIN, Event::RenameText("welcome".into()));
-        press(&mut app, MAIN, Event::SubmitRename);
+        press(&mut app, &mut events, MAIN, Event::Editor(Action::PlaceCaret(call + 1)));
+        press(&mut app, &mut events, MAIN, Event::Editor(Action::Rename));
+        press(&mut app, &mut events, MAIN, Event::RenameText("welcome".into()));
+        press(&mut app, &mut events, MAIN, Event::SubmitRename);
         for (id, uri) in [(MAIN, MAIN_URI), (UTIL, UTIL_URI)] {
             let text = text_of(&app, id);
             assert!(
@@ -495,7 +485,7 @@ mod tests {
                 "{uri} is renamed"
             );
             assert_eq!(
-                app.transport.server.text(uri),
+                app.server.text(uri),
                 Some(text.as_str()),
                 "the server saw {uri}'s didChange"
             );
@@ -506,15 +496,15 @@ mod tests {
     /// padded lines, synced back, and the server's next publish clears the warnings.
     #[test]
     fn format_strips_trailing_whitespace() {
-        let mut app = booted();
-        press(&mut app, MAIN, Event::Editor(Action::Format));
+        let (mut app, mut events) = booted();
+        press(&mut app, &mut events, MAIN, Event::Editor(Action::Format));
         let text = text_of(&app, MAIN);
         assert!(
             text.lines().all(|line| line == line.trim_end()),
             "no line of main.rs ends in whitespace"
         );
         assert_eq!(
-            app.transport.server.text(MAIN_URI),
+            app.server.text(MAIN_URI),
             Some(text.as_str()),
             "the server saw the formatted text"
         );
@@ -529,8 +519,8 @@ mod tests {
     /// diagnostics notifications.
     #[test]
     fn the_traffic_panel_logs_both_directions() {
-        let app = booted();
-        let traffic = &app.transport.traffic;
+        let (app, _events) = booted();
+        let traffic = &app.traffic.lines;
         assert!(
             traffic.iter().any(|line| line.starts_with("→ initialize")),
             "the initialize request is logged"
@@ -545,12 +535,12 @@ mod tests {
 
     /// Fire tab `id`'s scheduled hint fetch, as its widget does once the delay has passed, and
     /// let the conversation finish.
-    fn fetch(app: &mut App, id: tab::Id) {
+    fn fetch(app: &mut App, events: &mut lsp::client::Events, id: tab::Id) {
         let generation = editor(app, id)
             .pending_wake()
             .expect("a fetch is scheduled")
             .generation;
-        press(app, id, Event::Editor(Action::Wake(generation)));
+        press(app, events, id, Event::Editor(Action::Wake(generation)));
     }
 
     /// The hints tab `id` shows, as `(render offset, key)`, in offset order.
@@ -581,9 +571,9 @@ mod tests {
     }
 
     /// main.rs after boot with its hints fetched: `(type hint key, parameter hint key)`.
-    fn hinted() -> (App, inlay::Key, inlay::Key) {
-        let mut app = booted();
-        fetch(&mut app, MAIN);
+    fn hinted() -> (App, lsp::client::Events, inlay::Key, inlay::Key) {
+        let (mut app, mut events) = booted();
+        fetch(&mut app, &mut events, MAIN);
         let shown = hints(&app, MAIN);
         let key_at = |offset: u32| {
             shown
@@ -593,14 +583,14 @@ mod tests {
                 .1
         };
         let (ty, parameter) = (key_at(type_offset()), key_at(parameter_offset()));
-        (app, ty, parameter)
+        (app, events, ty, parameter)
     }
 
     /// The fetch for main.rs brings exactly its two hints: the type after `message` and the
     /// parameter before `"scrive"`.
     #[test]
     fn the_hint_script_lands_in_main_rs() {
-        let (app, _, _) = hinted();
+        let (app, _events, _, _) = hinted();
         let offsets: Vec<u32> = hints(&app, MAIN).iter().map(|(at, _)| *at).collect();
         assert_eq!(
             offsets,
@@ -608,8 +598,8 @@ mod tests {
             "the type hint and the parameter hint show, in offset order",
         );
         assert!(
-            app.transport
-                .traffic
+            app.traffic
+                .lines
                 .iter()
                 .any(|line| line.starts_with("→ textDocument/inlayHint")),
             "the fetch went to the server",
@@ -620,9 +610,10 @@ mod tests {
     /// parameter there: an `Open` label jump routed through the editor arm.
     #[test]
     fn ctrl_click_on_a_parameter_hint_opens_util_rs_at_the_parameter() {
-        let (mut app, _, parameter) = hinted();
+        let (mut app, mut events, _, parameter) = hinted();
         press(
             &mut app,
+            &mut events,
             MAIN,
             Event::Editor(Action::InlayJump {
                 key: parameter,
@@ -642,13 +633,14 @@ mod tests {
     /// returns the jump, with no request to the server, and the panel notes it.
     #[test]
     fn ctrl_click_on_a_type_hint_jumps_into_an_unopened_file_through_sync_lsp() {
-        let (mut app, ty, _) = hinted();
+        let (mut app, mut events, ty, _) = hinted();
         press(
             &mut app,
+            &mut events,
             MAIN,
             Event::Editor(Action::InlayJump { key: ty, part: 1 }),
         );
-        let traffic = &app.transport.traffic;
+        let traffic = &app.traffic.lines;
         assert!(
             traffic
                 .iter()
@@ -668,10 +660,11 @@ mod tests {
     /// sees the edit in the same press, and the refetch brings back only the parameter hint.
     #[test]
     fn double_click_inserts_the_type_once_and_leaves_no_duplicate_hint() {
-        let (mut app, ty, _) = hinted();
+        let (mut app, mut events, ty, _) = hinted();
         let offset = type_offset();
         press(
             &mut app,
+            &mut events,
             MAIN,
             Event::Editor(Action::InlayInsert { key: ty, offset }),
         );
@@ -686,11 +679,11 @@ mod tests {
             "the inserted hint is gone: {shown:?}",
         );
         assert_eq!(
-            app.transport.server.text(MAIN_URI),
+            app.server.text(MAIN_URI),
             Some(text.as_str()),
             "the insert's didChange went out with the press",
         );
-        fetch(&mut app, MAIN);
+        fetch(&mut app, &mut events, MAIN);
         let offsets: Vec<u32> = hints(&app, MAIN).iter().map(|(at, _)| *at).collect();
         assert_eq!(
             offsets,
@@ -702,13 +695,14 @@ mod tests {
     /// Hovering the type hint asks the server to resolve its tooltip, and the answer lands.
     #[test]
     fn hovering_a_hint_resolves_its_tooltip() {
-        let (mut app, ty, _) = hinted();
+        let (mut app, mut events, ty, _) = hinted();
         press(
             &mut app,
+            &mut events,
             MAIN,
             Event::Editor(Action::InlayHover { key: ty, part: 1 }),
         );
-        let traffic: Vec<&String> = app.transport.traffic.iter().collect();
+        let traffic: Vec<&String> = app.traffic.lines.iter().collect();
         let resolve = traffic
             .iter()
             .position(|line| line.starts_with("→ inlayHint/resolve"))
@@ -724,13 +718,13 @@ mod tests {
     /// Ctrl+I clears every tab's hints, and a second Ctrl+I brings them back after a fetch.
     #[test]
     fn the_toggle_key_clears_and_restores_the_hints() {
-        let (mut app, _, _) = hinted();
+        let (mut app, mut events, _, _) = hinted();
         let now = Instant::now();
         let _ = app.update(Message::ToggleHints, now);
         assert!(!app.hints, "hints are off");
         assert!(hints(&app, MAIN).is_empty(), "main.rs shows no hints");
         let _ = app.update(Message::ToggleHints, now);
-        fetch(&mut app, MAIN);
+        fetch(&mut app, &mut events, MAIN);
         assert!(app.hints, "hints are on");
         assert_eq!(hints(&app, MAIN).len(), 2, "both hints are back");
     }

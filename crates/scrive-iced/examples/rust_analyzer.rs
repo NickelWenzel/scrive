@@ -15,13 +15,16 @@
 //! Inlay hints are on: double-click a type hint to insert it, Ctrl+click a part to jump, hover
 //! one for its tooltip. Ctrl+I (Cmd+I on macOS) turns them off and on.
 //!
-//! The update loop is the one `examples/lsp` uses, cut down to one editor. What that example
-//! fakes with an in-process server is real here: a child process, a reader thread that decodes
-//! the LSP base protocol from its stdout, and a writer thread that encodes onto its stdin. The
-//! server's log goes to this process's stderr.
+//! The update loop is the one `examples/lsp` uses, cut down to one editor. The client owns its
+//! connection: the server end of an in-process `lsp_server::Connection`, which a reader and a
+//! writer thread pump to and from a child process's stdout and stdin, in the LSP base protocol.
+//! The server's log goes to this process's stderr. Closing the window shuts the server down
+//! first.
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> iced::Result {
+    use scrive_iced::lsp;
+
     let workspace = match app::Workspace::from_args() {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -29,7 +32,12 @@ fn main() -> iced::Result {
             std::process::exit(1);
         }
     };
-    app::run(workspace)
+    let (near, far) = lsp::lsp_server::Connection::memory();
+    if let Err(error) = transport::spawn(far) {
+        eprintln!("rust_analyzer: {}", transport::describe(&error));
+        std::process::exit(1);
+    }
+    app::run(workspace, near)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -68,8 +76,8 @@ mod frame {
     }
 
     /// `message` framed for the wire.
-    pub fn encode(message: &lsp::Message) -> Vec<u8> {
-        let body = serde_json::to_vec(message).expect("envelopes serialize");
+    pub fn encode(message: &lsp::lsp_server::Message) -> Vec<u8> {
+        let body = serde_json::to_vec(message).expect("lsp-server messages serialize");
         let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
         frame.extend(body);
         frame
@@ -77,7 +85,7 @@ mod frame {
 
     /// Takes the first complete frame off the front of `buffer`. `Ok(None)` means more bytes are
     /// needed, and leaves `buffer` as it was.
-    pub fn decode(buffer: &mut Vec<u8>) -> Result<Option<lsp::Message>, Error> {
+    pub fn decode(buffer: &mut Vec<u8>) -> Result<Option<lsp::lsp_server::Message>, Error> {
         let Some(end) = buffer
             .windows(SEPARATOR.len())
             .position(|window| window == SEPARATOR)
@@ -109,17 +117,29 @@ mod frame {
 
     #[cfg(test)]
     mod tests {
-        use serde_json::json;
+        use serde_json::{json, Value};
 
         use super::*;
 
-        fn message(text: &str) -> lsp::Message {
+        fn message(text: &str) -> lsp::lsp_server::Message {
             serde_json::from_value(json!({
                 "jsonrpc": "2.0",
                 "method": "window/showMessage",
                 "params": { "type": 3, "message": text },
             }))
-            .expect("the fixture is an envelope")
+            .expect("the fixture is an lsp-server message")
+        }
+
+        /// `message` as JSON, since lsp-server's messages have no equality.
+        fn json(message: &lsp::lsp_server::Message) -> Value {
+            serde_json::to_value(message).expect("lsp-server messages serialize")
+        }
+
+        /// The decoded messages as JSON.
+        fn decoded(
+            result: Result<Option<lsp::lsp_server::Message>, Error>,
+        ) -> Option<Value> {
+            result.ok().flatten().as_ref().map(json)
         }
 
         /// A decoded frame is the message that was encoded, and the buffer is left empty. The
@@ -129,7 +149,11 @@ mod frame {
             let sent = message("héllo, wörld");
             let mut buffer = encode(&sent);
             let received = decode(&mut buffer).expect("the frame decodes");
-            assert_eq!(received, Some(sent), "the message survives the wire");
+            assert_eq!(
+                received.as_ref().map(json),
+                Some(json(&sent)),
+                "the message survives the wire"
+            );
             assert!(buffer.is_empty(), "the frame is consumed");
         }
 
@@ -143,9 +167,13 @@ mod frame {
                 buffer.push(*byte);
                 let decoded = decode(&mut buffer).expect("a partial frame is not an error");
                 if index + 1 < wire.len() {
-                    assert_eq!(decoded, None, "byte {index} does not complete the frame");
+                    assert!(decoded.is_none(), "byte {index} does not complete the frame");
                 } else {
-                    assert_eq!(decoded, Some(sent.clone()), "the last byte completes it");
+                    assert_eq!(
+                        decoded.as_ref().map(json),
+                        Some(json(&sent)),
+                        "the last byte completes it"
+                    );
                 }
             }
         }
@@ -160,20 +188,16 @@ mod frame {
             let third_wire = encode(&third);
             buffer.extend(&third_wire[..10]);
             assert_eq!(
-                decode(&mut buffer).ok().flatten(),
-                Some(first),
+                decoded(decode(&mut buffer)),
+                Some(json(&first)),
                 "first frame"
             );
             assert_eq!(
-                decode(&mut buffer).ok().flatten(),
-                Some(second),
+                decoded(decode(&mut buffer)),
+                Some(json(&second)),
                 "second frame"
             );
-            assert_eq!(
-                decode(&mut buffer).ok().flatten(),
-                None,
-                "third frame is partial"
-            );
+            assert_eq!(decoded(decode(&mut buffer)), None, "third frame is partial");
             assert_eq!(buffer, third_wire[..10], "the partial frame stays buffered");
         }
 
@@ -202,13 +226,12 @@ mod frame {
     }
 }
 
-/// rust-analyzer as a child process: a reader thread decodes its stdout, and a writer thread owns
-/// its stdin.
+/// rust-analyzer as a child process, pumped to and from the server end of an in-process
+/// connection: a reader thread decodes its stdout, and a writer thread owns its stdin.
 #[cfg(not(target_arch = "wasm32"))]
 mod transport {
     use std::io::{self, Read, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-    use std::sync::mpsc;
     use std::thread;
 
     use scrive_iced::lsp;
@@ -218,35 +241,10 @@ mod transport {
     /// The command that starts the server, looked up on `PATH`.
     pub const SERVER: &str = "rust-analyzer";
 
-    /// Hands messages to the writer thread. Cloning it is cheap; the server's stdin closes when
-    /// the last clone drops.
-    #[derive(Debug, Clone)]
-    pub struct Sender(mpsc::Sender<lsp::Message>);
-
-    /// What the reader thread delivers.
-    #[derive(Debug)]
-    pub enum Incoming {
-        /// One message from the server.
-        Message(lsp::Message),
-        /// The server is gone; nothing follows. The text says why, for a person.
-        Closed(String),
-    }
-
-    impl Sender {
-        /// Queue `messages` for the server, in order. After the server exits they are dropped:
-        /// the reader has already reported the exit.
-        pub fn send(&self, messages: Vec<lsp::Message>) {
-            for message in messages {
-                if self.0.send(message).is_err() {
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Start the server with piped stdin and stdout and an inherited stderr. `deliver` runs on the
-    /// reader thread for every message, then once with [`Incoming::Closed`].
-    pub fn spawn(deliver: impl FnMut(Incoming) + Send + 'static) -> io::Result<Sender> {
+    /// Start the server with piped stdin and stdout and an inherited stderr, and pump `server`'s
+    /// messages to and from it. When the process is gone, `server`'s sender drops, which the
+    /// client reads as the connection closing.
+    pub fn spawn(server: lsp::lsp_server::Connection) -> io::Result<()> {
         let mut child = Command::new(SERVER)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -254,10 +252,10 @@ mod transport {
             .spawn()?;
         let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
-        let (sender, outgoing) = mpsc::channel();
-        thread::spawn(move || write(stdin, &outgoing));
-        thread::spawn(move || read(child, stdout, deliver));
-        Ok(Sender(sender))
+        let lsp::lsp_server::Connection { sender, receiver } = server;
+        thread::spawn(move || write(stdin, &receiver));
+        thread::spawn(move || read(child, stdout, |message| sender.send(message).is_ok()));
+        Ok(())
     }
 
     /// Why `spawn` failed, for a person.
@@ -270,7 +268,11 @@ mod transport {
         }
     }
 
-    fn write(mut stdin: ChildStdin, outgoing: &mpsc::Receiver<lsp::Message>) {
+    /// Writes until the client's last sender is gone, then closes stdin by dropping it.
+    fn write(
+        mut stdin: ChildStdin,
+        outgoing: impl IntoIterator<Item = lsp::lsp_server::Message>,
+    ) {
         for message in outgoing {
             let written = stdin.write_all(&frame::encode(&message));
             if written.and_then(|()| stdin.flush()).is_err() {
@@ -279,13 +281,20 @@ mod transport {
         }
     }
 
-    fn read(mut child: Child, mut stdout: ChildStdout, mut deliver: impl FnMut(Incoming)) {
+    /// Decodes stdout into `deliver`, which says whether anyone still listens, until EOF.
+    fn read(
+        mut child: Child,
+        mut stdout: ChildStdout,
+        deliver: impl Fn(lsp::lsp_server::Message) -> bool,
+    ) {
         let mut buffer = Vec::new();
         let mut chunk = [0; 8192];
         let failure = loop {
             match frame::decode(&mut buffer) {
                 Ok(Some(message)) => {
-                    deliver(Incoming::Message(message));
+                    if !deliver(message) {
+                        break Some(format!("nobody listens to {SERVER} any more"));
+                    }
                     continue;
                 }
                 Ok(None) => {}
@@ -306,25 +315,24 @@ mod transport {
             Ok(status) => format!("{SERVER} exited ({status})"),
             Err(error) => format!("{SERVER} is gone: {error}"),
         };
-        deliver(Incoming::Closed(match failure {
-            Some(failure) => format!("{failure}; {exit}"),
-            None => exit,
-        }));
+        match failure {
+            Some(failure) => eprintln!("{failure}; {exit}"),
+            None => eprintln!("{exit}"),
+        }
     }
 }
 
-/// The application: one editor, one client, and the link to the server process.
+/// The application: one editor and its client.
 #[cfg(not(target_arch = "wasm32"))]
 mod app {
     use std::io;
     use std::path::{Path, PathBuf};
 
-    use iced::futures::channel::mpsc;
-    use iced::futures::{SinkExt, Stream, StreamExt};
     use iced::keyboard::{self, Key};
     use iced::time::Instant;
-    use iced::widget::{column, container, text};
+    use iced::widget::{button, column, container, row, text};
     use iced::{Element, Fill, Subscription, Task, Theme};
+    use serde_json::json;
 
     use scrive_core::SyntaxDef;
     use scrive_iced::{lsp, CodeEditor, Event};
@@ -364,11 +372,12 @@ fn main() {
     struct App {
         editor: CodeEditor,
         client: lsp::Client,
-        link: Link,
         /// Where Ctrl+S writes the document.
         file: PathBuf,
         /// The one-line status bar.
         status: String,
+        /// Whether rust-analyzer runs `cargo check` on save; the button flips it.
+        check_on_save: bool,
         /// Whether inlay hints show; Ctrl+I flips it.
         hints: bool,
     }
@@ -381,21 +390,12 @@ fn main() {
         Save,
         /// Ctrl+I: turn inlay hints off or on.
         ToggleHints,
-        /// A JSON-RPC message from the server.
-        Lsp(lsp::Message),
-        /// The server process is running, and this reaches its stdin.
-        Connected(transport::Sender),
-        /// The server could not start, or has exited; the text says why.
-        Disconnected(String),
-    }
-
-    /// Where outgoing messages go.
-    enum Link {
-        /// Waiting for the process: messages queue, the `initialize` request first.
-        Connecting(Vec<lsp::Message>),
-        Connected(transport::Sender),
-        /// The server is gone, and messages are dropped.
-        Closed,
+        /// The button: turn `cargo check` on save off or on, reconfiguring the server.
+        ToggleCheck,
+        /// An event from the client's stream.
+        Lsp(lsp::client::Event),
+        /// The window's close button: shut the server down first.
+        CloseRequested,
     }
 
     impl Workspace {
@@ -462,30 +462,41 @@ fn main() {
     }
 
     impl App {
-        fn new(workspace: &Workspace) -> Self {
-            let (mut client, initialize) = lsp::Client::builder()
+        /// The app on `connection`, and its client's event stream, before anything runs it.
+        /// Tests drive the stream themselves.
+        fn boot(
+            workspace: &Workspace,
+            connection: lsp::lsp_server::Connection,
+        ) -> (Self, lsp::client::Events) {
+            let (mut client, events) = lsp::Client::builder()
                 .root(workspace.root_uri().clone())
-                .process_id(std::process::id())
-                .build();
+                .configuration(json!({ "rust-analyzer": { "checkOnSave": true } }))
+                .memory(connection);
             let mut editor = CodeEditor::new(workspace.text())
                 .language(rust())
                 .rename(true)
                 .inlay_hints(true);
-            let mut queued = vec![initialize];
             // Before the handshake this only records the text; the didOpen follows `initialized`.
-            queued.extend(
-                editor
-                    .open_lsp(&mut client, workspace.file_uri(), "rust")
-                    .expect("the client has no other document"),
-            );
-            Self {
+            editor
+                .open_lsp(&mut client, workspace.file_uri(), "rust")
+                .expect("the client has no other document");
+            let app = Self {
                 editor,
                 client,
-                link: Link::Connecting(queued),
                 file: workspace.file.clone(),
                 status: format!("starting {}…", transport::SERVER),
+                check_on_save: true,
                 hints: true,
-            }
+            };
+            (app, events)
+        }
+
+        fn new(
+            workspace: &Workspace,
+            connection: lsp::lsp_server::Connection,
+        ) -> (Self, Task<Message>) {
+            let (app, events) = Self::boot(workspace, connection);
+            (app, Task::run(events, Message::Lsp))
         }
 
         /// `now` is the instant iced stamps on the message (`iced::application::timed`).
@@ -493,16 +504,15 @@ fn main() {
             let Self {
                 editor,
                 client,
-                link,
                 file,
                 status,
+                check_on_save,
                 hints,
             } = self;
             match message {
                 Message::Editor(event) => {
                     let task = editor.update(event, now).map(Message::Editor);
                     let synced = editor.sync_lsp(client);
-                    link.send(synced.messages);
                     if let Some(line) = jumped(synced.jump) {
                         *status = line;
                     }
@@ -514,16 +524,16 @@ fn main() {
                     match std::fs::write(&*file, doc.serialize(doc.buffer().eol_flavor())) {
                         Ok(()) => {
                             let saved = editor.save_lsp(client);
-                            link.send(saved.messages);
                             if let Some(line) = jumped(saved.jump) {
                                 *status = line;
                             }
                             let name = file.file_name().unwrap_or(file.as_os_str()).display();
-                            *status = match link {
-                                Link::Connected(_) => {
-                                    format!("saved {name} — cargo check running…")
-                                }
-                                Link::Connecting(_) | Link::Closed => format!("saved {name}"),
+                            let checking =
+                                *check_on_save && client.status() == &lsp::client::Status::Running;
+                            *status = if checking {
+                                format!("saved {name} — cargo check running…")
+                            } else {
+                                format!("saved {name}")
                             };
                         }
                         Err(error) => {
@@ -538,28 +548,24 @@ fn main() {
                     *status = format!("inlay hints {}", if *hints { "on" } else { "off" });
                     Task::none()
                 }
-                Message::Connected(sender) => {
-                    if let Link::Connecting(queued) = std::mem::replace(link, Link::Closed) {
-                        sender.send(queued);
-                    }
-                    *link = Link::Connected(sender);
-                    *status = format!("connected to {}", transport::SERVER);
+                Message::ToggleCheck => {
+                    *check_on_save = !*check_on_save;
+                    client.configure(json!({ "rust-analyzer": { "checkOnSave": *check_on_save } }));
+                    *status = format!(
+                        "check on save {}",
+                        if *check_on_save { "on" } else { "off" }
+                    );
                     Task::none()
                 }
-                Message::Lsp(message) => {
-                    let output = match client.receive(message) {
-                        Ok(output) => output,
-                        Err(error) => {
-                            *status = format!("error: {error}");
-                            return Task::none();
+                Message::Lsp(event) => {
+                    for update in client.receive(event) {
+                        if let Some(line) = headline(&update) {
+                            *status = line;
+                            continue;
                         }
-                    };
-                    let mut outgoing = output.messages;
-                    for update in output.updates {
                         match update {
                             lsp::Update::Document(document) => {
                                 let applied = editor.apply_lsp(client, document);
-                                outgoing.extend(applied.messages);
                                 if let Some(refusal) = applied.refused {
                                     *status = format!("refused: {refusal}");
                                 }
@@ -571,19 +577,27 @@ fn main() {
                                 *status =
                                     format!("rename skipped {}, which is not open", edits.uri());
                             }
-                            lsp::Update::Notification(notification) => {
-                                if let Some(line) = headline(&notification) {
-                                    *status = line;
-                                }
+                            lsp::Update::Status(lsp::client::Status::Stopped(
+                                lsp::client::Reason::Shutdown,
+                            )) => return iced::exit(),
+                            lsp::Update::Status(other) => {
+                                *status = format!("{}: {other:?}", transport::SERVER);
                             }
+                            lsp::Update::Error(error) => *status = format!("error: {error}"),
+                            lsp::Update::Log(_)
+                            | lsp::Update::Notification(_)
+                            | lsp::Update::Trace(_) => {}
                         }
                     }
-                    link.send(outgoing);
                     Task::none()
                 }
-                Message::Disconnected(reason) => {
-                    *link = Link::Closed;
-                    *status = reason;
+                Message::CloseRequested => {
+                    if let lsp::client::Status::Stopped(_) = client.status() {
+                        return iced::exit();
+                    }
+                    for document in client.shutdown() {
+                        let _ = editor.apply_lsp(client, document);
+                    }
                     Task::none()
                 }
             }
@@ -593,11 +607,17 @@ fn main() {
             let status = text(self.status.as_str())
                 .size(12)
                 .font(scrive_iced::DEFAULT_FONT);
+            let check = if self.check_on_save {
+                "check on save: on"
+            } else {
+                "check on save: off"
+            };
+            let check = button(text(check).size(12)).on_press(Message::ToggleCheck);
             column![
                 container(self.editor.view().map(Message::Editor))
                     .width(Fill)
                     .height(Fill),
-                container(status).padding([2, 8]),
+                container(row![check, status].spacing(8)).padding([2, 8]),
             ]
             .into()
         }
@@ -607,62 +627,27 @@ fn main() {
                 self.editor.subscription().map(Message::Editor),
                 keyboard::listen().filter_map(save_chord),
                 keyboard::listen().filter_map(toggle_chord),
-                Subscription::run(connect),
+                iced::window::close_requests().map(|_| Message::CloseRequested),
             ])
         }
     }
 
-    impl Link {
-        fn send(&mut self, messages: Vec<lsp::Message>) {
-            match self {
-                Link::Connecting(queued) => queued.extend(messages),
-                Link::Connected(sender) => sender.send(messages),
-                Link::Closed => {}
-            }
-        }
-    }
-
-    pub fn run(workspace: Workspace) -> iced::Result {
+    pub fn run(workspace: Workspace, connection: lsp::lsp_server::Connection) -> iced::Result {
         let title = format!("scrive — rust-analyzer — {}", workspace.file.display());
+        // iced's boot is `Fn`, so the connection moves out of a cell the one time it runs.
+        let connection = std::cell::Cell::new(Some(connection));
         // `timed` hands `update` each message's instant, which the editor's debounces run on.
         iced::application::timed(
-            move || App::new(&workspace),
+            move || App::new(&workspace, connection.take().expect("iced boots the app once")),
             App::update,
             App::subscription,
             App::view,
         )
         .title(move |_: &App| title.clone())
         .theme(theme)
+        .exit_on_close_request(false)
         .fonts(scrive_iced::required_fonts().iter().copied())
         .run()
-    }
-
-    /// The server's messages: `Connected` first, then every message it sends, then one
-    /// `Disconnected`.
-    fn connect() -> impl Stream<Item = Message> {
-        iced::stream::channel(100, async |mut output: mpsc::Sender<Message>| {
-            let (incoming, mut received) = mpsc::unbounded();
-            let spawned = transport::spawn(move |message| {
-                // The receiver drops only when the app has stopped listening.
-                let _ = incoming.unbounded_send(message);
-            });
-            let first = match spawned {
-                Ok(sender) => Message::Connected(sender),
-                Err(error) => Message::Disconnected(transport::describe(&error)),
-            };
-            if output.send(first).await.is_err() {
-                return;
-            }
-            while let Some(message) = received.next().await {
-                let message = match message {
-                    transport::Incoming::Message(message) => Message::Lsp(message),
-                    transport::Incoming::Closed(reason) => Message::Disconnected(reason),
-                };
-                if output.send(message).await.is_err() {
-                    return;
-                }
-            }
-        })
     }
 
     /// Ctrl+S, or Cmd+S on macOS, without Shift or Alt and not repeated. The editor ignores it,
@@ -708,25 +693,29 @@ fn main() {
         }
     }
 
-    /// The status line a server notification earns: `window/showMessage` text, and the title of
-    /// a `$/progress` report.
-    fn headline(notification: &lsp::message::Notification) -> Option<String> {
-        let params = notification.params.as_ref()?;
-        let line = match notification.method.as_str() {
-            "window/showMessage" => params.get("message")?.as_str()?.to_owned(),
-            "$/progress" => {
-                let value = params.get("value")?;
+    /// The status line an update earns: a message the server asked to show, and the title of a
+    /// `$/progress` report.
+    fn headline(update: &lsp::Update) -> Option<String> {
+        match update {
+            lsp::Update::Log(entry) if entry.is_shown() => Some(entry.text().to_owned()),
+            lsp::Update::Notification(notification) if notification.method() == "$/progress" => {
+                let value = notification.params()?.get("value")?;
                 let title = value.get("title").and_then(|title| title.as_str());
                 let message = value.get("message").and_then(|message| message.as_str());
                 match (title, message) {
-                    (Some(title), Some(message)) => format!("{title}: {message}"),
-                    (Some(line), None) | (None, Some(line)) => line.to_owned(),
-                    (None, None) => return None,
+                    (Some(title), Some(message)) => Some(format!("{title}: {message}")),
+                    (Some(line), None) | (None, Some(line)) => Some(line.to_owned()),
+                    (None, None) => None,
                 }
             }
-            _ => return None,
-        };
-        Some(line)
+            lsp::Update::Document(_)
+            | lsp::Update::FileEdits(_)
+            | lsp::Update::Status(_)
+            | lsp::Update::Log(_)
+            | lsp::Update::Error(_)
+            | lsp::Update::Notification(_)
+            | lsp::Update::Trace(_) => None,
+        }
     }
 
     fn rust() -> SyntaxDef {
@@ -743,6 +732,7 @@ fn main() {
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
+        use iced::futures::{FutureExt, StreamExt};
         use iced::keyboard::key::{Code, Physical};
         use iced::keyboard::{Location, Modifiers};
         use scrive_core::{Diagnostic, EditOp};
@@ -751,38 +741,56 @@ fn main() {
 
         use super::*;
 
+        /// What a fresh client makes of `message` from its server.
+        fn updates(message: Value) -> Vec<lsp::Update> {
+            let (near, far) = lsp::lsp_server::Connection::memory();
+            let (mut client, mut events) = lsp::Client::builder().memory(near);
+            let message = serde_json::from_value(message).expect("the fixture is a message");
+            far.sender.send(message).expect("the client end is open");
+            let mut updates = Vec::new();
+            while let Some(Some(event)) = events.next().now_or_never() {
+                updates.extend(client.receive(event));
+            }
+            updates
+        }
+
+        /// The status lines `message` earns.
+        fn headlines(method: &str, params: Value) -> Vec<String> {
+            updates(serde_json::json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+                .iter()
+                .filter_map(headline)
+                .collect()
+        }
+
         /// The status bar shows a showMessage's text, and a progress report's title and message.
         #[test]
         fn headlines_come_from_show_message_and_progress() {
-            let notification = |method: &str, params: Value| lsp::message::Notification {
-                method: method.to_owned(),
-                params: Some(params),
-            };
-            let shown = notification(
-                "window/showMessage",
-                serde_json::json!({ "type": 3, "message": "hello" }),
-            );
             assert_eq!(
-                headline(&shown).as_deref(),
-                Some("hello"),
+                headlines(
+                    "window/showMessage",
+                    serde_json::json!({ "type": 3, "message": "hello" })
+                ),
+                ["hello"],
                 "showMessage text"
             );
-            let progress = notification(
-                "$/progress",
-                serde_json::json!({ "token": 1, "value": {
-                    "kind": "begin", "title": "Indexing", "message": "1/3"
-                }}),
-            );
             assert_eq!(
-                headline(&progress).as_deref(),
-                Some("Indexing: 1/3"),
+                headlines(
+                    "$/progress",
+                    serde_json::json!({ "token": 1, "value": {
+                        "kind": "begin", "title": "Indexing", "message": "1/3"
+                    }}),
+                ),
+                ["Indexing: 1/3"],
                 "progress title and message",
             );
-            let logged = notification(
-                "window/logMessage",
-                serde_json::json!({ "type": 3, "message": "noise" }),
+            assert!(
+                headlines(
+                    "window/logMessage",
+                    serde_json::json!({ "type": 3, "message": "noise" })
+                )
+                .is_empty(),
+                "log messages stay off the bar"
             );
-            assert_eq!(headline(&logged), None, "log messages stay off the bar");
         }
 
         /// Only a plain Ctrl+S (Cmd+S on macOS) saves.
@@ -846,33 +854,57 @@ fn main() {
             }
         }
 
-        /// The next message from the server, folded into `client`, with its answers sent back.
-        /// `None` once `deadline` passes.
-        fn pump(
-            client: &mut lsp::Client,
-            incoming: &mpsc::Receiver<transport::Incoming>,
-            sender: &transport::Sender,
-            deadline: Instant,
-        ) -> Option<lsp::Output> {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            let message = match incoming.recv_timeout(timeout) {
-                Ok(transport::Incoming::Message(message)) => message,
-                Ok(transport::Incoming::Closed(reason)) => panic!("the server left: {reason}"),
-                Err(_) => return None,
-            };
-            let output = client.receive(message).expect("server messages decode");
-            sender.send(output.messages.clone());
-            Some(output)
+        /// Starts rust-analyzer on `workspace` and boots the app on it, tracing, with its events
+        /// handed over by a thread so a test can wait with a deadline.
+        fn started(workspace: &Workspace) -> (App, mpsc::Receiver<lsp::client::Event>) {
+            let (near, far) = lsp::lsp_server::Connection::memory();
+            transport::spawn(far).unwrap_or_else(|error| panic!("{}", transport::describe(&error)));
+            let (mut app, events) = App::boot(workspace, near);
+            app.client.set_trace(lsp::trace::Mode::Messages);
+            (app, forward(events))
         }
 
-        /// The diagnostic sets in `output`, with their stamps, logged as they arrive.
+        /// Runs `events` on a thread and hands each event over, so a test can wait with a
+        /// deadline.
+        fn forward(events: lsp::client::Events) -> mpsc::Receiver<lsp::client::Event> {
+            let (sender, receiver) = mpsc::channel();
+            std::thread::spawn(move || {
+                iced::futures::executor::block_on(events.for_each(|event| {
+                    let _ = sender.send(event);
+                    std::future::ready(())
+                }));
+            });
+            receiver
+        }
+
+        /// The next event folded into the app's client, or `None` once `deadline` passes.
+        fn pump(
+            app: &mut App,
+            events: &mpsc::Receiver<lsp::client::Event>,
+            deadline: Instant,
+        ) -> Option<Vec<lsp::Update>> {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let event = events.recv_timeout(timeout).ok()?;
+            Some(app.client.receive(event))
+        }
+
+        /// Whether `updates` trace `method` going out.
+        fn went_out(updates: &[lsp::Update], method: &str) -> bool {
+            updates.iter().any(|update| {
+                matches!(update, lsp::Update::Trace(entry)
+                    if entry.direction() == lsp::trace::Direction::Outgoing
+                        && entry.method() == Some(method))
+            })
+        }
+
+        /// The diagnostic sets in `updates`, with their stamps, logged as they arrive.
         fn published(
-            output: &lsp::Output,
+            updates: &[lsp::Update],
             editor: &CodeEditor,
             started: Instant,
         ) -> Vec<(lsp::update::Stamp, Vec<Diagnostic>)> {
             let mut sets = Vec::new();
-            for update in &output.updates {
+            for update in updates {
                 let lsp::Update::Document(document) = update else {
                     continue;
                 };
@@ -909,37 +941,18 @@ fn main() {
         fn rust_analyzer_reports_the_scratch_crates_type_error_and_clears_it_on_save() {
             let root = std::env::temp_dir().join(format!("{SCRATCH}-test-{}", std::process::id()));
             let workspace = Workspace::scratch(&root).expect("the scratch crate is written");
-            let (deliver, incoming) = mpsc::channel();
-            let sender = transport::spawn(move |message| {
-                let _ = deliver.send(message);
-            })
-            .unwrap_or_else(|error| panic!("{}", transport::describe(&error)));
-
-            let (mut client, initialize) = lsp::Client::builder()
-                .root(workspace.root_uri().clone())
-                .process_id(std::process::id())
-                .build();
-            let mut editor = CodeEditor::new(workspace.text());
-            let mut outgoing = vec![initialize];
-            outgoing.extend(
-                editor
-                    .open_lsp(&mut client, workspace.file_uri(), "rust")
-                    .expect("the only document"),
-            );
-            sender.send(outgoing);
+            let (mut app, events) = started(&workspace);
 
             let started = Instant::now();
             let deadline = started + Duration::from_secs(120);
             let mut did_open = false;
             let mut diagnostics = None;
             while diagnostics.is_none() {
-                let Some(output) = pump(&mut client, &incoming, &sender, deadline) else {
+                let Some(updates) = pump(&mut app, &events, deadline) else {
                     break;
                 };
-                did_open |= output.messages.iter().any(|message| {
-                    matches!(message, lsp::Message::Notification(n) if n.method == "textDocument/didOpen")
-                });
-                diagnostics = published(&output, &editor, started)
+                did_open |= went_out(&updates, "textDocument/didOpen");
+                diagnostics = published(&updates, &app.editor, started)
                     .into_iter()
                     .map(|(_, list)| list)
                     .find(|list| !list.is_empty());
@@ -958,65 +971,60 @@ fn main() {
 
             let fix = "let label: String = doubled;";
             let at = SCRATCH_MAIN.find(fix).expect("the scratch has the error") + fix.len() - 1;
-            editor
+            app.editor
                 .try_edit(vec![EditOp::insert(u32::try_from(at).expect("small"), ".to_string()")])
                 .expect("the fix applies");
-            let doc = editor.document();
+            let doc = app.editor.document();
             std::fs::write(&workspace.file, doc.serialize(doc.buffer().eol_flavor()))
                 .expect("the fixed file is written");
             let fixed = lsp::update::Stamp::Revision(doc.revision());
-            let saved = editor.save_lsp(&mut client);
-            assert!(
-                saved.messages.iter().any(|message| {
-                    matches!(message, lsp::Message::Notification(n) if n.method == "textDocument/didSave")
-                }),
-                "rust-analyzer asks for saves, so the didSave goes out",
-            );
+            let _ = app.editor.save_lsp(&mut app.client);
             eprintln!("{:?}: saved", started.elapsed());
-            sender.send(saved.messages);
 
             let deadline = Instant::now() + Duration::from_secs(120);
+            let mut did_save = false;
             let mut cleared = false;
             while !cleared {
-                let Some(output) = pump(&mut client, &incoming, &sender, deadline) else {
+                let Some(updates) = pump(&mut app, &events, deadline) else {
                     break;
                 };
-                cleared = published(&output, &editor, started)
+                did_save |= went_out(&updates, "textDocument/didSave");
+                cleared = published(&updates, &app.editor, started)
                     .iter()
                     .any(|(stamp, list)| *stamp == fixed && !mismatched(list));
             }
+            assert!(did_save, "rust-analyzer asks for saves, so the didSave goes out");
             assert!(cleared, "a publish for the fixed text drops the type error");
             let quiet = Instant::now() + Duration::from_secs(2);
-            while let Some(output) = pump(&mut client, &incoming, &sender, quiet) {
-                for (_, list) in published(&output, &editor, started) {
+            while let Some(updates) = pump(&mut app, &events, quiet) {
+                for (_, list) in published(&updates, &app.editor, started) {
                     assert!(!mismatched(&list), "the type error stays cleared: {list:?}");
                 }
             }
 
-            shut_down(&mut client, &incoming, &sender);
+            shut_down(&mut app, &events);
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        /// Ask the server to shut down, answer it until it exits, and log why it left.
-        fn shut_down(
-            client: &mut lsp::Client,
-            incoming: &mpsc::Receiver<transport::Incoming>,
-            sender: &transport::Sender,
-        ) {
-            sender.send(client.shutdown().messages);
+        /// Shut the server down, as closing the window does, and wait for the client to stop.
+        /// The reader thread logs how the process exited.
+        fn shut_down(app: &mut App, events: &mpsc::Receiver<lsp::client::Event>) {
+            for document in app.client.shutdown() {
+                let _ = app.editor.apply_lsp(&mut app.client, document);
+            }
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                let timeout = deadline.saturating_duration_since(Instant::now());
-                match incoming.recv_timeout(timeout) {
-                    Ok(transport::Incoming::Message(message)) => {
-                        let output = client.receive(message).expect("server messages decode");
-                        sender.send(output.messages);
-                    }
-                    Ok(transport::Incoming::Closed(reason)) => {
-                        eprintln!("{reason}");
-                        break;
-                    }
-                    Err(_) => panic!("the server did not exit after shutdown"),
+                let updates = pump(app, events, deadline).expect("the client stops after shutdown");
+                let stopped = updates.iter().any(|update| {
+                    matches!(
+                        update,
+                        lsp::Update::Status(lsp::client::Status::Stopped(
+                            lsp::client::Reason::Shutdown
+                        ))
+                    )
+                });
+                if stopped {
+                    break;
                 }
             }
         }
@@ -1030,27 +1038,25 @@ fn main() {
                 .collect()
         }
 
-        /// Drive `editor` against the server until `done` holds, and say whether it did before
-        /// `deadline`. Each round fires a scheduled hint fetch at once, as the widget would
-        /// once its delay passed, then takes one server message and lands its updates.
+        /// Drive the app's editor against the server until `done` holds, and say whether it did
+        /// before `deadline`. Each round fires a scheduled hint fetch at once, as the widget
+        /// would once its delay passed, then takes one event and lands its documents.
         fn settle_until(
-            editor: &mut CodeEditor,
-            client: &mut lsp::Client,
-            incoming: &mpsc::Receiver<transport::Incoming>,
-            sender: &transport::Sender,
+            app: &mut App,
+            events: &mpsc::Receiver<lsp::client::Event>,
             (started, deadline): (Instant, Instant),
             done: impl Fn(&CodeEditor) -> bool,
         ) -> bool {
-            while !done(editor) {
-                if let Some(wake) = editor.pending_wake() {
+            while !done(&app.editor) {
+                if let Some(wake) = app.editor.pending_wake() {
                     let event = Event::Editor(Action::Wake(wake.generation));
-                    let _ = editor.update(event, Instant::now());
-                    sender.send(editor.sync_lsp(client).messages);
+                    let _ = app.editor.update(event, Instant::now());
+                    let _ = app.editor.sync_lsp(&mut app.client);
                 }
-                let Some(output) = pump(client, incoming, sender, deadline) else {
+                let Some(updates) = pump(app, events, deadline) else {
                     return false;
                 };
-                for update in output.updates {
+                for update in updates {
                     let lsp::Update::Document(document) = update else {
                         continue;
                     };
@@ -1062,8 +1068,7 @@ fn main() {
                             document.stamp(),
                         );
                     }
-                    let applied = editor.apply_lsp(client, document);
-                    sender.send(applied.messages);
+                    let _ = app.editor.apply_lsp(&mut app.client, document);
                 }
             }
             true
@@ -1079,24 +1084,7 @@ fn main() {
             let root =
                 std::env::temp_dir().join(format!("{SCRATCH}-hints-test-{}", std::process::id()));
             let workspace = Workspace::scratch(&root).expect("the scratch crate is written");
-            let (deliver, incoming) = mpsc::channel();
-            let sender = transport::spawn(move |message| {
-                let _ = deliver.send(message);
-            })
-            .unwrap_or_else(|error| panic!("{}", transport::describe(&error)));
-
-            let (mut client, initialize) = lsp::Client::builder()
-                .root(workspace.root_uri().clone())
-                .process_id(std::process::id())
-                .build();
-            let mut editor = CodeEditor::new(workspace.text()).inlay_hints(true);
-            let mut outgoing = vec![initialize];
-            outgoing.extend(
-                editor
-                    .open_lsp(&mut client, workspace.file_uri(), "rust")
-                    .expect("the only document"),
-            );
-            sender.send(outgoing);
+            let (mut app, events) = started(&workspace);
             let started = Instant::now();
             let within = || (started, Instant::now() + Duration::from_secs(120));
             let current = |editor: &CodeEditor| {
@@ -1106,48 +1094,39 @@ fn main() {
 
             let sum_end = SCRATCH_MAIN.find("let sum").expect("the scratch has `sum`");
             let sum_end = u32::try_from(sum_end + "let sum".len()).expect("small");
-            let arrived = settle_until(
-                &mut editor,
-                &mut client,
-                &incoming,
-                &sender,
-                within(),
-                |e| hint_offsets(e).contains(&sum_end),
-            );
+            let arrived = settle_until(&mut app, &events, within(), |e| {
+                hint_offsets(e).contains(&sum_end)
+            });
             assert!(arrived, "the `sum` hint arrived within the timeout");
 
             let moved = "// moved\n";
             let main_at = SCRATCH_MAIN.find("fn main").expect("the scratch has main");
-            editor
+            app.editor
                 .try_edit(vec![EditOp::insert(u32::try_from(main_at).expect("small"), moved)])
                 .expect("the edit applies");
             let typed = sum_end + 9;
             assert!(
-                hint_offsets(&editor).contains(&typed),
+                hint_offsets(&app.editor).contains(&typed),
                 "the hint rides the edit before any refetch: {:?}",
-                hint_offsets(&editor),
+                hint_offsets(&app.editor),
             );
-            sender.send(editor.sync_lsp(&mut client).messages);
-            let refetched = settle_until(
-                &mut editor,
-                &mut client,
-                &incoming,
-                &sender,
-                within(),
-                |e| current(e) && hint_offsets(e).contains(&typed),
-            );
+            let _ = app.editor.sync_lsp(&mut app.client);
+            let refetched = settle_until(&mut app, &events, within(), |e| {
+                current(e) && hint_offsets(e).contains(&typed)
+            });
             assert!(refetched, "a refetch at the new revision keeps the hint after `sum`");
 
-            let key = editor
+            let key = app
+                .editor
                 .document()
                 .inlays_in(typed..typed)
                 .find(|hint| hint.offset() == typed)
                 .expect("the `sum` hint shows")
                 .key();
             let insert = Event::Editor(Action::InlayInsert { key, offset: typed });
-            let _ = editor.update(insert, Instant::now());
-            sender.send(editor.sync_lsp(&mut client).messages);
-            let text = editor.document().text().into_owned();
+            let _ = app.editor.update(insert, Instant::now());
+            let _ = app.editor.sync_lsp(&mut app.client);
+            let text = app.editor.document().text().into_owned();
             assert_eq!(
                 text.matches("let sum: i32 = add(1, 2);").count(),
                 1,
@@ -1158,25 +1137,18 @@ fn main() {
                 let offsets = hint_offsets(editor);
                 offsets.contains(&typed) || offsets.contains(&typed_end)
             };
-            assert!(!beside(&editor), "no hint is left beside the inserted type");
+            assert!(!beside(&app.editor), "no hint is left beside the inserted type");
 
-            let settled = settle_until(
-                &mut editor,
-                &mut client,
-                &incoming,
-                &sender,
-                within(),
-                current,
-            );
+            let settled = settle_until(&mut app, &events, within(), current);
             assert!(settled, "the hints are refetched after the insert");
             assert!(
-                !beside(&editor),
+                !beside(&app.editor),
                 "the refetch brings no hint beside the inserted type: {:?}",
-                hint_offsets(&editor),
+                hint_offsets(&app.editor),
             );
             eprintln!("{:?}: done", started.elapsed());
 
-            shut_down(&mut client, &incoming, &sender);
+            shut_down(&mut app, &events);
             let _ = std::fs::remove_dir_all(&root);
         }
     }

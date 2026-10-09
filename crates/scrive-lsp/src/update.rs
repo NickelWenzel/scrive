@@ -1,4 +1,5 @@
-//! What the client hands back: document-bound changes, and notifications it passes through.
+//! What the client hands back: document-bound changes, the connection's status, logs, errors,
+//! traces, and notifications it passes through.
 
 use std::ops::Range;
 
@@ -7,17 +8,38 @@ use scrive_core::{
     CompletionItem, Diagnostic, DocId, EditOp, HoverInfo, Revision, SignatureInfo, Ticket,
 };
 
-use crate::{edits, message, uri, Encoding};
+use serde_json::Value;
+
+use crate::{client, edits, log, message, trace, uri, Encoding};
 
 /// One thing a host must act on.
 #[derive(Clone, Debug)]
 pub enum Update {
     /// A change bound for one open document.
     Document(Document),
-    /// A server notification the client does not consume (`window/logMessage`, `$/progress`, …).
-    Notification(message::Notification),
     /// A rename's edits for a file that is not open, for the host to apply on disk.
     FileEdits(FileEdits),
+    /// The connection's status changed.
+    Status(client::Status),
+    /// The server logged a line, or asked for one to be shown.
+    Log(log::Entry),
+    /// Something the client could not act on: an undecodable message, or a failed command.
+    Error(client::Error),
+    /// A server notification the client does not consume, such as `$/progress`.
+    ///
+    /// rust-analyzer sends thousands of `$/progress` notifications while it indexes, and each is
+    /// one update; the client does not coalesce them. A host that shows progress clears it on
+    /// every [`Update::Status`] change.
+    Notification(Notification),
+    /// A message crossed the connection; only with [`trace::Mode::Messages`].
+    Trace(trace::Entry),
+}
+
+/// A server notification passed through to the host.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notification {
+    method: String,
+    params: Option<Value>,
 }
 
 /// A change for one document, stamped with what it is valid against.
@@ -102,13 +124,11 @@ pub enum Refusal {
     Overlap,
 }
 
-/// What an editor did with one [`Document`] update: the host sends `messages`, routes `jump`,
-/// and may log `refused`.
-#[must_use = "Applied.messages must reach the server, and Applied.jump must be routed"]
+/// What an editor did with one [`Document`] update: the host routes `jump`, and may log
+/// `refused`.
+#[must_use = "Applied.jump must be routed"]
 #[derive(Debug, Default)]
 pub struct Applied {
-    /// Messages to send, from the sync that follows every update.
-    pub messages: Vec<message::Message>,
     /// A definition in another document. Present only when the editor still awaited it.
     pub jump: Option<Jump>,
     /// Why the update was not applied, if it was not.
@@ -248,6 +268,27 @@ pub mod jump {
             let span = self.encoding.text_span(text, self.range);
             span.start as u32..span.end as u32
         }
+    }
+}
+
+impl Notification {
+    pub(crate) fn new(notification: message::Notification) -> Self {
+        Self {
+            method: notification.method,
+            params: notification.params,
+        }
+    }
+
+    /// The LSP method, e.g. `$/progress`.
+    #[must_use]
+    pub fn method(&self) -> &str {
+        &self.method
+    }
+
+    /// The params; `None` when absent or `null`.
+    #[must_use]
+    pub fn params(&self) -> Option<&Value> {
+        self.params.as_ref()
     }
 }
 
