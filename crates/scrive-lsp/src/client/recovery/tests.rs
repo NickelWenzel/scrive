@@ -2,7 +2,9 @@
 //! events through `receive` and reading what the client tells the worker and writes.
 
 use std::str::FromStr;
+use std::time::Duration;
 
+use futures::{FutureExt, StreamExt};
 use scrive_core::intel::ticket::Counter;
 use scrive_core::{Document, EditOp, HoverRequest};
 use serde_json::{json, Value};
@@ -17,15 +19,21 @@ struct Scripted {
     client: Client,
     inbox: tap::Inbox,
     queue: tap::Queue,
+    /// What the client queued on its `Events`.
+    local: futures_channel::mpsc::UnboundedReceiver<Event>,
 }
 
 impl Scripted {
     /// A client that sent `initialize` on connection 0, with nothing else queued.
     fn new(policy: restart::Policy) -> Self {
+        Self::with(policy, None)
+    }
+
+    fn with(policy: restart::Policy, initialize_timeout: Option<Duration>) -> Self {
         let (session, initialize) = Builder::default().session(Some(1));
         let (link, queue) = tap::Queue::link(Generation::FIRST);
         let (control, inbox) = tap::Inbox::control();
-        let (local, _) = futures_channel::mpsc::unbounded();
+        let (local, queued) = futures_channel::mpsc::unbounded();
         let mut client = Client::new(
             Id::next(),
             session,
@@ -33,7 +41,7 @@ impl Scripted {
             transport::Control::Stdio(control),
             local,
             trace::Mode::Off,
-            State::new(policy),
+            State::new(policy, initialize_timeout),
         );
         client.send(vec![initialize], None);
         let _ = queue.items();
@@ -41,12 +49,20 @@ impl Scripted {
             client,
             inbox,
             queue,
+            local: queued,
         }
     }
 
     /// A running client with `let value = 1;` open as `file:///a.rs`.
     fn running(policy: restart::Policy) -> (Self, Document) {
-        let mut scripted = Self::new(policy);
+        Self::running_with(policy, None)
+    }
+
+    fn running_with(
+        policy: restart::Policy,
+        initialize_timeout: Option<Duration>,
+    ) -> (Self, Document) {
+        let mut scripted = Self::with(policy, initialize_timeout);
         let doc = document("let value = 1;");
         let _ = scripted
             .client
@@ -94,6 +110,15 @@ impl Scripted {
             link,
         });
         (updates, queue)
+    }
+
+    /// What the client queued on its `Events` since the last call, folded in.
+    fn queued(&mut self) -> Vec<Update> {
+        let mut updates = Vec::new();
+        while let Some(Some(event)) = self.local.next().now_or_never() {
+            updates.extend(self.client.receive(event));
+        }
+        updates
     }
 
     fn attempting(&mut self, generation: u64) -> Vec<Update> {
@@ -561,5 +586,125 @@ fn edits_while_reconnecting_reopen_with_the_latest_text() {
     assert_eq!(
         open["params"]["textDocument"]["version"], 2,
         "the version counts on"
+    );
+}
+
+/// A client that gave up comes back on `restart()`, which starts the count over.
+#[test]
+fn restart_revives_a_client_that_gave_up() {
+    let (mut scripted, _) = Scripted::running(restart::Policy::Never);
+    let _ = scripted.lost(1, exited(101));
+    assert_eq!(
+        scripted.inbox.lifecycles(),
+        [Lifecycle::Stop(nth(1))],
+        "stopped at 1, moving on to 2"
+    );
+    let settled = scripted.client.restart().expect("stdio restarts");
+    assert!(settled.is_empty(), "the loss already settled everything");
+    assert_eq!(
+        scripted.inbox.lifecycles(),
+        [Lifecycle::Restart(nth(3))],
+        "a new connection at once"
+    );
+    assert_eq!(
+        summaries(&scripted.queued()),
+        ["Restarting { attempt: 1 }"],
+        "the status follows through the stream"
+    );
+    let (_, queue) = scripted.reconnected(3);
+    let updates = handshake(&mut scripted, 3, &queue);
+    assert_eq!(summaries(&updates), ["Running"], "running again");
+}
+
+/// `restart()` on a running server settles what was pending, and what the old server still
+/// answers is dropped.
+#[test]
+fn restart_drops_the_old_connections_replies() {
+    let (mut scripted, doc) = Scripted::running(restart::Policy::default());
+    let request = hover(&doc);
+    let _ = scripted.client.hover(&doc.snapshot(), &request);
+    let items = scripted.queue.items();
+    let [Some(sent)] = items.as_slice() else {
+        panic!("expected the hover, got {items:?}")
+    };
+    let settled = scripted.client.restart().expect("stdio restarts");
+    assert!(
+        matches!(settled.as_slice(), [first, ..] if matches!(first.change(), update::Change::Hover(None))),
+        "the hover settles empty: {settled:?}"
+    );
+    assert_eq!(
+        scripted.inbox.lifecycles(),
+        [Lifecycle::Restart(nth(1))],
+        "the worker restarts"
+    );
+    assert_eq!(
+        summaries(&scripted.queued()),
+        ["Restarting { attempt: 1 }"],
+        "restarting"
+    );
+    let reply = json!({"id": sent["id"], "result": {"contents": "late"}});
+    assert!(
+        scripted.message(0, reply).is_empty(),
+        "the old reply is dropped"
+    );
+}
+
+/// After `shutdown()` there is nothing to restart.
+#[test]
+fn restart_after_shutdown_does_nothing() {
+    let (mut scripted, _) = Scripted::running(restart::Policy::default());
+    let _ = scripted.client.shutdown();
+    let _ = scripted.inbox.lifecycles();
+    assert!(
+        scripted.client.restart().expect("not an error").is_empty(),
+        "no documents"
+    );
+    assert!(scripted.queued().is_empty(), "no status");
+    assert!(
+        scripted.inbox.lifecycles().is_empty(),
+        "nothing for the worker"
+    );
+}
+
+/// A server that never answers `initialize` stops the client the first time; after a
+/// handshake, the timeout is a loss like any other and restarts.
+#[test]
+fn an_initialize_timeout_stops_first_and_restarts_later() {
+    let five = Duration::from_secs(5);
+    let mut scripted = Scripted::with(restart::Policy::default(), Some(five));
+    let updates = scripted.lost(1, Reason::Timeout);
+    assert_eq!(
+        summaries(&updates),
+        [
+            "error(the server did not answer `initialize` within 5s)",
+            "Stopped(Timeout)"
+        ],
+        "the error, then the stop"
+    );
+    assert_eq!(
+        scripted.inbox.lifecycles(),
+        [Lifecycle::Stop(nth(1))],
+        "the worker is told to stop"
+    );
+
+    let (mut scripted, _) = Scripted::running_with(restart::Policy::default(), Some(five));
+    let _ = scripted.lost(1, exited(101));
+    let (_, queue) = scripted.reconnected(1);
+    let _ = queue.items();
+    let _ = scripted.inbox.lifecycles();
+    let updates = scripted.lost(2, Reason::Timeout);
+    assert_eq!(
+        summaries(&updates),
+        [
+            "error(the server did not answer `initialize` within 5s)",
+            "diagnostics(0)",
+            "Restarting { attempt: 2 }"
+        ],
+        "the error, the clear, the restart"
+    );
+    assert_eq!(
+        scripted.inbox.lifecycles(),
+        [Lifecycle::Reconnect(nth(2))],
+        "the worker reconnects"
     );
 }

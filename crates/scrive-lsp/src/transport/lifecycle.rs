@@ -21,9 +21,11 @@ pub(crate) enum Lifecycle {
     Handshaken(Generation),
     /// Bring up connection `generation` after the backoff; answers the loss that announced it.
     Reconnect(Generation),
-    /// Don't reconnect: tear connection `generation` down if it is up, and wait for `Shutdown`.
-    /// The worker moves on to the next generation.
+    /// Don't reconnect: tear connection `generation` down if it is up, and wait for `Restart`
+    /// or `Shutdown`. The worker moves on to the next generation.
     Stop(Generation),
+    /// Tear down whatever is up and bring up connection `generation` now, with no backoff.
+    Restart(Generation),
 }
 
 /// Whether the server answered `initialize`, which decides how it is shut down.

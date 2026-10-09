@@ -75,6 +75,11 @@ impl Window {
             Verdict::Restart
         }
     }
+
+    /// Forgets every recorded loss.
+    pub(crate) fn reset(&mut self) {
+        self.losses.clear();
+    }
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -137,5 +142,23 @@ mod tests {
     fn never_rules_never() {
         let mut window = Window::new(Policy::Never);
         assert_eq!(window.admit(Instant::now()), Verdict::Never, "never");
+    }
+
+    /// A reset starts the count over.
+    #[test]
+    fn reset_forgets_every_loss() {
+        let mut window = Window::new(Policy::UpTo {
+            count: 1,
+            within: MINUTE,
+        });
+        let now = Instant::now();
+        assert_eq!(window.admit(now), Verdict::Restart, "the first loss");
+        window.reset();
+        assert_eq!(window.admit(now), Verdict::Restart, "counted afresh");
+        assert_eq!(
+            window.admit(now),
+            Verdict::Exhausted,
+            "then the window is full"
+        );
     }
 }

@@ -416,6 +416,25 @@ impl Client {
         documents(settled.updates)
     }
 
+    /// Starts the server again: every request in flight settles with its empty answer,
+    /// returned for the editors to apply, what the server published is cleared, and a new server
+    /// starts at once, with the restart policy's count starting over. Documents stay
+    /// registered and reopen on it. [`Status::Restarting`] follows through [`Events`].
+    ///
+    /// After [`shutdown`](Self::shutdown) there is nothing to restart, and this returns no
+    /// documents.
+    ///
+    /// # Errors
+    /// [`Error::Unrestartable`] on a bridge that cannot start its server (memory).
+    #[must_use = "the settled documents clear the editors' awaited slots"]
+    pub fn restart(&mut self) -> Result<Vec<update::Document>, Error> {
+        match &self.control {
+            transport::Control::Memory => Err(Error::Unrestartable),
+            #[cfg(not(target_family = "wasm"))]
+            transport::Control::Stdio(_) => Ok(self.restart_worker()),
+        }
+    }
+
     /// Folds one event from this client's [`Events`] in, and returns what the host must act on,
     /// in order: an incoming message's [`Update::Trace`] first, a [`Update::Status`] change last.
     /// Server requests are answered, and messages the event causes are sent. Traffic from a
@@ -461,7 +480,10 @@ impl Client {
             }
             event::Payload::Sent(entry) => vec![Update::Trace(entry)],
             event::Payload::Transport(transport::Event::Stopped(reason))
-            | event::Payload::Stopped(reason) => self.stopped(reason),
+            | event::Payload::Status(Status::Stopped(reason)) => self.stopped(reason),
+            event::Payload::Status(
+                status @ (Status::Starting | Status::Running | Status::Restarting { .. }),
+            ) => vec![Update::Status(status)],
         }
     }
 
@@ -543,10 +565,15 @@ impl Client {
     /// Ends the connection from this side: drops the link and queues `Stopped(reason)`.
     fn stop(&mut self, reason: Reason) {
         self.connection = Connection::Shut(None);
+        self.queue(Status::Stopped(reason));
+    }
+
+    /// Queues `status` on `Events`, for a decision taken outside `receive`.
+    fn queue(&self, status: Status) {
         // `Events` was dropped: nobody is left to tell.
         let _ = self
             .local
-            .unbounded_send(Event::new(self.id, event::Payload::Stopped(reason)));
+            .unbounded_send(Event::new(self.id, event::Payload::Status(status)));
     }
 
     fn received(&mut self, body: Arc<[u8]>) -> Vec<Update> {

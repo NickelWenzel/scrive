@@ -3,6 +3,7 @@
 use core::fmt;
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
 use scrive_core::DocId;
 
@@ -71,6 +72,15 @@ pub enum Error {
         /// Why the attempt failed.
         source: Arc<io::Error>,
     },
+    /// The server did not answer `initialize` within `after`.
+    #[error("the server did not answer `initialize` within {after:?}")]
+    Timeout {
+        /// The builder's `initialize_timeout`.
+        after: Duration,
+    },
+    /// This bridge cannot start its server again: an in-process server belongs to the host.
+    #[error("this bridge cannot restart its server")]
+    Unrestartable,
 }
 
 /// A JSON-RPC error object from the server.

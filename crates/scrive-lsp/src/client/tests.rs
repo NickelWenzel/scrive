@@ -582,6 +582,25 @@ fn event_debug_prints_a_summary_only() {
     assert!(printed.contains("bytes"), "with the size: {printed}");
 }
 
+/// An in-process server belongs to the host, so the client can't restart it.
+#[test]
+fn memory_cannot_restart() {
+    let (mut wire, _) = running();
+    assert!(
+        matches!(wire.client.restart(), Err(Error::Unrestartable)),
+        "unrestartable"
+    );
+    let _ = wire.client.shutdown();
+    assert!(
+        matches!(wire.client.restart(), Err(Error::Unrestartable)),
+        "after shutdown too"
+    );
+    assert!(wire.drain().iter().all(|update| !matches!(
+        update,
+        Update::Status(Status::Restarting { .. })
+    )), "no restart status");
+}
+
 /// `Failed` compares by its error's kind, so hosts can compare statuses.
 #[test]
 fn status_and_reason_compare_failed_by_error_kind() {

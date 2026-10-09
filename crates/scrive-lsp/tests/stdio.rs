@@ -285,6 +285,22 @@ mod native {
                 "a_reconnect_racing_shutdown_never_shows_running",
                 a_reconnect_racing_shutdown_never_shows_running,
             ),
+            (
+                "restart_after_giving_up_brings_the_server_back",
+                restart_after_giving_up_brings_the_server_back,
+            ),
+            (
+                "restart_kills_a_healthy_server_and_reopens",
+                restart_kills_a_healthy_server_and_reopens,
+            ),
+            (
+                "an_initialize_timeout_on_the_first_start_stops",
+                an_initialize_timeout_on_the_first_start_stops,
+            ),
+            (
+                "an_initialize_timeout_after_a_restart_counts_against_the_policy",
+                an_initialize_timeout_after_a_restart_counts_against_the_policy,
+            ),
         ];
         #[cfg(windows)]
         let tests = [
@@ -989,6 +1005,120 @@ mod native {
             statuses(&end),
             [Status::Stopped(Reason::Shutdown)],
             "only the shutdown: {end:#?}"
+        );
+    }
+
+    /// After the policy gave up, `restart()` brings the server back for the same client.
+    fn restart_after_giving_up_brings_the_server_back() {
+        let policy = restart::Policy::UpTo {
+            count: 2,
+            within: Duration::from_secs(60),
+        };
+        let mut harness = Harness::start(
+            "conversation",
+            &[("CRASH_AFTER", "3"), ("CRASHES", "3")],
+            |builder| builder.restart(policy),
+        );
+        let id = harness.client.id();
+        harness.until(running);
+        let doc = harness.open();
+        let updates = harness.until(|update| stopped(update).is_some());
+        assert_eq!(
+            statuses(&updates).last(),
+            Some(&Status::Stopped(Reason::GaveUp)),
+            "{updates:#?}"
+        );
+        let settled = harness.client.restart().expect("stdio restarts");
+        assert!(settled.is_empty(), "nothing was pending");
+        let updates = harness.until(running);
+        assert_eq!(
+            statuses(&updates),
+            [Status::Restarting { attempt: 1 }, Status::Running],
+            "{updates:#?}"
+        );
+        let request = harness.hover(&doc);
+        harness.until(|update| hovered(update, &request).flatten().is_some());
+        assert_eq!(harness.client.id(), id, "the same client");
+    }
+
+    /// `restart()` replaces a healthy server: it is killed and reaped before the next starts,
+    /// and the document reopens on the new one.
+    fn restart_kills_a_healthy_server_and_reopens() {
+        let mut harness = Harness::start("conversation", &[], |builder| builder);
+        harness.until(running);
+        let doc = harness.open();
+        harness.until(published_fake);
+        let _ = harness.client.restart().expect("stdio restarts");
+        let updates = harness.until(running);
+        assert_eq!(
+            statuses(&updates),
+            [Status::Restarting { attempt: 1 }, Status::Running],
+            "{updates:#?}"
+        );
+        let request = harness.hover(&doc);
+        harness.until(|update| hovered(update, &request).flatten().is_some());
+        let lines = harness.log.lines();
+        assert_eq!(spawns(&lines), 2, "two processes: {lines:#?}");
+        assert!(
+            spawn_lines(&lines, 1)
+                .iter()
+                .any(|line| line.starts_with("recv textDocument/didOpen")),
+            "the document reopens: {lines:#?}"
+        );
+    }
+
+    /// A server that never answers `initialize` stops the client once the deadline passes,
+    /// after reporting it.
+    fn an_initialize_timeout_on_the_first_start_stops() {
+        let timeout = Duration::from_millis(300);
+        let mut harness = Harness::start("conversation", &[("SILENT_FROM", "0")], |builder| {
+            builder.initialize_timeout(timeout)
+        });
+        let updates = harness.until(|update| stopped(update).is_some());
+        let timed_out = updates.iter().position(|update| {
+            matches!(update, Update::Error(client::Error::Timeout { after }) if *after == timeout)
+        });
+        assert!(
+            timed_out.is_some_and(|at| at + 1 < updates.len()),
+            "the error comes first: {updates:#?}"
+        );
+        assert_eq!(
+            statuses(&updates),
+            [Status::Stopped(Reason::Timeout)],
+            "{updates:#?}"
+        );
+        assert_eq!(spawns(&harness.log.lines()), 1, "one process");
+    }
+
+    /// After a restart, a server that never answers `initialize` is a loss the policy counts.
+    fn an_initialize_timeout_after_a_restart_counts_against_the_policy() {
+        let timeout = Duration::from_secs(2);
+        let policy = restart::Policy::UpTo {
+            count: 1,
+            within: Duration::from_secs(60),
+        };
+        let mut harness = Harness::start(
+            "conversation",
+            &[("CRASH_AFTER", "3"), ("CRASHES", "1"), ("SILENT_FROM", "1")],
+            |builder| builder.restart(policy).initialize_timeout(timeout),
+        );
+        let mut updates = harness.until(running);
+        let _doc = harness.open();
+        updates.extend(harness.until(|update| stopped(update).is_some()));
+        assert_eq!(
+            statuses(&updates),
+            [
+                Status::Running,
+                Status::Restarting { attempt: 1 },
+                Status::Stopped(Reason::GaveUp),
+            ],
+            "{updates:#?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|update| matches!(update, Update::Error(client::Error::Timeout { .. }))),
+            "the timeout is reported: {updates:#?}"
         );
     }
 

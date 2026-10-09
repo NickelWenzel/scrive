@@ -18,8 +18,8 @@ pub enum Status {
     },
     /// The connection is over: nothing goes out and every request declines. After
     /// [`Reason::Shutdown`], and for a bridge that cannot restart, this is final and the client's
-    /// [`Events`](super::Events) ends. After any other reason a server process's client keeps
-    /// its stream running.
+    /// [`Events`](super::Events) ends. After any other reason a restartable bridge stays
+    /// revivable: [`Client::restart`](super::Client::restart) starts the server again.
     Stopped(Reason),
 }
 
@@ -49,6 +49,8 @@ pub enum Reason {
     Unresponsive,
     /// The restart policy ran out: too many losses within its window.
     GaveUp,
+    /// The server did not answer `initialize` within the builder's `initialize_timeout`.
+    Timeout,
 }
 
 /// `Restarting` compares by its attempt, `Stopped` by its reason.
@@ -76,7 +78,8 @@ impl PartialEq for Reason {
             | (Self::Closed, Self::Closed)
             | (Self::Initialize, Self::Initialize)
             | (Self::Unresponsive, Self::Unresponsive)
-            | (Self::GaveUp, Self::GaveUp) => true,
+            | (Self::GaveUp, Self::GaveUp)
+            | (Self::Timeout, Self::Timeout) => true,
             (Self::Failed(a), Self::Failed(b)) => a.kind() == b.kind(),
             (
                 Self::Exited { code, signal },
@@ -92,7 +95,8 @@ impl PartialEq for Reason {
                 | Self::Failed(_)
                 | Self::Exited { .. }
                 | Self::Unresponsive
-                | Self::GaveUp,
+                | Self::GaveUp
+                | Self::Timeout,
                 _,
             ) => false,
         }
