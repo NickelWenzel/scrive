@@ -6,7 +6,12 @@ use std::io;
 use std::net::SocketAddr;
 
 /// Why [`Builder`](super::Builder)'s terminal method could not start the connection.
+///
+/// Which variants exist depends on the target and on the `websocket` feature, and cargo unifies
+/// features across a build: any crate in the tree that turns `websocket` on adds variants. A
+/// match on it must therefore end with a wildcard arm, or use `if let`.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[cfg(not(target_family = "wasm"))]
     /// The server process could not be started, for example because the program is not found.
