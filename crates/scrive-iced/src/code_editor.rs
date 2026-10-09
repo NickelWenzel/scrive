@@ -1674,6 +1674,7 @@ impl CodeEditor {
             }
             Action::AddCaret(offset) => self.doc.add_caret(offset),
             Action::AddNextOccurrence => self.doc.add_next_occurrence(),
+            Action::RemoveNewestCaret => self.doc.remove_newest_selection(),
             Action::SelectAllOccurrences => self.doc.select_all_occurrences(),
             Action::AddCaretVertical { down } => self.doc.add_caret_vertical(down),
             Action::JumpToBracket => self.doc.jump_to_bracket(),

@@ -478,6 +478,15 @@ impl Document {
         self.selections.add_caret(offset);
     }
 
+    /// Ctrl+U: remove the most recently added cursor, revealing the one that
+    /// is now newest. A single selection is left alone.
+    pub fn remove_newest_selection(&mut self) {
+        self.reset_transient();
+        if self.selections.remove_newest() {
+            self.request_reveal(RevealMode::Fit);
+        }
+    }
+
     /// Ctrl+D. If the newest selection is an empty caret, select the word
     /// surrounding it; otherwise add the next literal occurrence of the newest
     /// selection's text as a new (and now newest) selection — scanning forward

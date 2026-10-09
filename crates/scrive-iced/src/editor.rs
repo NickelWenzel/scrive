@@ -294,6 +294,8 @@ pub enum Action {
     AddCaret(u32),
     /// Add the next occurrence of the selection as a new caret (Ctrl+D).
     AddNextOccurrence,
+    /// Remove the most recently added cursor (Ctrl+U).
+    RemoveNewestCaret,
     /// Select every occurrence of the selection (Ctrl+Shift+L).
     SelectAllOccurrences,
     /// Add a caret one display row above/below every caret (Ctrl+Alt+↑/↓).
@@ -498,6 +500,7 @@ impl Action {
                 | Action::AddCaretVertical { .. }
                 | Action::SelectAllOccurrences
                 | Action::AddNextOccurrence
+                | Action::RemoveNewestCaret
         )
     }
 }
@@ -4018,6 +4021,10 @@ fn interpret_key(key: &Key, text: Option<&str>, mods: Modifiers) -> Option<Actio
         Key::Character(c) if mods.control() && !mods.alt() && c.as_str() == "d" => {
             Some(Action::AddNextOccurrence)
         }
+        // Ctrl+U removes the last added cursor (same `!alt` guard).
+        Key::Character(c) if mods.control() && !mods.alt() && c.as_str() == "u" => {
+            Some(Action::RemoveNewestCaret)
+        }
         // Ctrl+Shift+L select-all-occurrences (Shift makes the logical "L").
         Key::Character(c)
             if mods.control() && mods.shift() && !mods.alt() && c.as_str().eq_ignore_ascii_case("l") =>
@@ -4630,6 +4637,10 @@ mod tests {
         assert_eq!(
             interpret_key(&Key::Character("d".into()), Some("d"), Modifiers::CTRL),
             Some(Action::AddNextOccurrence)
+        );
+        assert_eq!(
+            interpret_key(&Key::Character("u".into()), Some("u"), Modifiers::CTRL),
+            Some(Action::RemoveNewestCaret)
         );
         // Ctrl+Alt (AltGr) must NOT trigger the gesture — the `!alt` guard. (What
         // it resolves to instead is platform-dependent, since `command()` folds

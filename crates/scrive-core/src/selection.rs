@@ -226,6 +226,17 @@ impl SelectionSet {
         self.normalize();
     }
 
+    /// Remove the newest selection (largest id) — undoing the last added
+    /// cursor. A lone selection stays; returns whether one was removed.
+    pub fn remove_newest(&mut self) -> bool {
+        if self.selections.len() == 1 {
+            return false;
+        }
+        let newest = self.newest().id;
+        self.selections.retain(|s| s.id != newest);
+        true
+    }
+
     /// Replace the whole set with a single selection (Escape collapses to the
     /// oldest; here the caller supplies it).
     pub fn set_single(&mut self, sel: Selection) {
@@ -458,6 +469,19 @@ mod tests {
         assert_eq!(set.all()[0].id, SelectionId(0), "the oldest cursor is kept");
         assert!(set.all()[0].is_empty());
         assert_eq!(set.all()[0].head(), 0);
+    }
+
+    #[test]
+    fn remove_newest_drops_the_last_added_cursor() {
+        let mut set = SelectionSet::new(0); // id 0
+        set.add_caret(20); // id 1
+        set.add_caret(10); // id 2, newest though not last in document order
+        assert!(set.remove_newest());
+        assert_eq!(set.all().iter().map(Selection::head).collect::<Vec<_>>(), [0, 20]);
+        assert!(set.remove_newest());
+        assert_eq!(set.all().iter().map(Selection::head).collect::<Vec<_>>(), [0]);
+        assert!(!set.remove_newest(), "the last selection stays");
+        assert_eq!(set.len(), 1);
     }
 
     #[test]
