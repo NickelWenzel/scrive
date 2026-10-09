@@ -1,9 +1,9 @@
-//! The TCP bridge: a language server on a socket that the client dials. A worker thread owns the
-//! connection and dials again when the client says so; each connection gets a writer and a
-//! reader of its own.
+//! The TCP bridge: a language server on a socket, which the client dials or accepts once. A
+//! worker thread owns the connection and dials again when the client says so; each connection
+//! gets a writer and a reader of its own.
 
 use std::io;
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -25,6 +25,9 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 // every such start.
 const FIRST_STEP: Duration = Duration::from_millis(50);
 const STEP_CAP: Duration = Duration::from_secs(1);
+// How long a pending accept waits on the inbox between polls; it bounds accept latency only,
+// since a notice wakes the wait at once.
+const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
 /// Dials the server once, within the deadline if there is one.
 type Dial = Box<dyn Fn(Option<Instant>) -> io::Result<TcpStream> + Send>;
@@ -51,11 +54,16 @@ enum Mode {
     /// It dials, and dials again after a loss. Before any connection, and after a restart,
     /// failed dials retry until `budget` has passed.
     Connect { dial: Dial, budget: Duration },
+    /// It accepts one connection, and that connection's loss ends it: a server that dialed in
+    /// is started again by whoever started it.
+    Listen,
 }
 
 enum State {
     /// Dialing until a connection is up or the budget runs out.
     Dialing(Dialing),
+    /// Waiting for the server to dial in; `queue` is the first connection's.
+    Accepting { listener: TcpListener, queue: Queue },
     /// The connection of the current generation is up.
     Live(Connection),
     /// The connection of `generation` is torn down; its reader gets until `until` to reach
@@ -153,6 +161,7 @@ impl Worker {
     fn next(&self) -> Option<Notice> {
         let until = match &self.state {
             State::Dialing(dialing) => Some(dialing.at),
+            State::Accepting { .. } => Some(Instant::now() + ACCEPT_POLL),
             State::Live(connection) => connection.deadline,
             State::Closing { sequence, .. } => Some(sequence.until()),
             State::Draining { until, .. } | State::Backoff { until } => Some(*until),
@@ -228,15 +237,18 @@ impl Worker {
                 sequence,
                 ending: Ending::Stopped,
             },
-            // Nothing is up that needs a goodbye: a pending dial never happens.
+            // Nothing is up that needs a goodbye: a pending dial or accept never happens. The
+            // listener closes before the stop is reported, so its port is free by then.
             (
                 Lifecycle::Shutdown { .. },
-                State::Dialing(_)
+                state @ (State::Dialing(_)
+                | State::Accepting { .. }
                 | State::Draining { .. }
                 | State::Waiting
                 | State::Backoff { .. }
-                | State::Idle,
+                | State::Idle),
             ) => {
+                drop(state);
                 self.report(transport::Event::Stopped(client::Reason::Shutdown));
                 return ControlFlow::Break(());
             }
@@ -262,6 +274,7 @@ impl Worker {
             (
                 Lifecycle::Stop(generation),
                 State::Dialing(_)
+                | State::Accepting { .. }
                 | State::Draining { .. }
                 | State::Waiting
                 | State::Backoff { .. }
@@ -279,7 +292,7 @@ impl Worker {
                     ending: Ending::Idle,
                     ..
                 },
-            ) if generation >= self.generation => {
+            ) if generation >= self.generation && self.redials() => {
                 connection.end();
                 self.restart(generation, now)
             }
@@ -290,7 +303,7 @@ impl Worker {
                 | State::Waiting
                 | State::Backoff { .. }
                 | State::Idle,
-            ) if generation >= self.generation => self.restart(generation, now),
+            ) if generation >= self.generation && self.redials() => self.restart(generation, now),
             // A restart never runs behind the client, and a shutdown under way wins.
             (Lifecycle::Restart(generation), state) => {
                 debug_assert!(
@@ -323,6 +336,7 @@ impl Worker {
                 ..
             } if *draining == generation => *ended = true,
             State::Dialing(_)
+            | State::Accepting { .. }
             | State::Live(_)
             | State::Draining { .. }
             | State::Waiting
@@ -349,6 +363,38 @@ impl Worker {
         let state = std::mem::replace(&mut self.state, State::Idle);
         self.state = match state {
             State::Dialing(dialing) if now >= dialing.at => self.dial(dialing),
+            State::Accepting { listener, queue } => match listener.accept() {
+                Ok((stream, _)) => {
+                    drop(listener);
+                    let mut queue = Some(queue);
+                    // Windows and the BSDs hand out accepted sockets in the listener's
+                    // non-blocking mode, which would make the reader spin.
+                    let opened = stream
+                        .set_nonblocking(false)
+                        .and_then(|()| self.open(stream, &mut queue));
+                    match opened {
+                        Ok(connection) => {
+                            self.retry = 1;
+                            State::Live(connection)
+                        }
+                        Err(error) => return self.fail(error),
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::Interrupted
+                            | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    State::Accepting { listener, queue }
+                }
+                Err(error) => {
+                    drop((listener, queue));
+                    return self.fail(error);
+                }
+            },
             State::Live(connection) if connection.deadline.is_some_and(|until| now >= until) => {
                 self.drain(connection, client::Reason::Timeout, now)
             }
@@ -359,14 +405,20 @@ impl Worker {
                 reason,
                 until,
                 ..
-            } if ended || now >= until => {
-                self.generation = self.generation.next();
-                self.report(transport::Event::Lost {
-                    generation: self.generation,
-                    reason,
-                });
-                State::Waiting
-            }
+            } if ended || now >= until => match self.mode {
+                Mode::Connect { .. } => {
+                    self.generation = self.generation.next();
+                    self.report(transport::Event::Lost {
+                        generation: self.generation,
+                        reason,
+                    });
+                    State::Waiting
+                }
+                Mode::Listen => {
+                    self.report(transport::Event::Stopped(reason));
+                    return ControlFlow::Break(());
+                }
+            },
             State::Backoff { until } if now >= until => self.redial(),
             State::Closing {
                 connection,
@@ -438,14 +490,18 @@ impl Worker {
     fn restart(&mut self, generation: Generation, now: Instant) -> State {
         self.generation = generation;
         self.retry = 0;
-        let Mode::Connect { budget, .. } = &self.mode;
-        State::Dialing(Dialing {
-            deadline: now + *budget,
-            at: now,
-            failed: 0,
-            failure: None,
-            queue: None,
-        })
+        let Mode::Connect { budget, .. } = &self.mode else {
+            unreachable!("only a dialing worker restarts");
+        };
+        State::Dialing(Dialing::new(now, *budget, None))
+    }
+
+    /// Whether the worker can bring a connection up again.
+    fn redials(&self) -> bool {
+        match self.mode {
+            Mode::Connect { .. } => true,
+            Mode::Listen => false,
+        }
     }
 
     /// One dial of the first ones: up on success, retried on failure until the budget runs out,
@@ -503,8 +559,18 @@ impl Worker {
     }
 
     fn connect(&self, deadline: Option<Instant>) -> io::Result<TcpStream> {
-        let Mode::Connect { dial, .. } = &self.mode;
+        let Mode::Connect { dial, .. } = &self.mode else {
+            unreachable!("a listening worker never dials");
+        };
         dial(deadline)
+    }
+
+    /// The bridge can't go on: it stops with `error`.
+    fn fail(&self, error: io::Error) -> ControlFlow<()> {
+        self.report(transport::Event::Stopped(client::Reason::Failed(Arc::new(
+            error,
+        ))));
+        ControlFlow::Break(())
     }
 
     /// Starts connection `self.generation` on `stream`, on `queue` if the client already holds
@@ -548,6 +614,19 @@ impl Worker {
     fn report(&self, event: transport::Event) {
         // `Events` was dropped: nobody is left to tell.
         let _ = self.events.unbounded_send(event);
+    }
+}
+
+impl Dialing {
+    /// The first dial at `now`, retried until `budget` has passed.
+    fn new(now: Instant, budget: Duration, queue: Option<Queue>) -> Self {
+        Self {
+            deadline: now + budget,
+            at: now,
+            failed: 0,
+            failure: None,
+            queue,
+        }
     }
 }
 
@@ -623,6 +702,39 @@ pub(crate) fn connect<A>(
 where
     A: ToSocketAddrs + Send + 'static,
 {
+    let now = Instant::now();
+    let mode = Mode::Connect {
+        dial: Box::new(move |deadline| dial(&address, deadline)),
+        budget,
+    };
+    spawn(mode, settings, |queue| {
+        State::Dialing(Dialing::new(now, budget, Some(queue)))
+    })
+}
+
+/// Binds `address` and starts a worker that accepts exactly one connection. Returns the bound
+/// address, with the port the OS picked for port 0.
+pub(crate) fn listen(
+    address: SocketAddr,
+    settings: Settings,
+) -> Result<(Started, SocketAddr), builder::Error> {
+    let bind = |source| builder::Error::Bind { address, source };
+    let listener = TcpListener::bind(address).map_err(bind)?;
+    listener.set_nonblocking(true).map_err(bind)?;
+    let bound = listener.local_addr().map_err(bind)?;
+    let started = spawn(Mode::Listen, settings, |queue| State::Accepting {
+        listener,
+        queue,
+    })?;
+    Ok((started, bound))
+}
+
+/// Starts the worker in the state `first` makes of the first connection's queue.
+fn spawn(
+    mode: Mode,
+    settings: Settings,
+    first: impl FnOnce(Queue) -> State,
+) -> Result<Started, builder::Error> {
     let (sender, notices) = mpsc::channel();
     let (events, incoming) = futures_channel::mpsc::unbounded();
     let generation = Generation::FIRST;
@@ -631,20 +743,14 @@ where
     let handle = Handle {
         notices: sender.clone(),
     };
-    let now = Instant::now();
+    let control = match mode {
+        Mode::Connect { .. } => transport::Control::Tcp(handle),
+        Mode::Listen => transport::Control::Listen(handle),
+    };
     let worker = Worker {
-        mode: Mode::Connect {
-            dial: Box::new(move |deadline| dial(&address, deadline)),
-            budget,
-        },
+        mode,
         generation,
-        state: State::Dialing(Dialing {
-            deadline: now + budget,
-            at: now,
-            failed: 0,
-            failure: None,
-            queue: Some(queue),
-        }),
+        state: first(queue),
         retry: 0,
         settings,
         events,
@@ -652,12 +758,12 @@ where
         sender,
     };
     transport::start(format!("scrive-lsp tcp #{generation}"), move || {
-        worker.run()
+        worker.run();
     })
     .map_err(builder::Error::Thread)?;
     Ok(Started {
         link,
-        control: transport::Control::Tcp(handle),
+        control,
         inbound: transport::Inbound::Channel(incoming),
     })
 }

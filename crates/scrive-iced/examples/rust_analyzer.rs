@@ -394,9 +394,9 @@ fn main() {
                     "{SERVER} is not on PATH; install it with `rustup component add rust-analyzer`"
                 )
             }
-            lsp::client::builder::Error::Spawn(_) | lsp::client::builder::Error::Thread(_) => {
-                error.to_string()
-            }
+            lsp::client::builder::Error::Spawn(_)
+            | lsp::client::builder::Error::Thread(_)
+            | lsp::client::builder::Error::Bind { .. } => error.to_string(),
         }
     }
 

@@ -116,6 +116,9 @@ pub(crate) enum Control {
     /// The worker of a TCP bridge that dials its server.
     #[cfg(not(target_family = "wasm"))]
     Tcp(Handle),
+    /// The worker of a TCP bridge that accepted its server once.
+    #[cfg(not(target_family = "wasm"))]
+    Listen(Handle),
 }
 
 /// The channel a worker bridge's threads report on.
@@ -210,7 +213,9 @@ impl Control {
     pub(crate) fn send(&self, lifecycle: Lifecycle) {
         match self {
             Self::Memory => {}
-            Self::Stdio(handle) | Self::Tcp(handle) => handle.send(lifecycle),
+            Self::Stdio(handle) | Self::Tcp(handle) | Self::Listen(handle) => {
+                handle.send(lifecycle);
+            }
         }
     }
 }
