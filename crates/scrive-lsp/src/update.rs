@@ -295,7 +295,7 @@ mod tests {
     use super::*;
 
     fn key(text: &str) -> uri::Key {
-        uri::normalize(&lsp_types::Uri::from_str(text).expect("fixture URI parses"))
+        uri::Key::new(&lsp_types::Uri::from_str(text).expect("fixture URI parses"))
     }
 
     fn edit(start: (u32, u32), end: (u32, u32), text: &str) -> lsp_types::TextEdit {

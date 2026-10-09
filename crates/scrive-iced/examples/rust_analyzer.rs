@@ -355,8 +355,9 @@ fn main() {
     /// The file to edit and the crate it belongs to.
     #[derive(Debug, Clone)]
     pub struct Workspace {
-        root: PathBuf,
+        root_uri: lsp::lsp_types::Uri,
         file: PathBuf,
+        file_uri: lsp::lsp_types::Uri,
         text: String,
     }
 
@@ -421,9 +422,21 @@ fn main() {
                         io::ErrorKind::NotFound,
                         format!("no Cargo.toml above {}", file.display()),
                     )
-                })?
-                .to_owned();
-            Ok(Self { root, file, text })
+                })?;
+            let uri = |path: &Path| {
+                lsp::uri::from_path(path).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("{} is not UTF-8", path.display()),
+                    )
+                })
+            };
+            Ok(Self {
+                root_uri: uri(root)?,
+                file_uri: uri(&file)?,
+                file,
+                text,
+            })
         }
 
         /// Writes the scratch crate into `root`, replacing an earlier one, and opens its
@@ -435,12 +448,12 @@ fn main() {
             Self::open(&root.join("src/main.rs"))
         }
 
-        fn file_uri(&self) -> lsp::lsp_types::Uri {
-            file_uri(&self.file)
+        fn file_uri(&self) -> &lsp::lsp_types::Uri {
+            &self.file_uri
         }
 
-        fn root_uri(&self) -> lsp::lsp_types::Uri {
-            file_uri(&self.root)
+        fn root_uri(&self) -> &lsp::lsp_types::Uri {
+            &self.root_uri
         }
 
         fn text(&self) -> &str {
@@ -451,7 +464,7 @@ fn main() {
     impl App {
         fn new(workspace: &Workspace) -> Self {
             let (mut client, initialize) = lsp::Client::builder()
-                .root(workspace.root_uri())
+                .root(workspace.root_uri().clone())
                 .process_id(std::process::id())
                 .build();
             let mut editor = CodeEditor::new(workspace.text())
@@ -462,7 +475,7 @@ fn main() {
             // Before the handshake this only records the text; the didOpen follows `initialized`.
             queued.extend(
                 editor
-                    .open_lsp(&mut client, &workspace.file_uri(), "rust")
+                    .open_lsp(&mut client, workspace.file_uri(), "rust")
                     .expect("the client has no other document"),
             );
             Self {
@@ -716,28 +729,6 @@ fn main() {
         Some(line)
     }
 
-    /// A `file:` URI for the absolute `path`, percent-encoding every byte outside RFC 3986's
-    /// unreserved set, `/` and `:`.
-    fn file_uri(path: &Path) -> lsp::lsp_types::Uri {
-        let mut path = path.to_string_lossy().into_owned();
-        if cfg!(windows) {
-            path = path.replace('\\', "/");
-        }
-        if !path.starts_with('/') {
-            // A drive-letter path: `file:///C:/…`.
-            path.insert(0, '/');
-        }
-        let mut uri = String::from("file://");
-        for byte in path.bytes() {
-            if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
-                uri.push(char::from(byte));
-            } else {
-                uri.push_str(&format!("%{byte:02X}"));
-            }
-        }
-        uri.parse().expect("an encoded file path is a valid URI")
-    }
-
     fn rust() -> SyntaxDef {
         SyntaxDef::from_sublime_syntax(include_str!("assets/rust.sublime-syntax"))
             .expect("bundled Rust grammar parses")
@@ -759,24 +750,6 @@ fn main() {
         use serde_json::Value;
 
         use super::*;
-
-        /// Spaces and non-ASCII are percent-encoded, and the result is already in the form the
-        /// client normalizes to, so the server sees the URI the host built.
-        #[cfg(unix)]
-        #[test]
-        fn file_uris_percent_encode_and_are_normalized() {
-            let uri = file_uri(Path::new("/tmp/a dir/é.rs"));
-            assert_eq!(
-                uri.as_str(),
-                "file:///tmp/a%20dir/%C3%A9.rs",
-                "the path is encoded"
-            );
-            assert_eq!(
-                lsp::uri::normalize(&uri).as_str(),
-                uri.as_str(),
-                "normalizing changes nothing",
-            );
-        }
 
         /// The status bar shows a showMessage's text, and a progress report's title and message.
         #[test]
@@ -943,14 +916,14 @@ fn main() {
             .unwrap_or_else(|error| panic!("{}", transport::describe(&error)));
 
             let (mut client, initialize) = lsp::Client::builder()
-                .root(workspace.root_uri())
+                .root(workspace.root_uri().clone())
                 .process_id(std::process::id())
                 .build();
             let mut editor = CodeEditor::new(workspace.text());
             let mut outgoing = vec![initialize];
             outgoing.extend(
                 editor
-                    .open_lsp(&mut client, &workspace.file_uri(), "rust")
+                    .open_lsp(&mut client, workspace.file_uri(), "rust")
                     .expect("the only document"),
             );
             sender.send(outgoing);
@@ -1113,14 +1086,14 @@ fn main() {
             .unwrap_or_else(|error| panic!("{}", transport::describe(&error)));
 
             let (mut client, initialize) = lsp::Client::builder()
-                .root(workspace.root_uri())
+                .root(workspace.root_uri().clone())
                 .process_id(std::process::id())
                 .build();
             let mut editor = CodeEditor::new(workspace.text()).inlay_hints(true);
             let mut outgoing = vec![initialize];
             outgoing.extend(
                 editor
-                    .open_lsp(&mut client, &workspace.file_uri(), "rust")
+                    .open_lsp(&mut client, workspace.file_uri(), "rust")
                     .expect("the only document"),
             );
             sender.send(outgoing);
