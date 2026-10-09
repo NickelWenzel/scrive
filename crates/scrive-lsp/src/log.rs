@@ -5,6 +5,10 @@
 pub enum Source {
     /// The server, through `window/logMessage` or `window/showMessage`.
     Server,
+    /// A line the server process wrote to its stderr.
+    Stderr,
+    /// A line the server process wrote to its stdout between protocol messages.
+    Stdout,
 }
 
 /// One line a server logged or asked to show.
@@ -34,6 +38,28 @@ impl Entry {
             level: params.typ,
             shown: true,
             text: params.message,
+        }
+    }
+
+    /// A line from the server process's stderr.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn stderr(text: String) -> Self {
+        Self::output(Source::Stderr, text)
+    }
+
+    /// A line of non-LSP output from the server process's stdout.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn stdout(text: String) -> Self {
+        Self::output(Source::Stdout, text)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn output(source: Source, text: String) -> Self {
+        Self {
+            source,
+            level: lsp_types::MessageType::LOG,
+            shown: false,
+            text,
         }
     }
 

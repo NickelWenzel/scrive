@@ -1,7 +1,8 @@
 //! `scrive-lsp` — a Language Server Protocol client for scrive.
 //!
 //! A [`Client`] owns its connection to one server. A [`client::Builder`] terminal picks the
-//! bridge ([`Builder::memory`](client::Builder::memory) in this release) and returns the client
+//! bridge (`Builder::stdio` for a server process, natively, and
+//! [`Builder::memory`](client::Builder::memory) for an in-process server) and returns the client
 //! with its [`client::Events`], the stream of everything the server sends. The host runs that
 //! stream and hands each event to [`Client::receive`], which returns the [`Update`]s to apply.
 //!
